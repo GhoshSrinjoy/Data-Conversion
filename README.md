@@ -1,6 +1,42 @@
-# CSV-Parquet Conversion Tools
+*“My CSV had 12 million rows. I converted it to Parquet and suddenly felt rich in storage space.”*  
 
-A collection of Python utilities for handling CSV and Parquet files, specifically designed for data engineers and analysts working with large datasets.
+# 🧮 Data Conversion Tools – CSV ↔ Parquet Utilities  
+
+A practical toolkit for **data engineers and analysts** working with massive CSVs and Parquet files.  
+Convert, inspect, and split large datasets , all from the command line or Python API.  
+
+🔗 **Repo:** https://github.com/GhoshSrinjoy/Data-Conversion  
+
+---
+
+## Executive Summary  
+
+This collection of tools streamlines the everyday pain points of handling large CSVs:  
+- Slow conversions  
+- Memory bottlenecks  
+- Schema mismatches  
+- Manual inspection  
+
+With these scripts, you can:  
+- ⚙️ Convert CSV files to Parquet efficiently  
+- 🔍 Inspect Parquet contents and schemas  
+- 🪓 Split huge CSVs into smaller chunks with progress tracking  
+
+Whether you’re validating ETL outputs or preparing data for analytics, these utilities save time , and RAM.  
+
+---
+
+## Methodology  
+
+The toolkit includes **three main scripts** designed to cover all CSV–Parquet workflows:  
+
+### 1️⃣ **`csv_to_parquet.py`** – Basic CSV → Parquet Conversion  
+Simple, fast, and reliable conversion for both single files and entire directories.  
+
+**Features:**  
+- Single or batch directory conversion  
+- Preserves schema and data types  
+- Maintains folder hierarchy  
 
 ## Tools Included
 
