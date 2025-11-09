@@ -5,9 +5,6 @@
 A practical toolkit for **data engineers and analysts** working with massive CSVs and Parquet files.  
 Convert, inspect, and split large datasets , all from the command line or Python API.  
 
-🔗 **Repo:** https://github.com/GhoshSrinjoy/Data-Conversion  
-
----
 
 ## Executive Summary  
 
