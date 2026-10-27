@@ -70,7 +70,7 @@ finishing!(zstd::stream::write::Encoder<'static, BufWriter<File>>, |s| s.finish(
 finishing!(liblzma::write::XzEncoder<BufWriter<File>>, |s| s.finish());
 finishing!(lz4_flex::frame::FrameEncoder<BufWriter<File>>, |s| s
     .finish()
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string())));
+    .map_err(|e| std::io::Error::other(e.to_string())));
 
 impl FinishWrite for brotli::CompressorWriter<BufWriter<File>> {
     fn finish_box(self: Box<Self>) -> std::io::Result<()> {
@@ -80,13 +80,17 @@ impl FinishWrite for brotli::CompressorWriter<BufWriter<File>> {
 }
 
 /// Wrap `w` in a compressor chosen by the output path's extension.
-pub fn compressed_writer(w: BufWriter<File>, compression: Compression, level: Option<i32>, threads: usize) -> Result<Box<dyn FinishWrite>> {
+pub fn compressed_writer(
+    w: BufWriter<File>,
+    compression: Compression,
+    level: Option<i32>,
+    threads: usize,
+) -> Result<Box<dyn FinishWrite>> {
     Ok(match compression {
         Compression::None => Box::new(Plain(w)),
-        Compression::Gzip => Box::new(flate2::write::GzEncoder::new(
-            w,
-            flate2::Compression::new(level.unwrap_or(6).clamp(0, 9) as u32),
-        )),
+        Compression::Gzip => {
+            Box::new(flate2::write::GzEncoder::new(w, flate2::Compression::new(level.unwrap_or(6).clamp(0, 9) as u32)))
+        }
         Compression::Zstd => {
             let mut enc = zstd::stream::write::Encoder::new(w, level.unwrap_or(3))?;
             if threads > 1 {
@@ -106,7 +110,9 @@ pub fn compressed_writer(w: BufWriter<File>, compression: Compression, level: Op
             Box::new(liblzma::write::XzEncoder::new_stream(w, stream))
         }
         Compression::Lz4 => Box::new(lz4_flex::frame::FrameEncoder::new(w)),
-        Compression::Brotli => Box::new(brotli::CompressorWriter::new(w, 1 << 16, level.unwrap_or(6).clamp(0, 11) as u32, 22)),
+        Compression::Brotli => {
+            Box::new(brotli::CompressorWriter::new(w, 1 << 16, level.unwrap_or(6).clamp(0, 11) as u32, 22))
+        }
         Compression::Bzip2 | Compression::Zip => {
             return Err(Error::Format(format!("{} output is not supported by the native engine", compression.name())))
         }
@@ -244,11 +250,19 @@ impl ParquetOptions {
 
 fn candidates(dt: &DataType) -> &'static [&'static str] {
     match dt {
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::UInt8 | DataType::UInt16
-        | DataType::UInt32 | DataType::UInt64 | DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _)
-        | DataType::Time32(_) | DataType::Time64(_) => {
-            &["DICTIONARY", "DELTA_BINARY_PACKED", "BYTE_STREAM_SPLIT", "PLAIN"]
-        }
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Date32
+        | DataType::Date64
+        | DataType::Timestamp(_, _)
+        | DataType::Time32(_)
+        | DataType::Time64(_) => &["DICTIONARY", "DELTA_BINARY_PACKED", "BYTE_STREAM_SPLIT", "PLAIN"],
         DataType::Float16 | DataType::Float32 | DataType::Float64 | DataType::Decimal128(_, _) => {
             &["DICTIONARY", "BYTE_STREAM_SPLIT", "PLAIN"]
         }
@@ -336,7 +350,7 @@ pub fn tune_encodings(sample: &RecordBatch, opts: &ParquetOptions) -> HashMap<St
                     Ok(buf.len())
                 })();
                 if let Ok(size) = size {
-                    if best.map_or(true, |(b, _)| size < b) {
+                    if best.is_none_or(|(b, _)| size < b) {
                         best = Some((size, cand));
                     }
                 }
@@ -411,7 +425,8 @@ impl ParquetSink {
         let index = self.next_group;
         self.next_group += 1;
         self.in_flight += 1;
-        let (factory, schema, pool, tx) = (self.factory.clone(), self.schema.clone(), self.pool.clone(), self.done_tx.clone());
+        let (factory, schema, pool, tx) =
+            (self.factory.clone(), self.schema.clone(), self.pool.clone(), self.done_tx.clone());
         self.pool.spawn(move || {
             let encode = || -> EncodedGroup {
                 let writers = factory.create_column_writers(index)?;
@@ -446,10 +461,8 @@ impl ParquetSink {
     }
 
     fn wait_one(&mut self) -> Result<()> {
-        let (index, result) = self
-            .done_rx
-            .recv()
-            .map_err(|_| Error::Data("a Parquet encoding worker stopped".into()))?;
+        let (index, result) =
+            self.done_rx.recv().map_err(|_| Error::Data("a Parquet encoding worker stopped".into()))?;
         self.in_flight -= 1;
         self.finished.insert(index, result);
         self.append_ready()
@@ -640,7 +653,13 @@ pub struct ParquetSource {
 }
 
 impl ParquetSource {
-    pub fn open(path: &Path, wave_bytes: u64, max_parallel: usize, pool: Arc<rayon::ThreadPool>, columns: Option<&[String]>) -> Result<Self> {
+    pub fn open(
+        path: &Path,
+        wave_bytes: u64,
+        max_parallel: usize,
+        pool: Arc<rayon::ThreadPool>,
+        columns: Option<&[String]>,
+    ) -> Result<Self> {
         let file = File::open(path).map_err(|e| Error::io(e, path))?;
         let total_bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
         let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new())?;
@@ -809,7 +828,13 @@ pub struct JsonlSource {
 }
 
 impl JsonlSource {
-    pub fn open(path: &Path, chunk_size: usize, wave: usize, pool: Arc<rayon::ThreadPool>, full_scan: bool) -> Result<Self> {
+    pub fn open(
+        path: &Path,
+        chunk_size: usize,
+        wave: usize,
+        pool: Arc<rayon::ThreadPool>,
+        full_scan: bool,
+    ) -> Result<Self> {
         let schema = Arc::new(infer_jsonl_schema(path, if full_scan { None } else { Some(64 << 20) })?);
         let input = crate::io::open_input(path)?;
         let chunker = Chunker::new(input.reader, chunk_size, None, b'\n');

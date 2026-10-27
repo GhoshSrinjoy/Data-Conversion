@@ -126,7 +126,12 @@ fn system_info() -> PyResult<String> {
 
 #[pyfunction]
 #[pyo3(signature = (input_size=None, threads=None, memory=None, chunk_size=None))]
-fn plan(input_size: Option<u64>, threads: Option<usize>, memory: Option<u64>, chunk_size: Option<usize>) -> PyResult<String> {
+fn plan(
+    input_size: Option<u64>,
+    threads: Option<usize>,
+    memory: Option<u64>,
+    chunk_size: Option<usize>,
+) -> PyResult<String> {
     json(&resources::plan(input_size, threads, memory, chunk_size))
 }
 
@@ -169,7 +174,14 @@ fn compress(
 
 #[pyfunction]
 #[pyo3(signature = (src, dst, threads=0, overwrite=false, progress=None))]
-fn decompress(py: Python<'_>, src: &str, dst: &str, threads: usize, overwrite: bool, progress: Option<Py<PyAny>>) -> PyResult<String> {
+fn decompress(
+    py: Python<'_>,
+    src: &str,
+    dst: &str,
+    threads: usize,
+    overwrite: bool,
+    progress: Option<Py<PyAny>>,
+) -> PyResult<String> {
     let hooks = PyHooks::new(progress);
     let result = py.detach(|| dcz::decompress_file(Path::new(src), Path::new(dst), overwrite, threads, &hooks));
     json(&hooks.finish(result)?)
@@ -221,7 +233,7 @@ fn count(py: Python<'_>, path: &str, options: &str) -> PyResult<u64> {
 }
 
 fn le_chunks<const N: usize>(data: &[u8]) -> PyResult<impl Iterator<Item = [u8; N]> + '_> {
-    if data.len() % N != 0 {
+    if !data.len().is_multiple_of(N) {
         return Err(NativeError::new_err(("invalid".to_string(), format!("buffer length must be a multiple of {N}"))));
     }
     Ok(data.chunks_exact(N).map(|c| c.try_into().unwrap()))
@@ -257,22 +269,33 @@ fn pack_values<'py>(
     Ok(PyBytes::new(py, &out))
 }
 
+/// (kind, values, validity, tag) as returned to Python.
+type Unpacked<'py> = (String, Bound<'py, PyAny>, Option<Bound<'py, PyBytes>>, Bound<'py, PyBytes>);
+
 /// Inverse of `pack_values`: returns (kind, values, valid, tag) with the same
 /// buffer conventions.
 #[pyfunction]
-fn unpack_values<'py>(py: Python<'py>, data: &[u8]) -> PyResult<(String, Bound<'py, PyAny>, Option<Bound<'py, PyBytes>>, Bound<'py, PyBytes>)> {
+fn unpack_values<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Unpacked<'py>> {
     let owned = data.to_vec();
     let p = py.detach(move || pack::unpack(&owned)).map_err(to_py)?;
     let valid = p.valid.as_ref().map(|v| PyBytes::new(py, &v.iter().map(|&b| b as u8).collect::<Vec<u8>>()));
     let tag = PyBytes::new(py, &p.tag);
     let (kind, values): (&str, Bound<'py, PyAny>) = match p.values {
-        Values::Int(v) => ("int", PyBytes::new(py, &v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).into_any()),
-        Values::Float(v) => ("float", PyBytes::new(py, &v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).into_any()),
+        Values::Int(v) => {
+            ("int", PyBytes::new(py, &v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).into_any())
+        }
+        Values::Float(v) => {
+            ("float", PyBytes::new(py, &v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()).into_any())
+        }
         Values::Bool(v) => ("bool", PyBytes::new(py, &v.iter().map(|&b| b as u8).collect::<Vec<u8>>()).into_any()),
         Values::Str(v) => {
             let strings: Vec<String> = v
                 .into_iter()
-                .map(|b| String::from_utf8(b).map_err(|_| NativeError::new_err(("integrity".to_string(), "invalid UTF-8 in packed strings".to_string()))))
+                .map(|b| {
+                    String::from_utf8(b).map_err(|_| {
+                        NativeError::new_err(("integrity".to_string(), "invalid UTF-8 in packed strings".to_string()))
+                    })
+                })
                 .collect::<PyResult<_>>()?;
             ("str", PyList::new(py, strings)?.into_any())
         }

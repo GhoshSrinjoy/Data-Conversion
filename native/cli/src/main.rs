@@ -54,7 +54,8 @@ struct Args {
     flags: HashMap<String, Option<String>>,
 }
 
-const SWITCHES: &[&str] = &["overwrite", "f", "quiet", "q", "json", "no-header", "header", "exact", "crlf", "help", "h"];
+const SWITCHES: &[&str] =
+    &["overwrite", "f", "quiet", "q", "json", "no-header", "header", "exact", "crlf", "help", "h"];
 
 fn parse_args(raw: &[String]) -> Args {
     let mut positional = Vec::new();
@@ -131,7 +132,11 @@ struct Bar {
 
 impl Bar {
     fn new(enabled: bool) -> Self {
-        Bar { enabled: enabled && std::io::stderr().is_terminal(), started: Instant::now(), last: Mutex::new(Instant::now()) }
+        Bar {
+            enabled: enabled && std::io::stderr().is_terminal(),
+            started: Instant::now(),
+            last: Mutex::new(Instant::now()),
+        }
     }
 
     fn clear(&self) {
@@ -284,14 +289,20 @@ fn run(raw: Vec<String>) -> Result<(), String> {
         "decompress" => {
             let src = PathBuf::from(need(&a, 1, "source")?);
             let dst = a.positional.get(2).map(PathBuf::from).unwrap_or_else(|| {
-                if src.extension().map_or(false, |e| e.eq_ignore_ascii_case("dcz")) {
+                if src.extension().is_some_and(|e| e.eq_ignore_ascii_case("dcz")) {
                     src.with_extension("")
                 } else {
                     src.with_extension("out")
                 }
             });
-            let r = dcz::decompress_file(&src, &dst, a.has("overwrite") || a.has("f"), a.num("threads")?.unwrap_or(0), &bar)
-                .map_err(err)?;
+            let r = dcz::decompress_file(
+                &src,
+                &dst,
+                a.has("overwrite") || a.has("f"),
+                a.num("threads")?.unwrap_or(0),
+                &bar,
+            )
+            .map_err(err)?;
             bar.clear();
             print_report(&r, &a);
         }

@@ -225,15 +225,16 @@ pub fn target_format(path: &Path, explicit: Option<&str>) -> Result<(Format, Com
 
 /// A decoded UTF-8 stream of a CSV file (decompressed, transcoded, BOM removed).
 fn open_csv_stream(path: &Path, encoding: &str) -> Result<(Box<dyn Read + Send>, Arc<AtomicU64>, u64)> {
-    let (raw, consumed, size): (Box<dyn Read + Send>, Arc<AtomicU64>, u64) = if detect_format(path, None)?.0 == Format::Dcz {
-        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        let reader = crate::dcz::DczReader::open(path)?;
-        let consumed = reader.consumed_counter();
-        (Box::new(reader), consumed, size)
-    } else {
-        let input = io::open_input(path)?;
-        (input.reader, input.consumed, input.file_size)
-    };
+    let (raw, consumed, size): (Box<dyn Read + Send>, Arc<AtomicU64>, u64) =
+        if detect_format(path, None)?.0 == Format::Dcz {
+            let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let reader = crate::dcz::DczReader::open(path)?;
+            let consumed = reader.consumed_counter();
+            (Box::new(reader), consumed, size)
+        } else {
+            let input = io::open_input(path)?;
+            (input.reader, input.consumed, input.file_size)
+        };
     let reader: Box<dyn Read + Send> = match encoding_rs::Encoding::for_label(encoding.as_bytes()) {
         Some(enc) if enc != encoding_rs::UTF_8 => Box::new(io::Utf8Reader::new(raw, enc)),
         _ => Box::new(io::SkipBom::new(raw)),
@@ -299,8 +300,7 @@ fn decode_chunk(plan: &CsvPlan, schema: &SchemaRef, chunk: &Chunk) -> Result<Dec
         return Err(Error::Data("input is not valid UTF-8".into()));
     }
     let est = chunk.data.len() / plan.avg_record.max(8) + 16;
-    let mut builders: Vec<ColumnBuilder> =
-        plan.types.iter().map(|t| ColumnBuilder::new(t, est, plan.mode)).collect();
+    let mut builders: Vec<ColumnBuilder> = plan.types.iter().map(|t| ColumnBuilder::new(t, est, plan.mode)).collect();
     let mut out = Decoded::default();
     let mut skip = if chunk.index == 0 { plan.leading } else { 0 };
     let mut tok = Tokenizer::new(plan.dialect);
@@ -350,7 +350,8 @@ fn decode_chunk(plan: &CsvPlan, schema: &SchemaRef, chunk: &Chunk) -> Result<Dec
             };
             if !ok {
                 let f = rec.fields.get(src);
-                let value = f.map(|f| String::from_utf8_lossy(&rec.data[f.start..f.end]).into_owned()).unwrap_or_default();
+                let value =
+                    f.map(|f| String::from_utf8_lossy(&rec.data[f.start..f.end]).into_owned()).unwrap_or_default();
                 out.violation = Some(Violation { column: out_idx, row: out.rows, value });
                 return false;
             }
@@ -438,7 +439,7 @@ fn record_ranges(data: &[u8], quote: Option<u8>, term: u8, n: usize) -> Vec<std:
                 parity += count(&data[pos..nl], q);
             }
             pos = nl + 1;
-            if parity % 2 == 0 {
+            if parity.is_multiple_of(2) {
                 cuts.push(pos);
                 break;
             }
@@ -452,7 +453,13 @@ fn record_ranges(data: &[u8], quote: Option<u8>, term: u8, n: usize) -> Vec<std:
     cuts.windows(2).filter(|w| w[1] > w[0]).map(|w| w[0]..w[1]).collect()
 }
 
-fn sample_stats(path: &Path, plan: &CsvPlan, encoding: &str, sample_bytes: usize, file_size: u64) -> Result<Vec<ColumnStats>> {
+fn sample_stats(
+    path: &Path,
+    plan: &CsvPlan,
+    encoding: &str,
+    sample_bytes: usize,
+    file_size: u64,
+) -> Result<Vec<ColumnStats>> {
     let ncols = plan.projection.len();
     let mut stats = vec![ColumnStats::default(); ncols];
     let t = Instant::now();
@@ -522,7 +529,13 @@ fn sample_stats(path: &Path, plan: &CsvPlan, encoding: &str, sample_bytes: usize
     Ok(stats)
 }
 
-fn full_stats(path: &Path, plan: &CsvPlan, encoding: &str, rplan: &Plan, pool: &rayon::ThreadPool) -> Result<Vec<ColumnStats>> {
+fn full_stats(
+    path: &Path,
+    plan: &CsvPlan,
+    encoding: &str,
+    rplan: &Plan,
+    pool: &rayon::ThreadPool,
+) -> Result<Vec<ColumnStats>> {
     let ncols = plan.projection.len();
     let (reader, _, _) = open_csv_stream(path, encoding)?;
     let rx = spawn_chunker(Chunker::new(reader, rplan.chunk_size, plan.dialect.quote, plan.split), rplan.wave_chunks);
@@ -584,7 +597,12 @@ fn next_wave(rx: &Receiver<Result<Chunk>>, n: usize) -> Result<Vec<Chunk>> {
     Ok(wave)
 }
 
-fn decide_types(stats: &[ColumnStats], names: &[String], opts: &ConvertOptions, warnings: &mut Vec<String>) -> Result<Vec<LogicalType>> {
+fn decide_types(
+    stats: &[ColumnStats],
+    names: &[String],
+    opts: &ConvertOptions,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<LogicalType>> {
     let mut types = Vec::with_capacity(stats.len());
     for (s, name) in stats.iter().zip(names) {
         if let Some(spec) = opts.schema.get(name) {
@@ -598,10 +616,8 @@ fn decide_types(stats: &[ColumnStats], names: &[String], opts: &ConvertOptions, 
             LogicalType::Decimal { scale: 0, .. } if s.maybe_int => {
                 warnings.push(format!("column '{name}': integers exceed int64, stored exactly as {}", ty.label()))
             }
-            LogicalType::Decimal { .. } => warnings.push(format!(
-                "column '{name}': more digits than float64 holds, stored exactly as {}",
-                ty.label()
-            )),
+            LogicalType::Decimal { .. } => warnings
+                .push(format!("column '{name}': more digits than float64 holds, stored exactly as {}", ty.label())),
             LogicalType::String if s.ts_tz_mixed && s.maybe_ts => {
                 warnings.push(format!("column '{name}' kept as text: it mixes UTC offsets"))
             }
@@ -677,9 +693,16 @@ fn build_sink(
             if let Some(d) = opts.out_delimiter.as_deref().and_then(sniff::parse_char_option) {
                 o.delimiter = d;
             }
-            let mut enc = crate::dcz::DczWriter::new(file, crate::dcz::EncodeOptions { profile, threads: plan.threads, block_size: None })?
-                .with_dialect(Dialect { delimiter: o.delimiter, ..Dialect::default() });
-            crate::csvout::write_header(&mut enc, &schema.fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>(), &o)?;
+            let mut enc = crate::dcz::DczWriter::new(
+                file,
+                crate::dcz::EncodeOptions { profile, threads: plan.threads, block_size: None },
+            )?
+            .with_dialect(Dialect { delimiter: o.delimiter, ..Dialect::default() });
+            crate::csvout::write_header(
+                &mut enc,
+                &schema.fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>(),
+                &o,
+            )?;
             Box::new(tables::CsvSink::new(Box::new(enc), schema, CsvWriteOptions { header: false, ..o })?)
         }
     })
@@ -744,7 +767,13 @@ struct Out<'a> {
 }
 
 impl<'a> Out<'a> {
-    fn new(target: &'a Target, schema: SchemaRef, opts: &'a ConvertOptions, plan: &'a Plan, pool: &'a Arc<rayon::ThreadPool>) -> Self {
+    fn new(
+        target: &'a Target,
+        schema: SchemaRef,
+        opts: &'a ConvertOptions,
+        plan: &'a Plan,
+        pool: &'a Arc<rayon::ThreadPool>,
+    ) -> Self {
         Out { target, schema, opts, plan, pool, single: None, rolling: None }
     }
 
@@ -753,7 +782,17 @@ impl<'a> Out<'a> {
         match &t.split {
             None => {
                 let mut file = AtomicFile::create(&t.dst, self.opts.overwrite)?;
-                let sink = build_sink(file.take_writer(), t.format, t.compression, &self.schema, first, self.opts, self.plan, self.pool, None)?;
+                let sink = build_sink(
+                    file.take_writer(),
+                    t.format,
+                    t.compression,
+                    &self.schema,
+                    first,
+                    self.opts,
+                    self.plan,
+                    self.pool,
+                    None,
+                )?;
                 self.single = Some((file, sink));
             }
             Some((rows, bytes, pattern, extension)) => {
@@ -770,10 +809,18 @@ impl<'a> Out<'a> {
                 let opener: Opener<'a> = Box::new(move |path: &Path, first: Option<&RecordBatch>, rows: usize| {
                     let mut file = AtomicFile::create(path, opts.overwrite)?;
                     let rg = Some(rows.clamp(1, plan.row_group_rows));
-                    let sink = build_sink(file.take_writer(), format, compression, &schema, first, opts, plan, pool, rg)?;
+                    let sink =
+                        build_sink(file.take_writer(), format, compression, &schema, first, opts, plan, pool, rg)?;
                     Ok((file, sink))
                 });
-                self.rolling = Some(crate::split::RollingSink::new(spec, format, compression, self.schema.clone(), self.opts.clone(), opener)?);
+                self.rolling = Some(crate::split::RollingSink::new(
+                    spec,
+                    format,
+                    compression,
+                    self.schema.clone(),
+                    self.opts.clone(),
+                    opener,
+                )?);
             }
         }
         Ok(())
@@ -839,9 +886,21 @@ pub fn convert(src: &Path, dst: &Path, opts: &ConvertOptions, hooks: &dyn Hooks)
     // Byte-exact paths: CSV <-> DCZ never re-encode values.
     if dst_fmt == Format::Dcz && src_fmt == Format::Csv {
         let profile = crate::codec::Profile::parse(opts.profile.as_deref().unwrap_or("balanced"))?;
-        return crate::dcz::compress_file(src, dst, &crate::dcz::EncodeOptions { profile, threads: opts.threads.unwrap_or(0), block_size: opts.chunk_size }, opts.overwrite, hooks);
+        return crate::dcz::compress_file(
+            src,
+            dst,
+            &crate::dcz::EncodeOptions { profile, threads: opts.threads.unwrap_or(0), block_size: opts.chunk_size },
+            opts.overwrite,
+            hooks,
+        );
     }
-    if src_fmt == Format::Dcz && dst_fmt == Format::Csv && opts.columns.is_none() && opts.limit.is_none() && dst_comp == Compression::None && opts.out_delimiter.is_none() {
+    if src_fmt == Format::Dcz
+        && dst_fmt == Format::Csv
+        && opts.columns.is_none()
+        && opts.limit.is_none()
+        && dst_comp == Compression::None
+        && opts.out_delimiter.is_none()
+    {
         return crate::dcz::decompress_file(src, dst, opts.overwrite, opts.threads.unwrap_or(0), hooks);
     }
 
@@ -863,7 +922,9 @@ pub fn convert(src: &Path, dst: &Path, opts: &ConvertOptions, hooks: &dyn Hooks)
     let target = Target { format: dst_fmt, compression: dst_comp, dst: dst.to_path_buf(), split: None };
     match src_fmt {
         Format::Csv | Format::Dcz => convert_csv(src, &target, opts, &plan, &pool, hooks, &mut report)?,
-        Format::Parquet | Format::Ipc | Format::Jsonl => convert_table(src, src_fmt, &target, opts, &plan, &pool, hooks, &mut report)?,
+        Format::Parquet | Format::Ipc | Format::Jsonl => {
+            convert_table(src, src_fmt, &target, opts, &plan, &pool, hooks, &mut report)?
+        }
     }
     report.seconds = started.elapsed().as_secs_f64();
     Ok(report)
@@ -950,7 +1011,9 @@ fn split(
     };
     match src_fmt {
         Format::Csv | Format::Dcz => convert_csv(src, &target, opts, &plan, &pool, hooks, &mut report)?,
-        Format::Parquet | Format::Ipc | Format::Jsonl => convert_table(src, src_fmt, &target, opts, &plan, &pool, hooks, &mut report)?,
+        Format::Parquet | Format::Ipc | Format::Jsonl => {
+            convert_table(src, src_fmt, &target, opts, &plan, &pool, hooks, &mut report)?
+        }
     }
     report.seconds = started.elapsed().as_secs_f64();
     Ok(report)
@@ -974,7 +1037,11 @@ fn convert_csv(
         Some(cols) => cols
             .iter()
             .map(|c| {
-                dialect.columns.iter().position(|n| n == c).ok_or_else(|| Error::Schema(format!("no column named '{c}'")))
+                dialect
+                    .columns
+                    .iter()
+                    .position(|n| n == c)
+                    .ok_or_else(|| Error::Schema(format!("no column named '{c}'")))
             })
             .collect::<Result<_>>()?,
     };
@@ -1139,12 +1206,14 @@ fn csv_attempt(
                 bad += d.bad.len() as u64;
                 if cplan.bad_lines != BadLines::Skip {
                     if quarantine.is_none() {
-                        let path = opts.quarantine.as_ref().map(PathBuf::from).unwrap_or_else(|| default_quarantine(dst));
+                        let path =
+                            opts.quarantine.as_ref().map(PathBuf::from).unwrap_or_else(|| default_quarantine(dst));
                         let mut f = AtomicFile::create(&path, true)?;
-                        crate::csvout::write_header(f.writer(), &cplan.names, &CsvWriteOptions {
-                            delimiter: cplan.dialect.delimiter,
-                            ..CsvWriteOptions::default()
-                        })?;
+                        crate::csvout::write_header(
+                            f.writer(),
+                            &cplan.names,
+                            &CsvWriteOptions { delimiter: cplan.dialect.delimiter, ..CsvWriteOptions::default() },
+                        )?;
                         quarantine = Some((path, f));
                     }
                     let w = quarantine.as_mut().unwrap().1.writer();
@@ -1214,9 +1283,17 @@ fn convert_table(
 ) -> Result<()> {
     let wave_bytes = plan.memory_budget / 5;
     let mut source: Box<dyn Source> = match src_fmt {
-        Format::Parquet => Box::new(tables::ParquetSource::open(src, wave_bytes, plan.threads, pool.clone(), opts.columns.as_deref())?),
+        Format::Parquet => {
+            Box::new(tables::ParquetSource::open(src, wave_bytes, plan.threads, pool.clone(), opts.columns.as_deref())?)
+        }
         Format::Ipc => Box::new(tables::IpcSource::open(src, plan.threads * 2, opts.columns.as_deref())?),
-        Format::Jsonl => Box::new(tables::JsonlSource::open(src, plan.chunk_size, plan.wave_chunks, pool.clone(), opts.infer == InferMode::Full)?),
+        Format::Jsonl => Box::new(tables::JsonlSource::open(
+            src,
+            plan.chunk_size,
+            plan.wave_chunks,
+            pool.clone(),
+            opts.infer == InferMode::Full,
+        )?),
         _ => unreachable!(),
     };
     let schema = source.schema();

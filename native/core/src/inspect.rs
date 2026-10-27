@@ -32,8 +32,11 @@ fn preview_from_batches(batches: &[RecordBatch], n: usize) -> Result<Preview> {
     let fmt = FormatOptions::default().with_null("");
     let mut rows = Vec::new();
     'outer: for b in batches {
-        let formatters: Vec<ArrayFormatter> =
-            b.columns().iter().map(|c| ArrayFormatter::try_new(c.as_ref(), &fmt)).collect::<std::result::Result<_, _>>()?;
+        let formatters: Vec<ArrayFormatter> = b
+            .columns()
+            .iter()
+            .map(|c| ArrayFormatter::try_new(c.as_ref(), &fmt))
+            .collect::<std::result::Result<_, _>>()?;
         for r in 0..b.num_rows() {
             if rows.len() >= n {
                 break 'outer;
@@ -137,7 +140,8 @@ pub fn count(path: &Path, opts: &ConvertOptions) -> Result<u64> {
             let mut chunker = Chunker::new(input.reader, 8 << 20, None, b'\n');
             let mut rows = 0u64;
             while let Some(c) = chunker.next_chunk()? {
-                rows += c.data.split(|&b| b == b'\n').filter(|l| l.iter().any(|b| !b.is_ascii_whitespace())).count() as u64;
+                rows +=
+                    c.data.split(|&b| b == b'\n').filter(|l| l.iter().any(|b| !b.is_ascii_whitespace())).count() as u64;
             }
             Ok(rows)
         }
@@ -228,10 +232,18 @@ fn stat_text(s: &parquet::file::statistics::Statistics, min: bool) -> Option<Str
         S::Int64(v) => (if min { v.min_opt() } else { v.max_opt() }).map(|x| x.to_string()),
         S::Float(v) => (if min { v.min_opt() } else { v.max_opt() }).map(|x| x.to_string()),
         S::Double(v) => (if min { v.min_opt() } else { v.max_opt() }).map(|x| x.to_string()),
-        S::ByteArray(v) => (if min { v.min_opt() } else { v.max_opt() }).map(|x| String::from_utf8_lossy(x.data()).into_owned()),
+        S::ByteArray(v) => {
+            (if min { v.min_opt() } else { v.max_opt() }).map(|x| String::from_utf8_lossy(x.data()).into_owned())
+        }
         _ => None,
     };
-    text.map(|t| if t.len() > 64 { format!("{}…", &t[..t.char_indices().nth(60).map_or(t.len(), |(i, _)| i)]) } else { t })
+    text.map(|t| {
+        if t.len() > 64 {
+            format!("{}…", &t[..t.char_indices().nth(60).map_or(t.len(), |(i, _)| i)])
+        } else {
+            t
+        }
+    })
 }
 
 /// Describe a file: format, size, rows, schema and format-specific details.
@@ -270,11 +282,7 @@ pub fn info(path: &Path, exact: bool, opts: &ConvertOptions) -> Result<Value> {
             let mut o = opts.clone();
             o.limit = Some(1000);
             let preview = head(path, 1000, &o)?;
-            let rows = if exact {
-                Some(count(path, opts)?)
-            } else {
-                None
-            };
+            let rows = if exact { Some(count(path, opts)?) } else { None };
             let dialect = if fmt == Format::Csv { Some(convert::sniff_file(path, &opts.sniff)?) } else { None };
             Ok(json!({
                 "format": fmt.name(),

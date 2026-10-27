@@ -74,7 +74,7 @@ pub fn canonical_decimal(v: &[u8]) -> Option<(i64, u8)> {
         return None;
     }
     let fp = match fp {
-        Some(f) if f.is_empty() => return None,
+        Some([]) => return None,
         Some(f) => f,
         None => &[][..],
     };
@@ -109,7 +109,7 @@ pub fn write_decimal(out: &mut Vec<u8>, m: i64, scale: u8) {
     if digits.len() <= s {
         out.push(b'0');
         out.push(b'.');
-        out.extend(std::iter::repeat(b'0').take(s - digits.len()));
+        out.extend(std::iter::repeat_n(b'0', s - digits.len()));
         out.extend_from_slice(digits);
     } else {
         let split = digits.len() - s;
@@ -262,7 +262,14 @@ fn needs_aux(aux: &Aux) -> bool {
     aux.quoting == 2 || aux.has_empty || !aux.exceptions.is_empty()
 }
 
-fn finish(enc: u8, aux: Aux, params: Vec<u8>, mut main: Vec<Vec<u8>>, quoted: &[bool], empty: Option<&[bool]>) -> EncodedColumn {
+fn finish(
+    enc: u8,
+    aux: Aux,
+    params: Vec<u8>,
+    mut main: Vec<Vec<u8>>,
+    quoted: &[bool],
+    empty: Option<&[bool]>,
+) -> EncodedColumn {
     let mut meta = vec![enc, aux.quoting];
     put_varint(&mut meta, aux.exceptions.len() as u64);
     meta.push(aux.has_empty as u8);
@@ -444,19 +451,24 @@ fn encode_template(cells: &[&[u8]], quoted: &[bool]) -> Option<EncodedColumn> {
         if empty[i] {
             continue;
         }
-        let ok = matched[i] && {
-            let row: Vec<&[u8]> = (0..nfields).map(|f| runs[f][cursor]).collect();
-            cursor += 1;
-            let fits = row.iter().zip(&widths).all(|(d, &w)| {
-                if w > 0 { d.len() == w as usize } else { d.len() == 1 || d[0] != b'0' }
-            });
-            if fits {
-                for (f, d) in row.iter().enumerate() {
-                    fields[f].push(parse_digits(d));
+        let ok =
+            matched[i] && {
+                let row: Vec<&[u8]> = (0..nfields).map(|f| runs[f][cursor]).collect();
+                cursor += 1;
+                let fits = row.iter().zip(&widths).all(|(d, &w)| {
+                    if w > 0 {
+                        d.len() == w as usize
+                    } else {
+                        d.len() == 1 || d[0] != b'0'
+                    }
+                });
+                if fits {
+                    for (f, d) in row.iter().enumerate() {
+                        fields[f].push(parse_digits(d));
+                    }
                 }
-            }
-            fits
-        };
+                fits
+            };
         if !ok {
             exceptions.push((i, c.to_vec()));
             if exceptions.len() > budget {
@@ -590,21 +602,22 @@ pub fn decode_column(meta: &mut Cursor<'_>, streams: &mut dyn FnMut() -> Result<
     let mut exc = exceptions.into_iter().peekable();
     // Emits cells in order, consulting empties and exceptions; `next` produces the
     // encoder-specific cell bytes.
-    let mut emit = |data: &mut Vec<u8>, ends: &mut Vec<u32>, next: &mut dyn FnMut(&mut Vec<u8>) -> Result<()>| -> Result<()> {
-        for i in 0..n {
-            if empty[i] {
-            } else if exc.peek().map_or(false, |(p, _)| *p == i) {
-                data.extend_from_slice(&exc.next().unwrap().1);
-            } else {
-                next(data)?;
+    let mut emit =
+        |data: &mut Vec<u8>, ends: &mut Vec<u32>, next: &mut dyn FnMut(&mut Vec<u8>) -> Result<()>| -> Result<()> {
+            for (i, &is_empty) in empty.iter().enumerate() {
+                if is_empty {
+                } else if exc.peek().is_some_and(|(p, _)| *p == i) {
+                    data.extend_from_slice(&exc.next().unwrap().1);
+                } else {
+                    next(data)?;
+                }
+                if data.len() > u32::MAX as usize {
+                    return Err(Error::Format("DCZ block too large".into()));
+                }
+                ends.push(data.len() as u32);
             }
-            if data.len() > u32::MAX as usize {
-                return Err(Error::Format("DCZ block too large".into()));
-            }
-            ends.push(data.len() as u32);
-        }
-        Ok(())
-    };
+            Ok(())
+        };
     match enc {
         RAW => {
             let lengths = ints::decode_all(&streams()?)?;
@@ -749,7 +762,8 @@ mod tests {
         roundtrip(&["1", "22", "", "-3", "0", "4"], Some(INT));
         roundtrip(&["1.50", "2.25", "", "-0.5", "10", "0.05"], Some(DECIMAL));
         roundtrip(&["x", "x", "x"], Some(CONST));
-        let ts: Vec<String> = (0..300).map(|i| format!("2024-01-{:02} 10:{:02}:{:02}", i % 28 + 1, i % 60, (i * 7) % 60)).collect();
+        let ts: Vec<String> =
+            (0..300).map(|i| format!("2024-01-{:02} 10:{:02}:{:02}", i % 28 + 1, i % 60, (i * 7) % 60)).collect();
         let ts_ref: Vec<&str> = ts.iter().map(|s| s.as_str()).collect();
         roundtrip(&ts_ref, Some(TEMPLATE));
         let ids: Vec<String> = (0..300).map(|i| format!("INV-{:06}", i * 13)).collect();

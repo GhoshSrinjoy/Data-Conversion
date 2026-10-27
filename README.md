@@ -1,220 +1,379 @@
-*“My CSV had 12 million rows. I converted it to Parquet and suddenly felt rich in storage space.”*  
+*"My CSV had 12 million rows. I converted it to Parquet and suddenly felt rich in storage space."*
 
-# 🧮 Data Conversion Tools – CSV ↔ Parquet Utilities  
+# dataconv: fast, lossless data conversion and compression
 
-A practical toolkit for **data engineers and analysts** working with massive CSVs and Parquet files.  
-Convert, inspect, and split large datasets , all from the command line or Python API.  
+Convert, compress, split, inspect and verify CSV, TSV, JSON Lines, JSON, Parquet,
+Arrow IPC/Feather, ORC, Excel and DCZ files, from the command line or Python.
 
+- **Lossless by design.** Zip codes keep their leading zeros, 20-digit IDs stay
+  exact, `NA` is only a missing value where the column is numeric, timestamps
+  keep their UTC offset, and malformed rows are set aside instead of dropped.
+- **Fast.** A native Rust engine parses, types and writes in parallel. On a
+  2-million-row CSV it is about 8x faster than the pandas path this project used
+  to take, and it produces a smaller file.
+- **Adaptive.** Threads, memory and chunk sizes follow the machine it runs on,
+  including CPU and memory limits inside containers.
+- **Strong compression.** DCZ, a byte-exact columnar format for delimited text,
+  produced a file about 1.5x smaller than Parquet and 1.6x smaller than xz on a
+  typical export, and still decompresses at about 1 GB/s.
+- **Runs anywhere.** One Python package with no required dependencies, an
+  optional native engine for Windows, macOS and Linux (x86-64 and ARM), and a
+  standalone binary that needs no Python at all.
 
-## Executive Summary  
+## Contents
 
-This collection of tools streamlines the everyday pain points of handling large CSVs:  
-- Slow conversions  
-- Memory bottlenecks  
-- Schema mismatches  
-- Manual inspection  
+- [Why this exists](#why-this-exists)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [What is the best compression for my data?](#what-is-the-best-compression-for-my-data)
+- [Lossless type inference](#lossless-type-inference)
+- [Robustness](#robustness)
+- [Performance and resources](#performance-and-resources)
+- [Command reference](#command-reference)
+- [Python API](#python-api)
+- [Engines and portability](#engines-and-portability)
+- [Architecture](#architecture)
+- [Development](#development)
+- [License](#license)
 
-With these scripts, you can:  
-- ⚙️ Convert CSV files to Parquet efficiently  
-- 🔍 Inspect Parquet contents and schemas  
-- 🪓 Split huge CSVs into smaller chunks with progress tracking  
+## Why this exists
 
-Whether you’re validating ETL outputs or preparing data for analytics, these utilities save time , and RAM.  
+Converting a CSV sounds trivial until the data is real. On a 2-million-row,
+135.5 MB export (ids, timestamps, user names, prices, zip codes, country codes),
+the classic `pandas.read_csv(...).to_parquet(...)` approach and dataconv give:
 
----
+|                                            | pandas + pyarrow | dataconv (native) |
+|--------------------------------------------|-----------------:|------------------:|
+| time                                       | 1.65 s           | **0.21 s**        |
+| Parquet size                               | 51.1 MB          | **33.5 MB**       |
+| zip codes that lost their leading zero     | 199,609          | **0**             |
+| `NA` (Namibia) turned into a missing value | 250,549          | **0**             |
 
-## Methodology  
+Measured on a 24-thread Windows machine (sizes in MB of 2^20 bytes, as dataconv
+prints them). Your timings will differ; the losses will not.
 
-The toolkit includes **three main scripts** designed to cover all CSV–Parquet workflows:  
+Other problems it handles for you:
 
-### 1️⃣ **`csv_to_parquet.py`** – Basic CSV → Parquet Conversion  
-Simple, fast, and reliable conversion for both single files and entire directories.  
+- **Files bigger than memory.** Input streams through in chunks sized to the
+  memory budget.
+- **A type change late in the file** (an integer column that turns into floats
+  at row 9 million). The job re-plans the schema and restarts.
+- **Encodings.** Windows-1252 and UTF-16 exports and stray bytes are detected,
+  and the job falls back automatically.
+- **Semicolon CSVs, preamble lines, missing or duplicate headers** are detected.
+- **Interrupted jobs** never leave half-written files.
 
-**Features:**  
-- Single or batch directory conversion  
-- Preserves schema and data types  
-- Maintains folder hierarchy  
+## Install
 
-## Tools Included
+From a checkout of this repository:
 
-1. **csv_to_parquet.py**: Basic CSV to Parquet converter
-2. **parquet_viewer.py**: Parquet file viewer and inspector
-3. **csv_splitter_converter.py**: Large CSV file splitter and converter
-
-## Installation
-
-### Prerequisites
 ```bash
-pip install pandas pyarrow tqdm
+pip install .                      # the package: pure Python, no dependencies
+pip install ./native/python        # the native engine (needs a Rust toolchain)
+pip install ".[arrow,fast]"        # pyarrow, numpy and extra codecs (optional)
 ```
 
-### Setup
-1. Clone or download the repository
-2. Ensure all requirements are installed
-3. Make sure Python 3.7+ is installed on your system
+Once the packages are published, the same is:
 
-## Tool Details
-
-### 1. CSV to Parquet Converter (csv_to_parquet.py)
-Basic converter for transforming CSV files to Parquet format.
-
-#### Features
-- Single file conversion
-- Batch directory conversion
-- Preserves data types and structure
-- Maintains directory hierarchy
-
-#### Usage
 ```bash
-# Convert single file
-python csv_to_parquet.py data.csv
-
-# Specify output location
-python csv_to_parquet.py data.csv --output converted/output.parquet
-
-# Convert entire directory
-python csv_to_parquet.py input_directory --output output_directory
+pip install "dataconv[native]"     # recommended: the Rust engine
+pip install "dataconv[all]"        # everything: native, pyarrow, codecs, Excel
 ```
 
-#### Python API
+The standalone binary (no Python) builds with `cargo build --release -p
+dataconv-cli` in `native/` and lands in `native/target/release/dataconv`.
+
+Requirements: Python 3.8 or newer (the native engine needs 3.9 or newer). Check
+what your machine offers with `dataconv doctor`.
+
+## Quick start
+
+```bash
+dataconv convert data.csv data.parquet                 # lossless, parallel, tuned
+dataconv convert data.csv --to parquet --profile max   # smallest Parquet
+dataconv convert exports/ --to parquet -o lake/        # a whole tree, in parallel
+dataconv compress huge.csv                             # huge.csv.dcz, byte-exact
+dataconv decompress huge.csv.dcz                       # the original bytes again
+dataconv split big.csv parts/ --size 100MB --to parquet
+dataconv info data.parquet                             # rows, schema, codecs, stats
+dataconv head data.csv -n 20
+dataconv verify data.csv data.parquet                  # same data?
+dataconv bench data.csv                                # which format suits this data
+```
+
 ```python
-from csv_to_parquet import convert_csv_to_parquet
+import dataconv as dc
 
-# Convert single file
-convert_csv_to_parquet('data.csv', 'output.parquet')
+report = dc.convert("data.csv", "data.parquet")
+print(report)               # rows, sizes, ratio, speed, engine
+print(report.warnings)      # e.g. "column 'zip' kept as text: leading zeros ..."
 
-# Convert directory
-batch_convert_csv_to_parquet('input_directory', 'output_directory')
+dc.compress("data.csv")                 # -> data.csv.dcz
+blob = dc.pack([19.99, 5.25, 7.5])      # compress a list in memory
+dc.unpack(blob)                         # -> [19.99, 5.25, 7.5], bit for bit
+
+table = dc.load("data.csv")             # a pyarrow.Table with lossless types
+dc.write(table, "out.parquet", profile="max")
 ```
 
-### 2. Parquet Viewer (parquet_viewer.py)
-Tool for inspecting and viewing Parquet file contents.
+## What is the best compression for my data?
 
-#### Features
-- View file contents
-- Display schema information
-- Show memory usage
-- Configurable row display
+It depends on what you will do with the file. `dataconv bench yourfile.csv`
+measures every option on your own data. For the 135.5 MB export above:
 
-#### Usage
+| format            | size    | ratio | write   | read   | use it for |
+|-------------------|--------:|------:|--------:|-------:|------------|
+| **DCZ max**       | 21.1 MB | 6.4x  | 16 s    | 0.3 s  | archival, smallest |
+| **DCZ balanced**  | 21.9 MB | 6.2x  | 0.3 s   | 0.1 s  | lossless storage and transfer |
+| Parquet max       | 29.3 MB | 4.6x  | 3.8 s   | 0.13 s | analytics, smallest Parquet |
+| Parquet zstd-3    | 33.5 MB | 4.0x  | 0.2 s   | 0.15 s | analytics (default) |
+| csv.xz            | 35.6 MB | 3.8x  | 7.6 s   | 1.8 s  | compatibility with xz tools |
+| csv.zst           | 44.0 MB | 3.1x  | 0.9 s   | 0.3 s  | fast generic compression |
+| Parquet snappy    | 49.6 MB | 2.7x  | 0.4 s   | 0.11 s | old readers |
+| csv.gz            | 49.6 MB | 2.7x  | 2.4 s   | 0.4 s  | maximum compatibility |
+
+Rules of thumb:
+
+- **To query the data** (pandas, polars, DuckDB, Spark), use **Parquet**. The
+  default zstd profile is the right speed/size balance. `--profile max` tunes each
+  column's encoding by trial: delta encoding for sorted integers and timestamps,
+  byte-stream-split for floats, prefix encoding for IDs and URLs.
+- **To store or ship a CSV exactly**, use **DCZ**. It is lossless to the byte
+  (every block is verified when written and checksummed when read), so a DCZ
+  file can stand in for the original CSV.
+- **Numbers in memory** (lists, arrays, time series) go through `dc.pack`.
+
+### How DCZ gets there
+
+General-purpose compressors see a CSV as a stream of characters. DCZ parses it,
+remembers exactly how every record was written (quoting and line endings), and
+encodes each column with the representation that suits it:
+
+| column looks like            | stored as                                                         |
+|------------------------------|-------------------------------------------------------------------|
+| `42`, `-7`, `1700000000`     | 64-bit integers: delta or run-length coded, minimal byte width     |
+| `19.99`, `0.05`, `-3.5`      | exact decimals: integer mantissa plus scale (no float rounding)    |
+| `2024-03-07 12:05:00`, `INV-000123` | a template of literal text and numeric fields, each delta-coded |
+| `red`, `green`, `red`        | a dictionary and small integer indices                             |
+| anything else                | lengths and bytes, kept apart                                      |
+
+Integers are stored as **byte planes** (all low bytes, then all next bytes, and
+so on), so the nearly constant high bytes compress to almost nothing. Cells that
+fit none of the patterns, such as `007` in an integer column or a ragged row,
+are kept verbatim. The result goes through zstd, or for `max` the best of zstd,
+lzma and brotli per stream. The format is specified in
+[docs/FORMAT.md](docs/FORMAT.md).
+
+### Lists and arrays: `dc.pack`
+
+`dc.pack` applies the same ideas to in-memory values and restores them exactly,
+including NaN payloads, `-0.0`, numpy dtypes and shapes. For one million values:
+
+| data                          | json + gzip-9 | pickle + zstd-19 | numpy + xz-9 | **dc.pack** |
+|-------------------------------|--------------:|-----------------:|-------------:|------------:|
+| prices with 2 decimals        | 2.6 MB        | 2.8 MB           | 2.1 MB       | **1.9 MB**  |
+| timestamps, 1 s steps         | 1.6 MB        | 874 KB           | 434 KB       | **261 KB**  |
+| smooth sensor readings        | 2.0 MB        | 2.2 MB           | 1.5 MB       | **1.1 MB**  |
+| small counts                  | 728 KB        | 614 KB           | 592 KB       | **556 KB**  |
+| random doubles                | 8.4 MB        | 6.7 MB           | 7.0 MB       | **6.5 MB**  |
+| IDs like `ORD-00000001`       | 2.3 MB        | 242 KB           | -            | **81 bytes** |
+
+Floats that were decimals before they became doubles (prices, sensor readings)
+are stored as integer mantissas, which only happens when dividing by the power of
+ten reproduces the exact bits. Other floats use XOR-delta byte planes. Random
+doubles are close to incompressible for every method.
+
+## Lossless type inference
+
+A column gets a typed representation only when every value converts without
+losing information. Otherwise it stays text, and the report says why.
+
+| values                                     | inferred type          | why |
+|--------------------------------------------|------------------------|-----|
+| `1`, `-2`, `30`                             | `int64`                | |
+| `007`, `02134`                              | `string`               | leading zeros carry meaning |
+| `+4915112345678`                            | `string`               | a `+` sign usually means a phone number |
+| `18446744073709551615`                      | `decimal(20,0)`        | beyond int64; a float would round it |
+| `0.1`, `2.50`, `1e-5`                       | `float64`              | every value round-trips |
+| `1.00000000000000000001`                    | `decimal(21,20)`       | more digits than a double holds |
+| `2024-01-02`                                | `date`                 | |
+| `2024-01-02T03:04:05.123+05:30`             | `timestamp[ms,+05:30]` | unit from the digits, offset kept |
+| offsets `+05:30` and `Z` mixed in one column | `string`              | a single type would drop local times |
+| `true`, `False`                             | `bool`                 | |
+| `NA`, `null`, `-`, empty in a numeric column | missing value          | |
+| `NA` in a text column (Namibia)             | `"NA"`                 | kept as written |
+
+An unquoted empty field is missing; a quoted empty field `""` is an empty string,
+and the distinction survives a round trip. Options:
+
+- `--types string` keeps every column as text;
+- `--types loose` behaves like most tools and parses `007` as `7`;
+- `--schema "zip=string,amount=decimal(12,2),ts=timestamp[us,UTC]"` overrides
+  single columns.
+
+Types are inferred from a sample (the start of the file plus windows spread
+through it). If a later value does not fit, the job re-plans from a full scan
+and restarts; `--infer full` scans everything up front.
+
+## Robustness
+
+- **Bad rows.** Rows with the wrong number of fields go to
+  `<output>.rejected.csv` by default (`--bad-lines quarantine`). Alternatives
+  are `skip`, `error` and `pad` (pad short rows with missing values).
+- **Encodings.** UTF-8 with or without BOM, UTF-16 and Windows-1252 are detected
+  from samples. Invalid bytes found later in the file trigger an automatic
+  re-read as Windows-1252.
+- **Dialects.** The delimiter (`,` `;` `\t` `|` and more), quoting, backslash
+  escapes, line endings, header presence and preamble lines before the header are
+  detected. Duplicate or empty column names are made unique.
+- **Compressed inputs.** `.gz`, `.zst`, `.xz`, `.bz2`, `.lz4`, `.br` and
+  single-file `.zip` inputs are read transparently, and outputs such as
+  `.csv.gz` or `.jsonl.zst` are compressed on the way out.
+- **Atomic outputs.** Results are written to a temporary file and moved into
+  place only on success. Ctrl-C or an error leaves the destination untouched.
+- **Verification.** `dataconv verify a b` compares contents across formats and
+  reports the first differences; DCZ checks a CRC-32 per block and for the
+  whole file.
+
+## Performance and resources
+
+The native engine splits input into record-aligned chunks (quote-aware, so
+newlines inside quoted fields are safe). It decodes the chunks on all cores,
+encodes Parquet columns and row groups in parallel, and overlaps reading,
+decoding and writing. Memory stays bounded however large the input is.
+
+Everything adapts to the machine:
+
+| resource      | detected from                                                  | drives |
+|---------------|----------------------------------------------------------------|--------|
+| CPUs          | affinity masks and cgroup CPU quotas (Docker, Kubernetes)      | worker threads, parallel files |
+| memory        | available RAM, cgroup limits, 32-bit address space             | chunk size, chunks in flight, row group size |
+| data          | sampled field widths, cardinality, measured output size        | dictionary use, encodings, split sizes |
+
+Override with `--threads`, `--memory 2GB`, or the `DATACONV_THREADS` and
+`DATACONV_MEMORY` environment variables. `dataconv doctor` shows what was
+detected, and `DATACONV_TRACE=1` prints phase timings for a job.
+
+Directory conversion runs several files at once when they are small and gives
+large files all the threads. `--skip-existing` makes repeated runs incremental.
+
+## Command reference
+
+```text
+dataconv convert SRC [DST] [options]   convert a file or a directory tree
+dataconv compress SRC [DST]            lossless DCZ compression
+dataconv decompress SRC [DST]          restore the original bytes
+dataconv split SRC DIR --rows N | --size SIZE [--to FORMAT] [--pattern P]
+dataconv merge SRC... -o DST           concatenate, unifying schemas
+dataconv info FILE [--exact]           format, rows, schema, codecs, statistics
+dataconv head FILE [-n N]              first rows
+dataconv count FILE                    exact row count
+dataconv schema FILE                   inferred column types
+dataconv sniff FILE                    detected CSV dialect
+dataconv stats FILE                    per-column profile
+dataconv verify A B                    same data? (exit code 1 if not)
+dataconv bench FILE [--quick]          compare formats and codecs on this data
+dataconv doctor                        resources, engines and codecs
+```
+
+Frequently used options:
+
+| option | meaning |
+|--------|---------|
+| `--to FORMAT` | csv, tsv, psv, jsonl, json, parquet, ipc (Feather), orc, dcz |
+| `-p, --profile` | `fast`, `balanced` (default), `max` |
+| `-c, --compression`, `--level` | codec and level, e.g. `-c zstd --level 9` |
+| `--types`, `--schema` | lossless (default), all text, permissive; per-column overrides |
+| `-d, --delimiter`, `--encoding`, `--no-header`, `--skip-rows` | override detection |
+| `--columns a,b`, `--limit N` | select columns, convert a prefix |
+| `--bad-lines` | `quarantine` (default), `skip`, `error`, `pad` |
+| `--include`, `--exclude`, `--skip-existing`, `--workers` | directory conversion |
+| `--threads`, `--memory`, `--engine` | resources and engine choice |
+| `-f, --overwrite`, `--json`, `-q`, `-v` | output control |
+
+The original scripts still work unchanged: `python csv_to_parquet.py`,
+`python parquet_viewer.py` and `python csv_splitter_converter.py`. They call
+the new engine and keep their arguments and output names, for example
+`chunk_0000.parquet`.
+
+## Python API
+
+| function | purpose |
+|----------|---------|
+| `convert(src, dst=None, **options)` | convert a file, or a directory (returns `Report` / `BatchReport`) |
+| `convert_dir(src, dst, to=..., include=..., skip_existing=...)` | directory trees |
+| `split(src, out_dir, rows=None, size=None, to=None, pattern=...)` | split by rows or target size |
+| `merge(sources, dst)` | concatenate with schema unification |
+| `compress(src, dst=None, profile=...)` / `decompress(src, dst=None)` | DCZ |
+| `pack(values, profile=...)` / `unpack(blob)` | lists, tuples, `array.array`, numpy arrays |
+| `load(path, **options)` / `write(data, dst, **options)` | pyarrow tables; `write` also takes pandas, polars and lists of dicts |
+| `info`, `head`, `count`, `schema`, `sniff`, `stats` | inspection |
+| `verify(a, b)` | content comparison across formats |
+| `bench(src, quick=False)` | measure formats and codecs, with recommendations |
+| `system_info()`, `plan(size)` | what the machine offers, how a job would use it |
+
+All options of the `convert` command are keyword arguments: `to`, `profile`,
+`compression`, `level`, `types`, `schema`, `delimiter`, `encoding`, `header`,
+`skip_rows`, `null_values`, `bad_lines`, `quarantine`, `columns`, `limit`,
+`threads`, `memory`, `overwrite`, `engine`, and `progress` (`True` for a progress
+bar, or a callable `(done_bytes, total_bytes)` that returns `False` to cancel).
+Errors derive from `dataconv.DataconvError`.
+
+## Engines and portability
+
+| engine | needs | reads and writes | speed |
+|--------|-------|------------------|-------|
+| `native` | the `dataconv-native` wheel (CPython 3.9+, one abi3 wheel per platform) | CSV/TSV, JSON Lines, Parquet, Arrow IPC, DCZ | fastest |
+| `arrow` | pyarrow | all of the above plus JSON arrays, ORC and Excel (needs openpyxl) | fast |
+| `pure` | nothing (Python 3.8+) | CSV/TSV, JSON Lines, JSON, DCZ | portable |
+
+`--engine auto` (the default) picks the first engine that handles both formats.
+All engines apply the same type rules and read and write the same DCZ files,
+which the test suite cross-checks. The suite runs on Python 3.8 to 3.13, with and
+without each optional package; set `DATACONV_DISABLE=all` (or a list such as
+`dataconv_native,pyarrow`) to try the fallbacks yourself.
+
+The native engine is plain Rust with no system dependencies. It builds for
+Windows, macOS and Linux on x86-64 and ARM64, and from source wherever Rust runs.
+
+## Architecture
+
+```text
+dataconv (Python)                         dataconv-native (Rust, PyO3, abi3)
+  cli.py      command line                  python/   bindings (GIL released, Ctrl-C aware)
+  api.py      public API, engine choice     core/     the engine
+  engines/    native | arrow | pure           chunk.rs     quote-aware record-aligned chunks
+  infer.py    lossless type rules             tokenize.rs  zero-copy CSV tokenizer
+  _sniff.py   dialect detection               types.rs     lossless type rules
+  dcz.py      DCZ reader/writer               decode.rs    guarded typed column builders
+  resources.py container-aware planning       convert.rs   streaming pipeline, re-planning
+  tune.py     Parquet tuning                  tables.rs    parallel Parquet, IPC, JSONL, CSV
+                                              split.rs     byte-exact and size-targeted splits
+                                              dcz/         columnar codec, container, int coding
+                                              pack.rs      value packing
+                                            cli/      standalone `dataconv` binary
+```
+
+## Development
+
 ```bash
-# Basic view
-python parquet_viewer.py file.parquet
-
-# View with 10 rows
-python parquet_viewer.py file.parquet --rows 10
-
-# View without schema
-python parquet_viewer.py file.parquet --no-schema
-
-# View without additional info
-python parquet_viewer.py file.parquet --no-info
+pip install -e ".[dev,arrow,fast]"
+pip install ./native/python             # or: cd native/python && maturin develop --release
+pytest                                  # Python suite (all engines available)
+DATACONV_DISABLE=all pytest             # the pure-Python fallbacks only
+cd native && cargo test                 # Rust unit and integration tests
 ```
 
-#### Python API
-```python
-from parquet_viewer import view_parquet
-
-# View file with default settings
-df = view_parquet('file.parquet')
-
-# Customize view
-df = view_parquet('file.parquet', 
-                  num_rows=10,
-                  show_info=True,
-                  show_schema=True)
-```
-
-### 3. CSV Splitter and Converter (csv_splitter_converter.py)
-Tool for handling large CSV files by splitting them into smaller chunks and converting to Parquet format.
-
-#### Features
-- Split large CSV files into manageable chunks
-- Automatic chunk size estimation
-- Progress tracking
-- UTF-8 encoding support
-- Handles problematic rows
-- Supports decimal chunk sizes
-
-#### Usage
-```bash
-# Split with default chunk size (250MB)
-python csv_splitter_converter.py large_file.csv output_directory
-
-# Split with custom chunk size (e.g., 100MB)
-python csv_splitter_converter.py large_file.csv output_directory --chunk-size 100
-
-# Split with small chunk size (e.g., 0.1MB)
-python csv_splitter_converter.py large_file.csv output_directory --chunk-size 0.1
-```
-
-#### Python API
-```python
-from csv_splitter import CSVSplitterConverter
-
-# Initialize with desired chunk size (in MB)
-splitter = CSVSplitterConverter(chunk_size_mb=250)
-
-# Split and convert
-created_files = splitter.split_and_convert(
-    'large_file.csv',
-    'output_directory'
-)
-```
-
-## Common Use Cases
-
-1. **Converting Small to Medium CSV Files**
-   ```bash
-   python csv_to_parquet.py data.csv
-   ```
-
-2. **Inspecting Converted Files**
-   ```bash
-   python parquet_viewer.py output.parquet
-   ```
-
-3. **Handling Large CSV Files**
-   ```bash
-   python csv_splitter_converter.py large_file.csv chunks --chunk-size 100
-   ```
-
-## Error Handling
-
-### Common Issues and Solutions
-
-1. **Memory Errors**
-   - Use csv_splitter_converter.py for large files
-   - Reduce chunk size using --chunk-size parameter
-
-2. **Encoding Issues**
-   - The tools use UTF-8 encoding by default
-   - Bad lines are skipped and logged
-
-3. **Data Type Issues**
-   - Parquet viewer will show schema information
-   - Check data types using --show-schema option
-
-## Best Practices
-
-1. **For Large Files**
-   - Start with a larger chunk size and adjust down if needed
-   - Monitor system memory during conversion
-   - Use progress indicators to track conversion status
-
-2. **For Data Validation**
-   - Use parquet_viewer to inspect converted files
-   - Compare row counts between source and destination
-   - Verify data types are preserved correctly
-
-## Contributing
-
-Feel free to submit issues and enhancement requests!
+Changes to the type rules or to DCZ must be made in both implementations;
+`tests/test_infer.py` and `tests/test_dcz.py` check that they agree.
 
 ## License
 
-This project is licensed under the Apache License - see the LICENSE file for details.
+PolyForm Noncommercial License 1.0.0. See [LICENSE](LICENSE).
 
-## Support
-
-For support and questions, please open an issue in the repository.
+You may use, modify and share this software for any **noncommercial**
+purpose: research, education, personal projects and hobby use, and use by
+charitable, educational, public research, public safety, health and government
+organizations. **Commercial use is not permitted** without a separate license
+from the author. Earlier releases were published under Apache-2.0 and remain
+available under those terms.

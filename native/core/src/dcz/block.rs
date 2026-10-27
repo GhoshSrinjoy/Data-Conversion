@@ -40,6 +40,9 @@ pub fn stream_codecs(profile: Profile) -> Vec<(CodecId, i32)> {
     }
 }
 
+/// One compressed stream of a payload: (codec, decoded length, stored bytes).
+pub type Stream = (CodecId, usize, Vec<u8>);
+
 /// Brotli at quality 11 runs at about 1 MB/s, so it is only tried on small streams.
 const BROTLI_MAX_STREAM: usize = 1 << 20;
 
@@ -55,7 +58,7 @@ pub fn compress_stream(data: &[u8], profile: Profile) -> Result<(CodecId, Vec<u8
 }
 
 /// Quick size estimate used to rank candidate encodings before the expensive codecs run.
-fn quick_size(data: &[u8]) -> usize {
+pub(crate) fn quick_size(data: &[u8]) -> usize {
     if data.len() < 48 {
         return data.len();
     }
@@ -143,7 +146,7 @@ pub fn encode(data: &[u8], d: Dialect, first_block: bool, profile: Profile) -> R
 
     // Columns, in parallel.
     let exhaustive = profile == Profile::Max;
-    let columns: Vec<(Vec<u8>, Vec<(CodecId, usize, Vec<u8>)>)> = (0..ncols)
+    let columns: Vec<(Vec<u8>, Vec<Stream>)> = (0..ncols)
         .into_par_iter()
         .map(|j| -> Result<_> {
             // Rank the candidate encodings with a fast codec, then spend the profile's
@@ -272,7 +275,7 @@ pub fn decode(payload: &[u8], raw_len: usize) -> Result<Vec<u8>> {
     let mut raw_iter = raw_records.into_iter().peekable();
     let mut row = 0usize;
     for rec in 0..records {
-        if raw_iter.peek().map_or(false, |(p, _)| *p == rec) {
+        if raw_iter.peek().is_some_and(|(p, _)| *p == rec) {
             out.extend_from_slice(&raw_iter.next().unwrap().1);
             continue;
         }

@@ -18,6 +18,7 @@
 //! -0.0, values needing more digits) is stored verbatim as an exception.
 
 use crate::codec::{self, CodecId, Profile};
+use crate::dcz::block::Stream;
 use crate::dcz::ints::{self, put_varint, Cursor};
 use crate::dcz::text;
 use crate::error::{Error, Result};
@@ -57,8 +58,8 @@ pub struct Packed {
 }
 
 const POW10: [f64; 23] = [
-    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19,
-    1e20, 1e21, 1e22,
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20,
+    1e21, 1e22,
 ];
 const MAX_EXACT: f64 = 9_007_199_254_740_992.0; // 2^53
 
@@ -95,14 +96,16 @@ fn best_exponent(values: &[f64]) -> (usize, usize) {
     best
 }
 
-fn stream(out: &mut Vec<(CodecId, usize, Vec<u8>)>, data: Vec<u8>, profile: Profile) -> Result<()> {
+fn stream(out: &mut Vec<Stream>, data: Vec<u8>, profile: Profile) -> Result<()> {
     let (c, bytes) = crate::dcz::block::compress_stream(&data, profile)?;
     out.push((c, data.len(), bytes));
     Ok(())
 }
 
-fn float_streams(values: &[f64], profile: Profile) -> Result<(Vec<u8>, Vec<(CodecId, usize, Vec<u8>)>)> {
-    let mut candidates: Vec<(Vec<u8>, Vec<(CodecId, usize, Vec<u8>)>)> = Vec::new();
+type Encoded = (Vec<u8>, Vec<Stream>);
+
+fn float_streams(values: &[f64], profile: Profile) -> Result<Encoded> {
+    let mut candidates: Vec<Encoded> = Vec::new();
     let (e, misses) = best_exponent(values);
     if misses * 4 < values.len().max(1) {
         let mut mantissas = Vec::with_capacity(values.len());
@@ -195,20 +198,17 @@ pub fn pack(p: &Packed, profile: Profile) -> Result<Vec<u8>> {
             let cells: Vec<&[u8]> = v.iter().map(|s| s.as_slice()).collect();
             let quoted = vec![false; cells.len()];
             let exhaustive = profile == Profile::Max;
-            let mut best: Option<(usize, Vec<u8>, Vec<(CodecId, usize, Vec<u8>)>)> = None;
-            for cand in text::candidates(&cells, &quoted, exhaustive) {
-                let mut packed = Vec::new();
-                for s in cand.streams {
-                    stream(&mut packed, s, profile)?;
-                }
-                let size = cand.meta.len() + packed.iter().map(|x| x.2.len() + 6).sum::<usize>();
-                if best.as_ref().map_or(true, |(b, _, _)| size < *b) {
-                    best = Some((size, cand.meta, packed));
-                }
+            // Rank with a fast codec, then compress only the winner with the profile's codecs.
+            let best = text::candidates(&cells, &quoted, exhaustive)
+                .into_iter()
+                .min_by_key(|c| {
+                    c.meta.len() + c.streams.iter().map(|s| crate::dcz::block::quick_size(s) + 6).sum::<usize>()
+                })
+                .expect("raw always applies");
+            meta.extend_from_slice(&best.meta);
+            for s in best.streams {
+                stream(&mut streams, s, profile)?;
             }
-            let (_, m, s) = best.expect("raw always applies");
-            meta.extend_from_slice(&m);
-            streams.extend(s);
         }
     }
     let mut all = Vec::with_capacity(streams.len() + 1);
@@ -236,7 +236,9 @@ pub fn pack(p: &Packed, profile: Profile) -> Result<Vec<u8>> {
 /// Equality with floats compared bit for bit (NaN payloads and -0.0 included).
 pub fn same(a: &Packed, b: &Packed) -> bool {
     let values = match (&a.values, &b.values) {
-        (Values::Float(x), Values::Float(y)) => x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits()),
+        (Values::Float(x), Values::Float(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits())
+        }
         (x, y) => x == y,
     };
     values && a.valid == b.valid && a.tag == b.tag
@@ -353,7 +355,8 @@ mod tests {
         let prices: Vec<f64> = (0..100_000).map(|i| ((i * 37) % 100_000) as f64 / 100.0).collect();
         let size = rt(Values::Float(prices), None);
         assert!(size < 100_000 * 3, "decimal floats should pack well, got {size}");
-        let specials = vec![0.0, -0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MIN_POSITIVE, 1e300, 0.1, 1.0 / 3.0];
+        let specials =
+            vec![0.0, -0.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MIN_POSITIVE, 1e300, 0.1, 1.0 / 3.0];
         rt(Values::Float(specials), None);
         let noisy: Vec<f64> = (0..10_000).map(|i| (i as f64).sin()).collect();
         rt(Values::Float(noisy), None);

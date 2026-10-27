@@ -93,7 +93,7 @@ pub fn truncated() -> Error {
 
 #[inline]
 fn width_for(max: u64) -> u8 {
-    ((64 - max.leading_zeros() + 7) / 8) as u8
+    (64 - max.leading_zeros()).div_ceil(8) as u8
 }
 
 /// Append `values` as `width`-byte little-endian unsigned numbers in byte planes.
@@ -260,7 +260,7 @@ pub fn decode(c: &mut Cursor<'_>) -> Result<Vec<i64>> {
                 if len < 0 || out.len() + len as usize > n {
                     return Err(truncated());
                 }
-                out.extend(std::iter::repeat(v).take(len as usize));
+                out.extend(std::iter::repeat_n(v, len as usize));
             }
             if out.len() != n {
                 return Err(truncated());

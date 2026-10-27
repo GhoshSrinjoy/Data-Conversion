@@ -161,8 +161,15 @@ fn encode_block(data: &[u8], csv: Option<Dialect>, first: bool, profile: Profile
         }
     };
     let mut header = Vec::with_capacity(BLOCK_HEADER_LEN);
-    BlockHeader { kind, codec: codec_id as u8, raw_len: data.len() as u64, payload_len: payload.len() as u64, crc32: crc, records }
-        .write(&mut header);
+    BlockHeader {
+        kind,
+        codec: codec_id as u8,
+        raw_len: data.len() as u64,
+        payload_len: payload.len() as u64,
+        crc32: crc,
+        records,
+    }
+    .write(&mut header);
     Ok(EncodedBlock { header, payload, raw_len: data.len() as u64, kind, records })
 }
 
@@ -265,7 +272,11 @@ impl DczWriter {
         let csv = self.csv;
         let profile = self.opts.profile;
         let encoded: Vec<EncodedBlock> = self.pool.install(|| {
-            blocks.par_iter().enumerate().map(|(i, b)| encode_block(b, csv, first && i == 0, profile)).collect::<Result<_>>()
+            blocks
+                .par_iter()
+                .enumerate()
+                .map(|(i, b)| encode_block(b, csv, first && i == 0, profile))
+                .collect::<Result<_>>()
         })?;
         self.first = false;
         let out = self.out.as_mut().expect("writer open");
@@ -337,7 +348,7 @@ impl Write for DczWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.pending.extend_from_slice(buf);
         if self.pending.len() >= self.block_size * self.wave {
-            self.drain(false).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            self.drain(false).map_err(|e| std::io::Error::other(e.to_string()))?;
         }
         Ok(buf.len())
     }
@@ -349,7 +360,7 @@ impl Write for DczWriter {
 
 impl crate::tables::FinishWrite for DczWriter {
     fn finish_box(self: Box<Self>) -> std::io::Result<()> {
-        (*self).finish().map(|_| ()).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        (*self).finish().map(|_| ()).map_err(|e| std::io::Error::other(e.to_string()))
     }
 }
 
@@ -497,7 +508,13 @@ fn looks_delimited(path: &Path) -> Option<Dialect> {
 
 /// Compress a file into DCZ.  Delimited text is encoded column-wise (byte-exact);
 /// anything else is stored as compressed raw blocks.
-pub fn compress_file(src: &Path, dst: &Path, opts: &EncodeOptions, overwrite: bool, hooks: &dyn Hooks) -> Result<Report> {
+pub fn compress_file(
+    src: &Path,
+    dst: &Path,
+    opts: &EncodeOptions,
+    overwrite: bool,
+    hooks: &dyn Hooks,
+) -> Result<Report> {
     let started = Instant::now();
     let input = io::open_input(src)?;
     let size = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
@@ -574,7 +591,10 @@ pub fn decompress_file(src: &Path, dst: &Path, overwrite: bool, threads: usize, 
     while i < footer.blocks.len() {
         let mut group = Vec::new();
         let mut bytes = 0u64;
-        while i < footer.blocks.len() && (group.is_empty() || bytes + footer.blocks[i].raw_len <= wave_bytes) && group.len() < plan.threads * 2 {
+        while i < footer.blocks.len()
+            && (group.is_empty() || bytes + footer.blocks[i].raw_len <= wave_bytes)
+            && group.len() < plan.threads * 2
+        {
             let b = &footer.blocks[i];
             f.seek(SeekFrom::Start(b.offset))?;
             let mut bh = [0u8; BLOCK_HEADER_LEN];
@@ -647,7 +667,15 @@ pub fn compress_bytes(data: &[u8], csv: bool, profile: Profile) -> Result<Vec<u8
     let json = serde_json::to_vec(&footer)?;
     let footer_offset = out.len() as u64;
     let mut h = Vec::new();
-    BlockHeader { kind: KIND_FOOTER, codec: 0, raw_len: json.len() as u64, payload_len: json.len() as u64, crc32: crc32fast::hash(&json), records: 0 }.write(&mut h);
+    BlockHeader {
+        kind: KIND_FOOTER,
+        codec: 0,
+        raw_len: json.len() as u64,
+        payload_len: json.len() as u64,
+        crc32: crc32fast::hash(&json),
+        records: 0,
+    }
+    .write(&mut h);
     out.extend_from_slice(&h);
     out.extend_from_slice(&json);
     out.extend_from_slice(&footer_offset.to_le_bytes());
@@ -724,7 +752,8 @@ pub fn decompress_bytes(buf: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(footer.original_size as usize);
     let mut pos = HEADER_LEN;
     while pos < footer_offset {
-        let bh: &[u8; BLOCK_HEADER_LEN] = buf.get(pos..pos + BLOCK_HEADER_LEN).ok_or_else(ints::truncated)?.try_into().unwrap();
+        let bh: &[u8; BLOCK_HEADER_LEN] =
+            buf.get(pos..pos + BLOCK_HEADER_LEN).ok_or_else(ints::truncated)?.try_into().unwrap();
         let h = BlockHeader::parse(bh);
         pos += BLOCK_HEADER_LEN;
         let end = pos.checked_add(h.payload_len as usize).ok_or_else(ints::truncated)?;
@@ -753,7 +782,15 @@ mod tests {
     fn file_roundtrip_all_profiles() {
         let mut csv = String::from("id,amount,city,ts\n");
         for i in 0..120_000 {
-            csv.push_str(&format!("{},{}.{:02},{},2024-01-01T{:02}:{:02}:00\n", i, i % 977, i % 100, ["Paris", "Pune", "\"Rome, IT\""][i % 3], i / 60 % 24, i % 60));
+            csv.push_str(&format!(
+                "{},{}.{:02},{},2024-01-01T{:02}:{:02}:00\n",
+                i,
+                i % 977,
+                i % 100,
+                ["Paris", "Pune", "\"Rome, IT\""][i % 3],
+                i / 60 % 24,
+                i % 60
+            ));
         }
         let src = tmp("in.csv");
         std::fs::write(&src, &csv).unwrap();
@@ -793,7 +830,14 @@ mod tests {
         std::fs::write(&src, &data).unwrap();
         let dst = tmp("blob.dcz");
         let back = tmp("blob.back");
-        compress_file(&src, &dst, &EncodeOptions { profile: Profile::Balanced, threads: 2, block_size: Some(100_000) }, true, &NoHooks).unwrap();
+        compress_file(
+            &src,
+            &dst,
+            &EncodeOptions { profile: Profile::Balanced, threads: 2, block_size: Some(100_000) },
+            true,
+            &NoHooks,
+        )
+        .unwrap();
         decompress_file(&dst, &back, true, 2, &NoHooks).unwrap();
         assert_eq!(std::fs::read(&back).unwrap(), data);
         assert_eq!(read_footer(&dst).unwrap().kind, "raw");

@@ -99,10 +99,8 @@ pub fn plan_with(
     chunk: Option<usize>,
 ) -> Plan {
     let threads = threads.filter(|&t| t > 0).unwrap_or(info.cpu_usable).max(1);
-    let budget = memory
-        .filter(|&m| m > 0)
-        .unwrap_or_else(|| (info.mem_available / 2).min(info.mem_total * 4 / 5))
-        .max(64 * MIB);
+    let budget =
+        memory.filter(|&m| m > 0).unwrap_or_else(|| (info.mem_available / 2).min(info.mem_total * 4 / 5)).max(64 * MIB);
     let wave_bytes = ((budget as f64) / EXPANSION) as u64;
     // User-supplied chunk sizes are clamped: a typo must not become a 256 GB allocation.
     let mut chunk_size = chunk.map(|c| (c as u64).clamp(4 * KIB, 2 * GIB)).unwrap_or_else(|| {

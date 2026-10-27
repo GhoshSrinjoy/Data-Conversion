@@ -100,7 +100,7 @@ pub fn split_csv_bytes(
                 f.writer().write_all(rec)?;
                 *rows += 1;
                 *bytes += rec.len() as u64;
-                let full = spec.rows.map_or(false, |n| *rows >= n) || spec.bytes.map_or(false, |b| *bytes >= b);
+                let full = spec.rows.is_some_and(|n| *rows >= n) || spec.bytes.is_some_and(|b| *bytes >= b);
                 if full {
                     let (f, rows, _) = current.take().unwrap();
                     let path = spec.path(parts.len());
@@ -130,7 +130,12 @@ pub fn split_csv_bytes(
     Ok(parts)
 }
 
-fn written_size(sample: &RecordBatch, format: Format, compression: Compression, opts: &crate::convert::ConvertOptions) -> usize {
+fn written_size(
+    sample: &RecordBatch,
+    format: Format,
+    compression: Compression,
+    opts: &crate::convert::ConvertOptions,
+) -> usize {
     use crate::codec::{compress, CodecId};
     let rows = sample.num_rows().max(1);
     let compressed = |text: Vec<u8>| -> usize {
@@ -173,7 +178,9 @@ fn written_size(sample: &RecordBatch, format: Format, compression: Compression, 
             let mut buf = Vec::new();
             let _ = crate::csvout::write_batch(&mut buf, sample, &crate::csvout::CsvWriteOptions::default());
             if format == Format::Dcz {
-                crate::dcz::compress_bytes(&buf, true, crate::codec::Profile::Balanced).map(|c| c.len()).unwrap_or(buf.len())
+                crate::dcz::compress_bytes(&buf, true, crate::codec::Profile::Balanced)
+                    .map(|c| c.len())
+                    .unwrap_or(buf.len())
             } else {
                 compressed(buf)
             }
@@ -231,7 +238,14 @@ impl<F> RollingSink<F>
 where
     F: FnMut(&Path, Option<&RecordBatch>, usize) -> Result<(AtomicFile, Box<dyn Sink>)>,
 {
-    pub fn new(spec: SplitSpec, format: Format, compression: Compression, schema: SchemaRef, opts: crate::convert::ConvertOptions, open: F) -> Result<Self> {
+    pub fn new(
+        spec: SplitSpec,
+        format: Format,
+        compression: Compression,
+        schema: SchemaRef,
+        opts: crate::convert::ConvertOptions,
+        open: F,
+    ) -> Result<Self> {
         std::fs::create_dir_all(&spec.dir).map_err(|e| Error::io(e, &spec.dir))?;
         let rows_target = spec.rows.unwrap_or(u64::MAX);
         let measured = spec.bytes.is_none();
@@ -300,7 +314,8 @@ where
             if self.current.is_none() {
                 let path = self.spec.path(self.parts.len());
                 let rg = self.rows_target.min(usize::MAX as u64) as usize;
-                let (file, sink) = (self.open)(&path, Some(&batch.slice(offset, (total - offset).min(MEASURE_ROWS))), rg)?;
+                let (file, sink) =
+                    (self.open)(&path, Some(&batch.slice(offset, (total - offset).min(MEASURE_ROWS))), rg)?;
                 self.current = Some((file, sink, 0));
             }
             let (_, sink, rows) = self.current.as_mut().unwrap();

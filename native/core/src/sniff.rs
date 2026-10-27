@@ -37,7 +37,11 @@ impl CsvDialect {
 
     /// The byte the chunker splits on.
     pub fn split_byte(&self) -> u8 {
-        if self.terminator == "\r" { b'\r' } else { b'\n' }
+        if self.terminator == "\r" {
+            b'\r'
+        } else {
+            b'\n'
+        }
     }
 
     /// Records to skip at the start of the data (preamble lines plus the header).
@@ -106,7 +110,13 @@ pub fn trim_partial_utf8(sample: &[u8]) -> &[u8] {
     for back in 1..=3.min(n) {
         let b = sample[n - back];
         if b & 0xC0 == 0xC0 {
-            let needed = if b >= 0xF0 { 4 } else if b >= 0xE0 { 3 } else { 2 };
+            let needed = if b >= 0xF0 {
+                4
+            } else if b >= 0xE0 {
+                3
+            } else {
+                2
+            };
             return if back < needed { &sample[..n - back] } else { sample };
         }
         if b & 0x80 == 0 {
@@ -228,7 +238,7 @@ pub fn sniff(raw: &[u8], complete: bool, opts: &SniffOptions) -> Result<CsvDiale
         Some(q) => parse_char_option(q),
         None => Some(b'"'),
     };
-    let has_quotes = quote.map_or(false, |q| memchr::memchr(q, &text).is_some());
+    let has_quotes = quote.is_some_and(|q| memchr::memchr(q, &text).is_some());
     let escape = match &opts.escape {
         Some(e) => parse_char_option(e),
         None => detect_backslash_escape(&text, quote),
@@ -236,7 +246,7 @@ pub fn sniff(raw: &[u8], complete: bool, opts: &SniffOptions) -> Result<CsvDiale
     let base = Dialect { delimiter: b',', quote, escape, double_quote: escape.is_none() };
     const LIMIT: usize = 400;
 
-    let tsv_hint = opts.extension.as_deref().map_or(false, |e| {
+    let tsv_hint = opts.extension.as_deref().is_some_and(|e| {
         let e = e.trim_start_matches('.').to_ascii_lowercase();
         e == "tsv" || e == "tab"
     });
@@ -297,7 +307,11 @@ pub fn sniff(raw: &[u8], complete: bool, opts: &SniffOptions) -> Result<CsvDiale
                 }
                 k += 1;
             }
-            if k >= rows.len() { 0 } else { k }
+            if k >= rows.len() {
+                0
+            } else {
+                k
+            }
         }
     };
 
@@ -415,7 +429,8 @@ mod tests {
 
     #[test]
     fn preamble_and_terminators() {
-        let d = sn("Exported report\nGenerated 2024-01-01\n\nid,value,flag\n1,2,true\n3,4,false\n5,6,true\n7,8,false\n");
+        let d =
+            sn("Exported report\nGenerated 2024-01-01\n\nid,value,flag\n1,2,true\n3,4,false\n5,6,true\n7,8,false\n");
         assert_eq!(d.skip_rows, 3);
         assert_eq!(d.columns, vec!["id", "value", "flag"]);
         assert_eq!(sn("a,b\r\n1,2\r\n").terminator, "\r\n");

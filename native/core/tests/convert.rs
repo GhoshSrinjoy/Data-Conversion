@@ -130,7 +130,12 @@ fn recovers_from_type_drift_beyond_the_sample() {
     s.push_str("1.5,x\n");
     std::fs::write(&src, &s).unwrap();
     let dst = d.join("drift.parquet");
-    let opts = ConvertOptions { overwrite: true, sample_bytes: Some(64 << 10), chunk_size: Some(256 << 10), ..Default::default() };
+    let opts = ConvertOptions {
+        overwrite: true,
+        sample_bytes: Some(64 << 10),
+        chunk_size: Some(256 << 10),
+        ..Default::default()
+    };
     let report = convert(&src, &dst, &opts, &NoHooks).unwrap();
     assert_eq!(report.restarts, 1, "{:?}", report.warnings);
     assert_eq!(report.schema, vec![("a".into(), "float64".into()), ("b".into(), "string".into())]);
@@ -162,12 +167,29 @@ fn bad_line_policies_and_options() {
     let src = d.join("bad.csv");
     std::fs::write(&src, "a,b,c\n1,2,3\n4,5\n6,7,8,9\n").unwrap();
     let dst = d.join("bad.parquet");
-    let err = convert(&src, &dst, &ConvertOptions { overwrite: true, bad_lines: BadLines::Error, ..Default::default() }, &NoHooks);
+    let err = convert(
+        &src,
+        &dst,
+        &ConvertOptions { overwrite: true, bad_lines: BadLines::Error, ..Default::default() },
+        &NoHooks,
+    );
     assert!(err.is_err());
     assert!(!dst.exists(), "no partial output on failure");
-    let r = convert(&src, &dst, &ConvertOptions { overwrite: true, bad_lines: BadLines::Pad, ..Default::default() }, &NoHooks).unwrap();
+    let r = convert(
+        &src,
+        &dst,
+        &ConvertOptions { overwrite: true, bad_lines: BadLines::Pad, ..Default::default() },
+        &NoHooks,
+    )
+    .unwrap();
     assert_eq!((r.rows, r.bad_rows), (2, 1));
-    let r = convert(&src, &dst, &ConvertOptions { overwrite: true, bad_lines: BadLines::Skip, ..Default::default() }, &NoHooks).unwrap();
+    let r = convert(
+        &src,
+        &dst,
+        &ConvertOptions { overwrite: true, bad_lines: BadLines::Skip, ..Default::default() },
+        &NoHooks,
+    )
+    .unwrap();
     assert_eq!((r.rows, r.bad_rows), (1, 2));
     assert!(r.quarantine.is_none());
     // projection, limit, schema override, refusing to overwrite
@@ -194,8 +216,20 @@ fn max_profile_tunes_parquet() {
     std::fs::write(&src, &s).unwrap();
     let fast = d.join("fast.parquet");
     let max = d.join("max.parquet");
-    let rf = convert(&src, &fast, &ConvertOptions { overwrite: true, profile: Some("fast".into()), ..Default::default() }, &NoHooks).unwrap();
-    let rm = convert(&src, &max, &ConvertOptions { overwrite: true, profile: Some("max".into()), ..Default::default() }, &NoHooks).unwrap();
+    let rf = convert(
+        &src,
+        &fast,
+        &ConvertOptions { overwrite: true, profile: Some("fast".into()), ..Default::default() },
+        &NoHooks,
+    )
+    .unwrap();
+    let rm = convert(
+        &src,
+        &max,
+        &ConvertOptions { overwrite: true, profile: Some("max".into()), ..Default::default() },
+        &NoHooks,
+    )
+    .unwrap();
     assert!(rm.bytes_out <= rf.bytes_out, "max {} vs fast {}", rm.bytes_out, rf.bytes_out);
     assert_eq!(read_parquet(&max).num_rows(), 100_000);
 }
@@ -213,7 +247,8 @@ fn split_csv_is_byte_exact() {
     let header = "a,b,c\r\n";
     std::fs::write(&src, format!("{header}{body}")).unwrap();
     let out = d.join("parts");
-    let opts = ConvertOptions { split_rows: Some(3000), split_pattern: Some("chunk_{n:04}".into()), ..Default::default() };
+    let opts =
+        ConvertOptions { split_rows: Some(3000), split_pattern: Some("chunk_{n:04}".into()), ..Default::default() };
     let r = convert(&src, &out, &opts, &NoHooks).unwrap();
     assert_eq!(r.parts.len(), 4);
     assert_eq!(r.rows, 10_000);

@@ -6,16 +6,16 @@
 
 use std::sync::Arc;
 
+use arrow::array::builder::{BooleanBufferBuilder, NullBufferBuilder};
 use arrow::array::{
     ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray,
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
 };
-use arrow::array::builder::{BooleanBufferBuilder, NullBufferBuilder};
 use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 
 use crate::types::{
     is_nan_token, is_null_token, parse_bool, parse_date, parse_decimal, parse_float, parse_int, parse_timestamp,
-    IntParse, LogicalType, Tz, TypesMode, Unit,
+    IntParse, LogicalType, TypesMode, Tz, Unit,
 };
 
 #[derive(Clone, Debug)]
@@ -182,12 +182,13 @@ impl ColumnBuilder {
                         (Some(e), t) => t == *e,
                         _ => false,
                     };
-                    let precise = (ts.frac_digits as u32) <= match unit {
-                        Unit::S => 0,
-                        Unit::Ms => 3,
-                        Unit::Us => 6,
-                        Unit::Ns => 9,
-                    };
+                    let precise = (ts.frac_digits as u32)
+                        <= match unit {
+                            Unit::S => 0,
+                            Unit::Ms => 3,
+                            Unit::Us => 6,
+                            Unit::Ns => 9,
+                        };
                     match ts.to_unit(*unit) {
                         Some(x) if tz_ok && precise => {
                             values.push(x);

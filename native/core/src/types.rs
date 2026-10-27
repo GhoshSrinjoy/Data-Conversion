@@ -17,9 +17,8 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const NULL_TOKENS: &[&[u8]] = &[
-    b"", b"NA", b"N/A", b"n/a", b"na", b"NULL", b"null", b"Null", b"None", b"none", b"nil", b"NIL", b"#N/A", b"-",
-];
+pub const NULL_TOKENS: &[&[u8]] =
+    &[b"", b"NA", b"N/A", b"n/a", b"na", b"NULL", b"null", b"Null", b"None", b"none", b"nil", b"NIL", b"#N/A", b"-"];
 pub const NAN_TOKENS: &[&[u8]] = &[b"NaN", b"nan", b"NAN"];
 
 #[inline]
@@ -30,12 +29,12 @@ pub fn is_null_token(v: &[u8], extra: &[Vec<u8>]) -> bool {
     if v.len() > 4 && extra.is_empty() {
         return false;
     }
-    NULL_TOKENS.iter().any(|t| *t == v) || extra.iter().any(|t| t.as_slice() == v)
+    NULL_TOKENS.contains(&v) || extra.iter().any(|t| t.as_slice() == v)
 }
 
 #[inline]
 pub fn is_nan_token(v: &[u8]) -> bool {
-    v.len() == 3 && NAN_TOKENS.iter().any(|t| *t == v)
+    v.len() == 3 && NAN_TOKENS.contains(&v)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -169,7 +168,11 @@ impl LogicalType {
                     };
                     let tz = parts.next().map(|z| {
                         let z = z.trim();
-                        if z.eq_ignore_ascii_case("utc") || z == "z" { "UTC".to_string() } else { z.to_uppercase() }
+                        if z.eq_ignore_ascii_case("utc") || z == "z" {
+                            "UTC".to_string()
+                        } else {
+                            z.to_uppercase()
+                        }
                     });
                     LogicalType::Timestamp { unit, tz }
                 } else {

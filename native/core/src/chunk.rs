@@ -30,7 +30,7 @@ pub fn last_boundary(buf: &[u8], quote: Option<u8>, term: u8) -> Option<usize> {
     let mut end = buf.len();
     while let Some(nl) = memchr::memrchr(term, &buf[..end]) {
         after += count_byte(&buf[nl + 1..end], q);
-        if (total - after) % 2 == 0 {
+        if (total - after).is_multiple_of(2) {
             return Some(nl + 1);
         }
         end = nl;
@@ -48,7 +48,7 @@ pub fn first_boundary(buf: &[u8], quote: Option<u8>, term: u8) -> Option<usize> 
         if let Some(q) = quote {
             quotes += count_byte(&buf[start..nl], q);
         }
-        if quotes % 2 == 0 {
+        if quotes.is_multiple_of(2) {
             return Some(nl + 1);
         }
         start = nl + 1;

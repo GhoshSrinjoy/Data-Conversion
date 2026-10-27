@@ -5,7 +5,10 @@ use std::path::PathBuf;
 /// matching `dataconv.errors` exception.
 #[derive(Debug)]
 pub enum Error {
-    Io { source: std::io::Error, path: Option<PathBuf> },
+    Io {
+        source: std::io::Error,
+        path: Option<PathBuf>,
+    },
     Arrow(arrow::error::ArrowError),
     Parquet(parquet::errors::ParquetError),
     /// Unknown, unsupported or mismatched file format.

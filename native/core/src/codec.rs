@@ -228,7 +228,7 @@ pub fn compress_best(candidates: &[(CodecId, i32)], data: &[u8]) -> Result<(Code
     let mut best: Option<(CodecId, Vec<u8>)> = None;
     for &(codec, level) in candidates {
         let out = compress(codec, data, level)?;
-        if best.as_ref().map_or(true, |(_, b)| out.len() < b.len()) {
+        if best.as_ref().is_none_or(|(_, b)| out.len() < b.len()) {
             best = Some((codec, out));
         }
     }

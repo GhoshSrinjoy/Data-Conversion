@@ -240,10 +240,8 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub fn temp_sibling(target: &Path, tag: &str) -> PathBuf {
     let name = target.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
+    let nanos =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     target.with_file_name(format!(".{name}.{}.{nanos:x}{seq}.{tag}", std::process::id()))
 }
