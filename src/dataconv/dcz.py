@@ -688,11 +688,25 @@ def _assemble(streams: Sequence[Tuple[int, int, bytes]]) -> bytes:
     return bytes(out)
 
 
+BROTLI_MAX_STREAM = 1 << 20  # quality 11 runs at about 1 MB/s: small streams only
+
+
 def _compress_stream(data: bytes, profile: str) -> Tuple[int, int, bytes]:
     if len(data) < 48:
         return codec.NONE, len(data), data
-    c, out = codec.compress_best(codec.stream_candidates(profile), data)
+    candidates = codec.stream_candidates(profile)
+    if profile == "max" and len(data) <= BROTLI_MAX_STREAM and codec.available(codec.BROTLI):
+        candidates = [*candidates, (codec.BROTLI, 11)]
+    c, out = codec.compress_best(candidates, data)
     return c, len(data), out
+
+
+def _quick_size(data: bytes) -> int:
+    """Fast size estimate used to rank candidate encodings."""
+    if len(data) < 48:
+        return len(data)
+    fast = codec.ZSTD if codec.available(codec.ZSTD) else codec.ZLIB
+    return min(len(data), len(codec.compress(fast, data, 3 if fast == codec.ZSTD else 1)))
 
 
 def encode_csv_block(data: bytes, delimiter: str = ",", quote: Optional[str] = '"', first: bool = True,
@@ -743,14 +757,13 @@ def encode_csv_block(data: bytes, delimiter: str = ",", quote: Optional[str] = '
         streams.append(_compress_stream(encode_ints(terms), profile))
     exhaustive = profile == "max"
     for j in range(ncols):
-        best_size, best_meta, best_streams = None, b"", []
-        for m, ss in column_candidates(cells[j], quoted[j], exhaustive):
-            packed = [_compress_stream(x, profile) for x in ss]
-            size = len(m) + sum(len(p[2]) + 6 for p in packed)
-            if best_size is None or size < best_size:
-                best_size, best_meta, best_streams = size, m, packed
+        options = column_candidates(cells[j], quoted[j], exhaustive)
+        # rank with a fast codec; only the winner gets the profile's codecs
+        best_meta, best_raw = options[0] if len(options) == 1 else min(
+            options, key=lambda o: len(o[0]) + sum(_quick_size(x) + 6 for x in o[1])
+        )
         meta += best_meta
-        streams.extend(best_streams)
+        streams.extend(_compress_stream(x, profile) for x in best_raw)
     payload = _assemble([_compress_stream(bytes(meta), profile), *streams])
     try:
         if decode_csv_block(payload, len(data)) != data:
@@ -849,7 +862,8 @@ def encode_block(data: bytes, csv: Optional[Tuple[str, Optional[str]]], first: b
         if enc is not None:
             payload, records = enc
             if profile == "max":
-                c, plain = codec.compress_best(codec.stream_candidates(profile), data)
+                yardstick = [(codec.ZSTD, 19)] if codec.available(codec.ZSTD) else codec.stream_candidates("balanced")
+                c, plain = codec.compress_best(yardstick, data)
                 if len(plain) < len(payload):
                     return _block_header(KIND_RAW, c, len(data), len(plain), crc, 0), plain, KIND_RAW, 0
             return _block_header(KIND_CSV, 0, len(data), len(payload), crc, records), payload, KIND_CSV, records

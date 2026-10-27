@@ -23,7 +23,7 @@ zstd = { version = "0.14", default-features = false, features = ["zstdmt"] }
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "frame"] }
 brotli = { version = "9", default-features = false, features = ["std"] }
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
-liblzma = { version = "0.4", features = ["static"] }
+liblzma = { version = "0.4", default-features = false, features = ["static", "parallel"] }
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 
 [dev-dependencies]

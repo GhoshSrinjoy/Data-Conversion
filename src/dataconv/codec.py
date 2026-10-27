@@ -30,7 +30,7 @@ ALIASES = {"gzip": "zlib", "deflate": "zlib", "xz": "lzma", "zst": "zstd", "br":
 PROFILE_LEVELS = {
     "fast": {ZSTD: 1, ZLIB: 1, LZMA: 1, BROTLI: 2, LZ4: 0, NONE: 0},
     "balanced": {ZSTD: 9, ZLIB: 6, LZMA: 6, BROTLI: 7, LZ4: 0, NONE: 0},
-    "max": {ZSTD: 22, ZLIB: 9, LZMA: 9, BROTLI: 11, LZ4: 0, NONE: 0},
+    "max": {ZSTD: 19, ZLIB: 9, LZMA: 9, BROTLI: 11, LZ4: 0, NONE: 0},
 }
 
 Compressor = Callable[[bytes, int], bytes]
@@ -166,7 +166,7 @@ def stream_candidates(profile: str) -> List[Tuple[int, int]]:
     """Codecs tried for a DCZ stream: the native choices that are available here."""
     levels = PROFILE_LEVELS[profile]
     if profile == "max":
-        wanted = [ZSTD, LZMA, BROTLI]
+        wanted = [ZSTD, LZMA]
     elif profile == "fast":
         wanted = [ZSTD, LZ4, ZLIB]
     else:

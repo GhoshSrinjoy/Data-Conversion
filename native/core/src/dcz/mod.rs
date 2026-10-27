@@ -142,8 +142,9 @@ fn encode_block(data: &[u8], csv: Option<Dialect>, first: bool, profile: Profile
         Some(enc) => {
             let mut chosen = (KIND_CSV, CodecId::None, enc.payload, enc.records);
             if profile == Profile::Max {
-                // Never lose to plain compression of the same bytes.
-                let (c, plain) = codec::compress_best(&block::stream_codecs(profile), data)?;
+                // Never lose to plain compression of the same bytes (zstd -19 is the
+                // yardstick: lzma or brotli on a whole raw block would cost minutes).
+                let (c, plain) = codec::compress_best(&[(CodecId::Zstd, 19)], data)?;
                 if plain.len() < chosen.2.len() {
                     chosen = (KIND_RAW, c, plain, 0);
                 }
@@ -202,7 +203,7 @@ impl DczWriter {
         let block_size = opts.block_size.unwrap_or(match opts.profile {
             Profile::Fast => 8 << 20,
             Profile::Balanced => 8 << 20,
-            Profile::Max => 32 << 20,
+            Profile::Max => 16 << 20,
         });
         // Each block in flight costs about five times its size while encoding.
         let wave = ((plan.memory_budget as usize / 5) / block_size.max(1)).clamp(1, plan.threads.max(1) * 2);

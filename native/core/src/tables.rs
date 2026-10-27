@@ -94,7 +94,17 @@ pub fn compressed_writer(w: BufWriter<File>, compression: Compression, level: Op
             }
             Box::new(enc)
         }
-        Compression::Xz => Box::new(liblzma::write::XzEncoder::new(w, level.unwrap_or(6).clamp(0, 9) as u32)),
+        Compression::Xz => {
+            // Multi-threaded xz: the input is cut into independent blocks.
+            let stream = liblzma::stream::MtStreamBuilder::new()
+                .threads(threads.clamp(1, 64) as u32)
+                .block_size(8 << 20)
+                .preset(level.unwrap_or(6).clamp(0, 9) as u32)
+                .check(liblzma::stream::Check::Crc64)
+                .encoder()
+                .map_err(|e| Error::Invalid(format!("xz: {e}")))?;
+            Box::new(liblzma::write::XzEncoder::new_stream(w, stream))
+        }
         Compression::Lz4 => Box::new(lz4_flex::frame::FrameEncoder::new(w)),
         Compression::Brotli => Box::new(brotli::CompressorWriter::new(w, 1 << 16, level.unwrap_or(6).clamp(0, 11) as u32, 22)),
         Compression::Bzip2 | Compression::Zip => {

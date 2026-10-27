@@ -17,7 +17,6 @@
 //! used when that division reproduces the original bits; anything else (NaN payloads,
 //! -0.0, values needing more digits) is stored verbatim as an exception.
 
-use super::dcz::block::stream_codecs;
 use crate::codec::{self, CodecId, Profile};
 use crate::dcz::ints::{self, put_varint, Cursor};
 use crate::dcz::text;
@@ -97,7 +96,7 @@ fn best_exponent(values: &[f64]) -> (usize, usize) {
 }
 
 fn stream(out: &mut Vec<(CodecId, usize, Vec<u8>)>, data: Vec<u8>, profile: Profile) -> Result<()> {
-    let (c, bytes) = if data.len() < 48 { (CodecId::None, data.clone()) } else { codec::compress_best(&stream_codecs(profile), &data)? };
+    let (c, bytes) = crate::dcz::block::compress_stream(&data, profile)?;
     out.push((c, data.len(), bytes));
     Ok(())
 }

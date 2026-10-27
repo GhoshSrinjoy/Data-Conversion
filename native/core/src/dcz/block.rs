@@ -36,15 +36,30 @@ pub fn stream_codecs(profile: Profile) -> Vec<(CodecId, i32)> {
     match profile {
         Profile::Fast => vec![(CodecId::Zstd, 1)],
         Profile::Balanced => vec![(CodecId::Zstd, 9)],
-        Profile::Max => vec![(CodecId::Zstd, 22), (CodecId::Lzma, 9), (CodecId::Brotli, 11)],
+        Profile::Max => vec![(CodecId::Zstd, 19), (CodecId::Lzma, 9)],
     }
 }
 
-fn compress_stream(data: &[u8], profile: Profile) -> Result<(CodecId, Vec<u8>)> {
+/// Brotli at quality 11 runs at about 1 MB/s, so it is only tried on small streams.
+const BROTLI_MAX_STREAM: usize = 1 << 20;
+
+pub fn compress_stream(data: &[u8], profile: Profile) -> Result<(CodecId, Vec<u8>)> {
     if data.len() < 48 {
         return Ok((CodecId::None, data.to_vec()));
     }
-    codec::compress_best(&stream_codecs(profile), data)
+    let mut candidates = stream_codecs(profile);
+    if profile == Profile::Max && data.len() <= BROTLI_MAX_STREAM {
+        candidates.push((CodecId::Brotli, 11));
+    }
+    codec::compress_best(&candidates, data)
+}
+
+/// Quick size estimate used to rank candidate encodings before the expensive codecs run.
+fn quick_size(data: &[u8]) -> usize {
+    if data.len() < 48 {
+        return data.len();
+    }
+    codec::compress(CodecId::Zstd, data, 3).map(|c| c.len().min(data.len())).unwrap_or(data.len())
 }
 
 fn assemble(streams: &[(CodecId, usize, Vec<u8>)]) -> Vec<u8> {
@@ -131,21 +146,23 @@ pub fn encode(data: &[u8], d: Dialect, first_block: bool, profile: Profile) -> R
     let columns: Vec<(Vec<u8>, Vec<(CodecId, usize, Vec<u8>)>)> = (0..ncols)
         .into_par_iter()
         .map(|j| -> Result<_> {
-            let mut best: Option<(usize, Vec<u8>, Vec<(CodecId, usize, Vec<u8>)>)> = None;
-            for cand in text::candidates(&cells[j], &quoted[j], exhaustive) {
-                let mut packed = Vec::with_capacity(cand.streams.len());
-                let mut size = cand.meta.len();
-                for s in &cand.streams {
-                    let (c, bytes) = compress_stream(s, profile)?;
-                    size += bytes.len() + 6;
-                    packed.push((c, s.len(), bytes));
-                }
-                if best.as_ref().map_or(true, |(b, _, _)| size < *b) {
-                    best = Some((size, cand.meta, packed));
-                }
+            // Rank the candidate encodings with a fast codec, then spend the profile's
+            // codecs only on the winner.
+            let candidates = text::candidates(&cells[j], &quoted[j], exhaustive);
+            let best = if candidates.len() == 1 {
+                candidates.into_iter().next().expect("one candidate")
+            } else {
+                candidates
+                    .into_iter()
+                    .min_by_key(|c| c.meta.len() + c.streams.iter().map(|s| quick_size(s) + 6).sum::<usize>())
+                    .expect("raw encoding always applies")
+            };
+            let mut packed = Vec::with_capacity(best.streams.len());
+            for s in &best.streams {
+                let (c, bytes) = compress_stream(s, profile)?;
+                packed.push((c, s.len(), bytes));
             }
-            let (_, meta, packed) = best.expect("raw encoding always applies");
-            Ok((meta, packed))
+            Ok((best.meta, packed))
         })
         .collect::<Result<_>>()?;
 
