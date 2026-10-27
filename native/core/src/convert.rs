@@ -223,8 +223,11 @@ pub fn target_format(path: &Path, explicit: Option<&str>) -> Result<(Format, Com
 // CSV input
 // ---------------------------------------------------------------------------------
 
+/// A stream, the counter of input bytes it has consumed, and the input size.
+type Counted<R> = (R, Arc<AtomicU64>, u64);
+
 /// A decoded UTF-8 stream of a CSV file (decompressed, transcoded, BOM removed).
-fn open_csv_stream(path: &Path, encoding: &str) -> Result<(Box<dyn Read + Send>, Arc<AtomicU64>, u64)> {
+fn open_csv_stream(path: &Path, encoding: &str) -> Result<Counted<Box<dyn Read + Send>>> {
     let (raw, consumed, size): (Box<dyn Read + Send>, Arc<AtomicU64>, u64) =
         if detect_format(path, None)?.0 == Format::Dcz {
             let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -240,6 +243,73 @@ fn open_csv_stream(path: &Path, encoding: &str) -> Result<(Box<dyn Read + Send>,
         _ => Box::new(io::SkipBom::new(raw)),
     };
     Ok((reader, consumed, size))
+}
+
+/// Read past the `leading` records (preamble and header) of a stream.  Returns the
+/// stream and the bytes already read beyond them, so that chunking starts at the
+/// first data record however long the header is.
+fn skip_leading(
+    mut reader: Box<dyn Read + Send>,
+    d: Dialect,
+    leading: usize,
+) -> Result<(Box<dyn Read + Send>, Vec<u8>)> {
+    if leading == 0 {
+        return Ok((reader, Vec::new()));
+    }
+    let mut buf = Vec::new();
+    let mut tok = Tokenizer::new(d);
+    loop {
+        let more = io::read_up_to(&mut reader, 1 << 20)?;
+        let eof = more.is_empty();
+        buf.extend_from_slice(&more);
+        let buf_len = buf.len();
+        let (mut seen, mut cut) = (0usize, None);
+        tok.for_each(&buf, |r| {
+            if !eof && (r.term == crate::tokenize::Term::Eof || r.end >= buf_len) {
+                return false; // the record (or a CR LF pair) may continue beyond what was read
+            }
+            seen += 1;
+            if seen == leading {
+                cut = Some(r.end);
+                return false;
+            }
+            true
+        });
+        if let Some(c) = cut {
+            let rest = buf.split_off(c);
+            return Ok((reader, rest));
+        }
+        if eof {
+            return Ok((reader, Vec::new())); // nothing but leading records
+        }
+        if buf.len() > (1 << 30) {
+            return Err(Error::Data("the header is larger than 1 GB".into()));
+        }
+    }
+}
+
+/// The decoded stream of a CSV file positioned at its first data record.
+pub(crate) fn data_stream(path: &Path, dialect: &CsvDialect) -> Result<Counted<Box<dyn Read + Send>>> {
+    let (reader, consumed, total) = open_csv_stream(path, &dialect.encoding)?;
+    let (reader, prefix) = skip_leading(reader, dialect.tokenizer_dialect(), dialect.leading_records())?;
+    let reader: Box<dyn Read + Send> =
+        if prefix.is_empty() { reader } else { Box::new(std::io::Cursor::new(prefix).chain(reader)) };
+    Ok((reader, consumed, total))
+}
+
+/// A chunker over the data records of a CSV stream (leading records skipped).
+fn open_records(
+    path: &Path,
+    encoding: &str,
+    plan: &CsvPlan,
+    chunk_size: usize,
+) -> Result<Counted<Chunker<Box<dyn Read + Send>>>> {
+    let (reader, consumed, total) = open_csv_stream(path, encoding)?;
+    let (reader, prefix) = skip_leading(reader, plan.dialect, plan.leading)?;
+    let chunker = Chunker::new(reader, chunk_size, plan.dialect.quote, plan.split)
+        .with_escape(plan.dialect.escape)
+        .with_prefix(prefix);
+    Ok((chunker, consumed, total))
 }
 
 pub fn sniff_file(path: &Path, opts: &SniffOptions) -> Result<CsvDialect> {
@@ -302,16 +372,12 @@ fn decode_chunk(plan: &CsvPlan, schema: &SchemaRef, chunk: &Chunk) -> Result<Dec
     let est = chunk.data.len() / plan.avg_record.max(8) + 16;
     let mut builders: Vec<ColumnBuilder> = plan.types.iter().map(|t| ColumnBuilder::new(t, est, plan.mode)).collect();
     let mut out = Decoded::default();
-    let mut skip = if chunk.index == 0 { plan.leading } else { 0 };
     let mut tok = Tokenizer::new(plan.dialect);
     let mut scratch = Vec::new();
     let d = plan.dialect;
     tok.for_each(&chunk.data, |rec| {
-        if skip > 0 {
-            skip -= 1;
-            return true;
-        }
-        if rec.is_blank() {
+        // In a single-column file a blank line is a row with a missing value.
+        if rec.is_blank() && plan.ncols != 1 {
             out.blank += 1;
             return true;
         }
@@ -370,18 +436,13 @@ fn decode_chunk(plan: &CsvPlan, schema: &SchemaRef, chunk: &Chunk) -> Result<Dec
 }
 
 /// Statistics of every column over a sample (or the whole stream).
-fn observe_chunk(plan: &CsvPlan, data: &[u8], skip: usize, stats: &mut [ColumnStats]) -> (u64, u64) {
+fn observe_chunk(plan: &CsvPlan, data: &[u8], stats: &mut [ColumnStats]) -> (u64, u64) {
     let mut tok = Tokenizer::new(plan.dialect);
     let mut scratch = Vec::new();
-    let mut skip = skip;
     let (mut good, mut bad) = (0u64, 0u64);
     let d = plan.dialect;
     tok.for_each(data, |rec| {
-        if skip > 0 {
-            skip -= 1;
-            return true;
-        }
-        if rec.is_blank() {
+        if rec.is_blank() && plan.ncols != 1 {
             return true;
         }
         let nf = rec.fields.len();
@@ -463,20 +524,20 @@ fn sample_stats(
     let ncols = plan.projection.len();
     let mut stats = vec![ColumnStats::default(); ncols];
     let t = Instant::now();
-    let (reader, _, _) = open_csv_stream(path, encoding)?;
-    let mut chunker = Chunker::new(reader, sample_bytes, plan.dialect.quote, plan.split);
+    let (mut chunker, _, _) = open_records(path, encoding, plan, sample_bytes)?;
     let head = chunker.next_chunk()?;
     trace("  read head sample", t);
     let t = Instant::now();
     if let Some(head) = head {
         // Split the head sample at record boundaries and observe the parts in parallel.
-        let parts = record_ranges(&head.data, plan.dialect.quote, plan.split, rayon::current_num_threads().max(1));
+        // (escape dialects are observed in one piece: parity cannot split them safely)
+        let pieces = if plan.dialect.escape.is_some() { 1 } else { rayon::current_num_threads().max(1) };
+        let parts = record_ranges(&head.data, plan.dialect.quote, plan.split, pieces);
         let partials: Vec<Vec<ColumnStats>> = parts
             .par_iter()
-            .enumerate()
-            .map(|(i, r)| {
+            .map(|r| {
                 let mut local = vec![ColumnStats::default(); ncols];
-                observe_chunk(plan, &head.data[r.clone()], if i == 0 { plan.leading } else { 0 }, &mut local);
+                observe_chunk(plan, &head.data[r.clone()], &mut local);
                 local
             })
             .collect();
@@ -514,7 +575,7 @@ fn sample_stats(
                     return None;
                 }
                 let mut local = vec![ColumnStats::default(); ncols];
-                let (good, bad) = observe_chunk(plan, slice, 0, &mut local);
+                let (good, bad) = observe_chunk(plan, slice, &mut local);
                 // A window that started inside a quoted field parses as garbage: drop it.
                 (good > 0 && bad * 10 <= good).then_some(local)
             })
@@ -537,8 +598,8 @@ fn full_stats(
     pool: &rayon::ThreadPool,
 ) -> Result<Vec<ColumnStats>> {
     let ncols = plan.projection.len();
-    let (reader, _, _) = open_csv_stream(path, encoding)?;
-    let rx = spawn_chunker(Chunker::new(reader, rplan.chunk_size, plan.dialect.quote, plan.split), rplan.wave_chunks);
+    let (chunker, _, _) = open_records(path, encoding, plan, rplan.chunk_size)?;
+    let rx = spawn_chunker(chunker, rplan.wave_chunks);
     let mut stats = vec![ColumnStats::default(); ncols];
     loop {
         let wave = next_wave(&rx, rplan.wave_chunks)?;
@@ -549,7 +610,7 @@ fn full_stats(
             wave.par_iter()
                 .map(|c| {
                     let mut local = vec![ColumnStats::default(); ncols];
-                    observe_chunk(plan, &c.data, if c.index == 0 { plan.leading } else { 0 }, &mut local);
+                    observe_chunk(plan, &c.data, &mut local);
                     local
                 })
                 .collect()
@@ -567,18 +628,23 @@ fn spawn_chunker<R: Read + Send + 'static>(mut chunker: Chunker<R>, depth: usize
     let (tx, rx) = sync_channel::<Result<Chunk>>(depth.max(1));
     std::thread::Builder::new()
         .name("dataconv-reader".into())
-        .spawn(move || loop {
-            match chunker.next_chunk() {
-                Ok(Some(c)) => {
-                    if tx.send(Ok(c)).is_err() {
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
+                match chunker.next_chunk() {
+                    Ok(Some(c)) => {
+                        if tx.send(Ok(c)).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
                         return;
                     }
                 }
-                Ok(None) => return,
-                Err(e) => {
-                    let _ = tx.send(Err(e));
-                    return;
-                }
+            }));
+            if result.is_err() {
+                let _ = tx.send(Err(Error::Data("internal error while reading the input".into())));
             }
         })
         .expect("failed to start reader thread");
@@ -646,7 +712,10 @@ fn decide_types(
 pub(crate) struct Target {
     pub format: Format,
     pub compression: Compression,
+    /// Where the output is written (for a split, the staging directory).
     pub dst: PathBuf,
+    /// The destination the caller named (it also names the default quarantine file).
+    pub final_dst: PathBuf,
     /// (rows per part, bytes per part, name pattern, extension)
     pub split: Option<(Option<u64>, Option<u64>, String, String)>,
 }
@@ -676,36 +745,40 @@ fn build_sink(
             if format == Format::Jsonl {
                 Box::new(JsonlSink::new(w))
             } else {
-                let mut o = CsvWriteOptions::default();
-                if let Some(d) = opts.out_delimiter.as_deref().and_then(sniff::parse_char_option) {
-                    o.delimiter = d;
-                }
-                o.header = opts.out_header.unwrap_or(true);
-                if opts.out_crlf {
-                    o.terminator = b"\r\n".to_vec();
-                }
-                Box::new(tables::CsvSink::new(w, schema, o)?)
+                Box::new(tables::CsvSink::new(w, schema, csv_write_options(opts)?)?)
             }
         }
         Format::Dcz => {
             let profile = crate::codec::Profile::parse(opts.profile.as_deref().unwrap_or("balanced"))?;
-            let mut o = CsvWriteOptions::default();
-            if let Some(d) = opts.out_delimiter.as_deref().and_then(sniff::parse_char_option) {
-                o.delimiter = d;
-            }
+            let o = csv_write_options(opts)?;
             let mut enc = crate::dcz::DczWriter::new(
                 file,
                 crate::dcz::EncodeOptions { profile, threads: plan.threads, block_size: None },
             )?
             .with_dialect(Dialect { delimiter: o.delimiter, ..Dialect::default() });
-            crate::csvout::write_header(
-                &mut enc,
-                &schema.fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>(),
-                &o,
-            )?;
+            if o.header {
+                crate::csvout::write_header(
+                    &mut enc,
+                    &schema.fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>(),
+                    &o,
+                )?;
+            }
             Box::new(tables::CsvSink::new(Box::new(enc), schema, CsvWriteOptions { header: false, ..o })?)
         }
     })
+}
+
+/// CSV output options of a job (delimiter, header, line terminator).
+fn csv_write_options(opts: &ConvertOptions) -> Result<CsvWriteOptions> {
+    let mut o = CsvWriteOptions::default();
+    if let Some(d) = opts.out_delimiter.as_deref().map(sniff::parse_char_option).transpose()?.flatten() {
+        o.delimiter = d;
+    }
+    o.header = opts.out_header.unwrap_or(true);
+    if opts.out_crlf {
+        o.terminator = b"\r\n".to_vec();
+    }
+    Ok(o)
 }
 
 /// Parquet options for a job, refined by its first batch: per-column encoding trials
@@ -900,6 +973,8 @@ pub fn convert(src: &Path, dst: &Path, opts: &ConvertOptions, hooks: &dyn Hooks)
         && opts.limit.is_none()
         && dst_comp == Compression::None
         && opts.out_delimiter.is_none()
+        && !opts.out_crlf
+        && opts.out_header != Some(false)
     {
         return crate::dcz::decompress_file(src, dst, opts.overwrite, opts.threads.unwrap_or(0), hooks);
     }
@@ -919,7 +994,13 @@ pub fn convert(src: &Path, dst: &Path, opts: &ConvertOptions, hooks: &dyn Hooks)
         ..Report::default()
     };
 
-    let target = Target { format: dst_fmt, compression: dst_comp, dst: dst.to_path_buf(), split: None };
+    let target = Target {
+        format: dst_fmt,
+        compression: dst_comp,
+        dst: dst.to_path_buf(),
+        final_dst: dst.to_path_buf(),
+        split: None,
+    };
     match src_fmt {
         Format::Csv | Format::Dcz => convert_csv(src, &target, opts, &plan, &pool, hooks, &mut report)?,
         Format::Parquet | Format::Ipc | Format::Jsonl => {
@@ -974,6 +1055,12 @@ fn split(
         chunk_size: plan.chunk_size,
         ..Report::default()
     };
+    // Fail before doing any work if the first part would collide with an earlier run.
+    let first = dir.join(format!("{}{extension}", crate::split::part_name(&pattern, 0)));
+    if !opts.overwrite && first.exists() {
+        return Err(Error::Exists(first));
+    }
+    let staging = crate::split::Staging::new(dir)?;
     let byte_exact = src_fmt == Format::Csv
         && dst_fmt == Format::Csv
         && dst_comp == Compression::None
@@ -987,10 +1074,10 @@ fn split(
         let spec = crate::split::SplitSpec {
             rows: opts.split_rows,
             bytes: opts.split_bytes,
-            dir: dir.to_path_buf(),
-            pattern,
-            extension,
-            overwrite: opts.overwrite,
+            dir: staging.tmp.clone(),
+            pattern: pattern.clone(),
+            extension: extension.clone(),
+            overwrite: true,
         };
         let parts = crate::split::split_csv_bytes(src, &spec, &dialect, hooks)?;
         report.rows = parts.iter().map(|p| p.rows).sum();
@@ -999,21 +1086,31 @@ fn split(
         report.compression = "csv (byte-exact)".into();
         report.parts = parts;
         report.dialect = Some(dialect);
-        report.seconds = started.elapsed().as_secs_f64();
-        return Ok(report);
-    }
-    let pool = Arc::new(resources::thread_pool(plan.threads));
-    let target = Target {
-        format: dst_fmt,
-        compression: dst_comp,
-        dst: dir.to_path_buf(),
-        split: Some((opts.split_rows, opts.split_bytes, pattern, extension)),
-    };
-    match src_fmt {
-        Format::Csv | Format::Dcz => convert_csv(src, &target, opts, &plan, &pool, hooks, &mut report)?,
-        Format::Parquet | Format::Ipc | Format::Jsonl => {
-            convert_table(src, src_fmt, &target, opts, &plan, &pool, hooks, &mut report)?
+    } else {
+        let pool = Arc::new(resources::thread_pool(plan.threads));
+        let target = Target {
+            format: dst_fmt,
+            compression: dst_comp,
+            dst: staging.tmp.clone(),
+            final_dst: dir.to_path_buf(),
+            split: Some((opts.split_rows, opts.split_bytes, pattern.clone(), extension.clone())),
+        };
+        match src_fmt {
+            Format::Csv | Format::Dcz => convert_csv(src, &target, opts, &plan, &pool, hooks, &mut report)?,
+            Format::Parquet | Format::Ipc | Format::Jsonl => {
+                convert_table(src, src_fmt, &target, opts, &plan, &pool, hooks, &mut report)?
+            }
         }
+    }
+    report.parts = staging.publish(std::mem::take(&mut report.parts), opts.overwrite)?;
+    let stale = crate::split::leftover_parts(dir, &pattern, &extension, report.parts.len());
+    if let Some(first) = stale.first() {
+        report.warnings.push(format!(
+            "{} older part file(s) from an earlier run remain in {} (starting with {})",
+            stale.len(),
+            dir.display(),
+            first.file_name().unwrap_or_default().to_string_lossy()
+        ));
     }
     report.seconds = started.elapsed().as_secs_f64();
     Ok(report)
@@ -1145,10 +1242,14 @@ fn csv_attempt(
     report: &mut Report,
 ) -> std::result::Result<(), Retry> {
     let started_attempt = Instant::now();
-    let (reader, consumed, total) = open_csv_stream(src, encoding)?;
-    let rx = spawn_chunker(Chunker::new(reader, plan.chunk_size, cplan.dialect.quote, cplan.split), plan.wave_chunks);
+    if target.split.is_some() {
+        // a restarted split writes every part again, into an empty staging directory
+        crate::split::reset_staging(&target.dst)?;
+    }
+    let (chunker, consumed, total) = open_records(src, encoding, cplan, plan.chunk_size)?;
+    let rx = spawn_chunker(chunker, plan.wave_chunks);
     let schema = cplan.schema();
-    let dst = target.dst.as_path();
+    let dst = target.final_dst.as_path();
     let mut out = Out::new(target, schema.clone(), opts, plan, pool);
     // Rejected rows go to a temporary file too, published only if the job succeeds.
     let mut quarantine: Option<(PathBuf, AtomicFile)> = None;

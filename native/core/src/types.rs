@@ -201,7 +201,7 @@ pub fn parse_int(v: &[u8], loose: bool) -> IntParse {
         Some(b'+') if loose => (false, &v[1..]),
         _ => (false, v),
     };
-    if digits.is_empty() || (!loose && digits.len() > 1 && digits[0] == b'0') {
+    if digits.is_empty() || (!loose && digits.len() > 1 && digits[0] == b'0') || (!loose && neg && digits == b"0") {
         return IntParse::No;
     }
     let mut acc: u64 = 0;
@@ -325,13 +325,12 @@ pub fn parse_float(v: &[u8], loose: bool) -> Option<FloatInfo> {
     let sig_len = total - lead - trail;
     let lossless = if loose || sig_len == 0 {
         value.is_finite() || loose
-    } else if !value.is_finite() || value == 0.0 {
-        false
-    } else if sig_len <= 15 {
+    } else if !value.is_finite() || value == 0.0 || sig_len >= 18 {
+        false // (no double holds 18 significant digits)
+    } else if sig_len <= 15 && value.abs() >= f64::MIN_POSITIVE {
         true
-    } else if sig_len >= 18 {
-        false
     } else {
+        // 16-17 digits, or a subnormal (which keeps fewer digits): check exactly.
         let sig: Vec<u8> = (lead..lead + sig_len).map(digit_at).collect();
         // Decimal exponent of the first significant digit.
         let sci_exp = int_part.len() as i64 - 1 - lead as i64 + exp;
@@ -538,6 +537,10 @@ pub fn parse_decimal(v: &[u8], scale: u8) -> Option<i128> {
     if (int_part.is_empty() && frac_part.is_empty()) || frac_part.len() > scale as usize {
         return None;
     }
+    // Canonical only: leading zeros (`007.5`) would be lost.
+    if int_part.len() > 1 && int_part[0] == b'0' {
+        return None;
+    }
     let mut acc: i128 = 0;
     for &b in int_part.iter().chain(frac_part.iter()) {
         let d = b.wrapping_sub(b'0');
@@ -548,6 +551,9 @@ pub fn parse_decimal(v: &[u8], scale: u8) -> Option<i128> {
     }
     for _ in frac_part.len()..scale as usize {
         acc = acc.checked_mul(10)?;
+    }
+    if neg && acc == 0 {
+        return None; // `-0` / `-0.00`: the sign would be lost
     }
     Some(if neg { -acc } else { acc })
 }
@@ -840,6 +846,11 @@ mod tests {
         assert_eq!(infer(&["NA", "Namibia"]), LogicalType::String);
         assert_eq!(parse_decimal(b"-12.5", 3), Some(-12500));
         assert_eq!(parse_decimal(b"12.345", 2), None);
+        assert_eq!(parse_decimal(b"012.5", 2), None, "leading zeros");
+        assert_eq!(parse_decimal(b"-0.00", 2), None, "negative zero");
+        assert_eq!(infer(&["-0", "1"]), LogicalType::Float64, "-0 keeps its sign only as a float");
+        assert!(!parse_float(b"1.2345e-320", false).unwrap().lossless, "subnormal precision");
+        assert!(parse_float(b"5e-324", false).unwrap().lossless);
         assert_eq!(LogicalType::parse("decimal(10, 2)"), Some(LogicalType::Decimal { precision: 10, scale: 2 }));
         assert_eq!(
             LogicalType::parse("timestamp[ms,utc]"),

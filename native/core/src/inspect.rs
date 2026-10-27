@@ -148,13 +148,10 @@ pub fn count(path: &Path, opts: &ConvertOptions) -> Result<u64> {
         Format::Csv | Format::Dcz => {
             let dialect = convert::sniff_file(path, &opts.sniff)?;
             let td = dialect.tokenizer_dialect();
-            let reader: Box<dyn std::io::Read + Send> = if fmt == Format::Dcz {
-                Box::new(crate::dcz::DczReader::open(path)?)
-            } else {
-                io::open_input(path)?.reader
-            };
-            let records = count_records(reader, td.quote, dialect.split_byte())?;
-            Ok(records.saturating_sub(dialect.leading_records() as u64))
+            let (reader, _, _) = convert::data_stream(path, &dialect)?;
+            // blank lines are skipped like the converters do, except in a single-column
+            // file, where they are rows with a missing value
+            count_records(reader, td.quote, td.escape, dialect.split_byte(), dialect.columns.len() == 1)
         }
     }
 }
@@ -301,19 +298,14 @@ pub fn info(path: &Path, exact: bool, opts: &ConvertOptions) -> Result<Value> {
 pub fn csv_column_stats(path: &Path, opts: &ConvertOptions) -> Result<Vec<(String, ColumnStats)>> {
     let dialect = convert::sniff_file(path, &opts.sniff)?;
     let td = dialect.tokenizer_dialect();
-    let input = io::open_input(path)?;
-    let mut chunker = Chunker::new(input.reader, 16 << 20, td.quote, dialect.split_byte());
+    let (reader, _, _) = convert::data_stream(path, &dialect)?;
+    let mut chunker = Chunker::new(reader, 16 << 20, td.quote, dialect.split_byte()).with_escape(td.escape);
     let ncols = dialect.columns.len();
     let mut stats = vec![ColumnStats::default(); ncols];
-    let mut skip = dialect.leading_records();
     let mut scratch = Vec::new();
     let mut tok = crate::tokenize::Tokenizer::new(td);
     while let Some(c) = chunker.next_chunk()? {
         tok.for_each(&c.data, |r| {
-            if skip > 0 {
-                skip -= 1;
-                return true;
-            }
             if r.fields.len() != ncols {
                 return true;
             }

@@ -258,8 +258,9 @@ pub fn unpack(buf: &[u8]) -> Result<Packed> {
     let mut pos = c.pos;
     let mut parts = Vec::with_capacity(n);
     for (codec, raw, stored) in dir {
-        let bytes = payload.get(pos..pos + stored).ok_or_else(ints::truncated)?;
-        pos += stored;
+        let end = pos.checked_add(stored).ok_or_else(ints::truncated)?;
+        let bytes = payload.get(pos..end).ok_or_else(ints::truncated)?;
+        pos = end;
         parts.push(codec::decompress(codec, bytes, raw)?);
     }
     let mut it = parts.into_iter();
@@ -274,24 +275,27 @@ pub fn unpack(buf: &[u8]) -> Result<Packed> {
     let valid = if has_nulls { Some(ints::get_bitmap(&mut Cursor::new(&take()?), count)?) } else { None };
     let present = valid.as_ref().map_or(count, |v| v.iter().filter(|&&x| x).count());
     let values = match ty {
-        1 => Values::Int(ints::decode_all(&take()?)?),
+        1 => Values::Int(ints::decode_all(&take()?, present)?),
         4 => Values::Bool(ints::get_bitmap(&mut Cursor::new(&take()?), present)?),
         2 => match m.u8()? {
             0 => {
                 let e = m.u8()? as usize;
                 let n_exc = m.usize()?;
-                if e > 22 {
+                if e > 22 || n_exc > present {
                     return Err(ints::truncated());
                 }
-                let mantissas = ints::decode_all(&take()?)?;
+                let mantissas = ints::decode_all(&take()?, present)?;
                 let mut out: Vec<f64> = mantissas.iter().map(|&x| x as f64 / POW10[e]).collect();
                 if n_exc > 0 {
                     let exc = take()?;
                     let mut ec = Cursor::new(&exc);
-                    let positions = ints::decode(&mut ec)?;
+                    let positions = ints::decode(&mut ec, n_exc)?;
+                    if positions.len() != n_exc {
+                        return Err(ints::truncated());
+                    }
                     for p in positions {
                         let b = ec.bytes(8)?;
-                        let slot = out.get_mut(p as usize).ok_or_else(ints::truncated)?;
+                        let slot = out.get_mut(ints::index(p)?).ok_or_else(ints::truncated)?;
                         *slot = f64::from_bits(u64::from_le_bytes(b.try_into().unwrap()));
                     }
                 }
@@ -299,7 +303,7 @@ pub fn unpack(buf: &[u8]) -> Result<Packed> {
             }
             1 => {
                 let planes = take()?;
-                if planes.len() != present * 8 {
+                if Some(planes.len()) != present.checked_mul(8) {
                     return Err(ints::truncated());
                 }
                 let mut out = Vec::with_capacity(present);
@@ -317,7 +321,8 @@ pub fn unpack(buf: &[u8]) -> Result<Packed> {
             other => return Err(Error::Format(format!("unknown float encoding {other}"))),
         },
         3 => {
-            let cells = text::decode_column(&mut m, &mut take, present)?;
+            let mut budget = usize::MAX; // the payload checksum was verified already
+            let cells = text::decode_column(&mut m, &mut take, present, &mut budget)?;
             Values::Str((0..present).map(|i| cells.get(i).to_vec()).collect())
         }
         other => return Err(Error::Format(format!("unknown packed type {other}"))),

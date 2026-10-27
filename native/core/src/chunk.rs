@@ -1,10 +1,11 @@
 //! Record-aligned chunking.
 //!
-//! A chunk always ends at a record terminator that lies outside quotes.  Quote
-//! state is tracked by parity: in RFC 4180 CSV an escaped quote is written `""`,
-//! so a terminator is inside a quoted field exactly when an odd number of quote
-//! characters precede it in the record.  Every chunk starts at a record boundary,
-//! so counting from the chunk start is enough.
+//! A chunk always ends at a record terminator that lies outside quotes.  For RFC
+//! 4180 CSV quote state is tracked by parity: an escaped quote is written `""`, so
+//! a terminator is inside a quoted field exactly when an odd number of quote
+//! characters precede it in the record.  Dialects with an escape character (`\"`)
+//! break that rule and use an exact byte-by-byte scan instead.  Every chunk starts
+//! at a record boundary, so counting from the chunk start is enough.
 
 use std::io::Read;
 
@@ -38,6 +39,39 @@ pub fn last_boundary(buf: &[u8], quote: Option<u8>, term: u8) -> Option<usize> {
     None
 }
 
+/// Exact scan for dialects with an escape character inside quotes.
+fn last_boundary_escaped(buf: &[u8], q: u8, esc: u8, term: u8) -> Option<usize> {
+    let mut inside = false;
+    let mut last = None;
+    let mut i = 0;
+    while i < buf.len() {
+        let b = buf[i];
+        if inside {
+            if b == esc && esc != q {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                inside = false;
+            }
+        } else if b == q {
+            inside = true;
+        } else if b == term {
+            last = Some(i + 1);
+        }
+        i += 1;
+    }
+    last
+}
+
+/// Offset just past the last record terminator outside quotes, for any dialect.
+pub fn last_record_end(buf: &[u8], quote: Option<u8>, escape: Option<u8>, term: u8) -> Option<usize> {
+    match (quote, escape) {
+        (Some(q), Some(e)) if e != q => last_boundary_escaped(buf, q, e, term),
+        _ => last_boundary(buf, quote, term),
+    }
+}
+
 /// Offset just past the first record terminator outside quotes, starting from a
 /// position known to be a record boundary.
 pub fn first_boundary(buf: &[u8], quote: Option<u8>, term: u8) -> Option<usize> {
@@ -68,14 +102,15 @@ pub struct Chunker<R> {
     reader: R,
     chunk_size: usize,
     quote: Option<u8>,
+    escape: Option<u8>,
     term: u8,
     carry: Vec<u8>,
     offset: u64,
     index: usize,
     eof: bool,
     /// Records larger than this are not searched for a quote-balanced boundary; the
-    /// chunk is cut at the last terminator instead (protects memory against a stray
-    /// unbalanced quote).
+    /// chunk is cut at the last terminator, or anywhere if there is none (bounds
+    /// memory for a stray unbalanced quote or input without line breaks).
     max_record: usize,
 }
 
@@ -85,6 +120,7 @@ impl<R: Read> Chunker<R> {
             reader,
             chunk_size: chunk_size.max(1),
             quote,
+            escape: None,
             term,
             carry: Vec::new(),
             offset: 0,
@@ -92,6 +128,18 @@ impl<R: Read> Chunker<R> {
             eof: false,
             max_record: (chunk_size.max(1) * 8).max(64 << 20),
         }
+    }
+
+    /// Escape character inside quoted fields (e.g. `\\`), if the dialect has one.
+    pub fn with_escape(mut self, escape: Option<u8>) -> Self {
+        self.escape = escape;
+        self
+    }
+
+    /// Cut chunks without a record boundary once they reach `n` bytes.
+    pub fn with_max_record(mut self, n: usize) -> Self {
+        self.max_record = n.max(self.chunk_size);
+        self
     }
 
     /// Prepend bytes that were already read from the stream (e.g. by the sniffer).
@@ -138,9 +186,9 @@ impl<R: Read> Chunker<R> {
             let cut = if self.eof && self.carry.len() < target {
                 Some(self.carry.len())
             } else {
-                let mut cut = last_boundary(&self.carry, self.quote, self.term);
+                let mut cut = last_record_end(&self.carry, self.quote, self.escape, self.term);
                 if cut.is_none() && self.carry.len() >= self.max_record {
-                    cut = memchr::memrchr(self.term, &self.carry).map(|i| i + 1);
+                    cut = Some(memchr::memrchr(self.term, &self.carry).map_or(self.carry.len(), |i| i + 1));
                 }
                 cut
             };
@@ -174,36 +222,72 @@ impl<R: Read> Chunker<R> {
 }
 
 /// Count records (terminators outside quotes) in a stream; a final record without a
-/// terminator counts too.  Runs at memory bandwidth.
-pub fn count_records<R: Read>(reader: R, quote: Option<u8>, term: u8) -> Result<u64> {
-    let mut chunker = Chunker::new(reader, 8 << 20, quote, term);
+/// terminator counts too.  Blank lines are skipped unless `count_blank` (a
+/// single-column file, where a blank line is a missing value).
+pub fn count_records<R: Read>(
+    reader: R,
+    quote: Option<u8>,
+    escape: Option<u8>,
+    term: u8,
+    count_blank: bool,
+) -> Result<u64> {
+    let mut chunker = Chunker::new(reader, 8 << 20, quote, term).with_escape(escape);
     let mut records = 0u64;
     while let Some(chunk) = chunker.next_chunk()? {
-        let data = &chunk.data;
-        let n = count_byte(data, term) as u64;
-        let inside = match quote {
-            Some(q) if memchr::memchr(q, data).is_some() => count_quoted_terminators(data, q, term),
-            _ => 0,
-        };
-        records += n - inside;
-        if data.last() != Some(&term) {
-            records += 1;
-        }
+        records += count_chunk(&chunk.data, quote, escape, term, count_blank);
     }
     Ok(records)
 }
 
-fn count_quoted_terminators(data: &[u8], q: u8, term: u8) -> u64 {
-    let mut inside = false;
-    let mut count = 0u64;
-    for &b in data {
-        if b == q {
-            inside = !inside;
-        } else if b == term && inside {
-            count += 1;
+fn count_chunk(data: &[u8], quote: Option<u8>, escape: Option<u8>, term: u8, count_blank: bool) -> u64 {
+    let q = quote.filter(|&q| memchr::memchr(q, data).is_some());
+    let esc = escape.filter(|&e| Some(e) != q);
+    let mut records = 0u64;
+    let mut line_start = 0usize;
+    let mut finish_line = |start: usize, end: usize| {
+        // `end` is the terminator position; a CR before LF belongs to the terminator
+        let mut e = end;
+        if term == b'\n' && e > start && data[e - 1] == b'\r' {
+            e -= 1;
+        }
+        if count_blank || e > start {
+            records += 1;
+        }
+    };
+    match q {
+        None => {
+            for p in memchr::memchr_iter(term, data) {
+                finish_line(line_start, p);
+                line_start = p + 1;
+            }
+        }
+        Some(q) => {
+            let mut inside = false;
+            let mut i = 0;
+            while i < data.len() {
+                let b = data[i];
+                if inside {
+                    if Some(b) == esc {
+                        i += 2;
+                        continue;
+                    }
+                    if b == q {
+                        inside = false;
+                    }
+                } else if b == q {
+                    inside = true;
+                } else if b == term {
+                    finish_line(line_start, i);
+                    line_start = i + 1;
+                }
+                i += 1;
+            }
         }
     }
-    count
+    if line_start < data.len() {
+        records += 1;
+    }
+    records
 }
 
 #[cfg(test)]
@@ -249,10 +333,31 @@ mod tests {
     }
 
     #[test]
+    fn escaped_boundaries_and_hard_cuts() {
+        let data = b"1,\"a \\\" b\nc\",7\n2,x\n";
+        // parity alone cuts inside the quoted field, after `b` (offset 10) ...
+        assert_eq!(last_boundary(&data[..16], Some(b'"'), b'\n'), Some(10));
+        // ... the escape-aware scan finds the real end of the first record
+        assert_eq!(last_record_end(&data[..16], Some(b'"'), Some(b'\\'), b'\n'), Some(15));
+        assert_eq!(last_record_end(data, Some(b'"'), Some(b'\\'), b'\n'), Some(data.len()));
+        // input without terminators is still cut once a chunk grows past max_record
+        let blob = vec![b'x'; 100 << 20];
+        let mut chunker = Chunker::new(&blob[..], 4 << 20, None, b'\n');
+        let first = chunker.next_chunk().unwrap().unwrap();
+        assert!(first.data.len() <= 128 << 20, "{}", first.data.len());
+    }
+
+    #[test]
     fn counts_records() {
         let data = b"h1,h2\n1,\"a\nb\"\n2,c\n3,d";
-        assert_eq!(count_records(&data[..], Some(b'"'), b'\n').unwrap(), 4);
-        assert_eq!(count_records(&b"a\nb\n"[..], None, b'\n').unwrap(), 2);
-        assert_eq!(count_records(&b""[..], None, b'\n').unwrap(), 0);
+        assert_eq!(count_records(&data[..], Some(b'"'), None, b'\n', false).unwrap(), 4);
+        assert_eq!(count_records(&b"a\nb\n"[..], None, None, b'\n', false).unwrap(), 2);
+        assert_eq!(count_records(&b""[..], None, None, b'\n', false).unwrap(), 0);
+        // blank lines are not records, except in single-column files
+        assert_eq!(count_records(&b"a,b\r\n1,2\r\n\r\n3,4\n\n"[..], Some(b'"'), None, b'\n', false).unwrap(), 3);
+        assert_eq!(count_records(&b"a\nx\n\nz\n"[..], None, None, b'\n', true).unwrap(), 4);
+        // an escaped quote does not open or close a field
+        let esc = b"id,t\n1,\"a \\\" b\nc\",7\n2,x\n";
+        assert_eq!(count_records(&esc[..], Some(b'"'), Some(b'\\'), b'\n', false).unwrap(), 3);
     }
 }

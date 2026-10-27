@@ -41,6 +41,82 @@ pub fn part_name(pattern: &str, n: usize) -> String {
     format!("{pattern}{n:05}")
 }
 
+const STAGING_PREFIX: &str = ".dataconv-staging-";
+
+/// A private directory inside the destination that parts are written to.  They are
+/// moved into place only when the whole job has succeeded, so a failed, cancelled
+/// or restarted job never leaves a partial set of parts behind.
+pub struct Staging {
+    dir: PathBuf,
+    pub tmp: PathBuf,
+    created: bool,
+    published: bool,
+}
+
+impl Staging {
+    pub fn new(dir: &Path) -> Result<Self> {
+        let created = !dir.exists();
+        std::fs::create_dir_all(dir).map_err(|e| Error::io(e, dir))?;
+        let nanos =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+        let tmp = dir.join(format!("{STAGING_PREFIX}{}-{nanos:08x}", std::process::id()));
+        std::fs::create_dir(&tmp).map_err(|e| Error::io(e, &tmp))?;
+        Ok(Staging { dir: dir.to_path_buf(), tmp, created, published: false })
+    }
+
+    /// Move the parts into the destination.  Nothing is moved if any of them would
+    /// replace an existing file without `overwrite`.
+    pub fn publish(mut self, parts: Vec<Part>, overwrite: bool) -> Result<Vec<Part>> {
+        let moves: Vec<(PathBuf, PathBuf)> = parts
+            .iter()
+            .map(|p| {
+                let from = PathBuf::from(&p.path);
+                let to = self.dir.join(from.file_name().unwrap_or_default());
+                (from, to)
+            })
+            .collect();
+        if !overwrite {
+            if let Some((_, to)) = moves.iter().find(|(_, to)| to.exists()) {
+                return Err(Error::Exists(to.clone()));
+            }
+        }
+        for (from, to) in &moves {
+            std::fs::rename(from, to).map_err(|e| Error::io(e, to))?;
+        }
+        self.published = true;
+        Ok(parts.into_iter().zip(moves).map(|(p, (_, to))| Part { path: to.display().to_string(), ..p }).collect())
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.tmp);
+        if self.created && !self.published {
+            let _ = std::fs::remove_dir(&self.dir); // removes it only while empty
+        }
+    }
+}
+
+/// Empty a staging directory before a restarted job writes its parts again.  Refuses
+/// any directory that is not a staging directory.
+pub(crate) fn reset_staging(tmp: &Path) -> Result<()> {
+    let is_staging = tmp.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(STAGING_PREFIX));
+    if !is_staging {
+        return Err(Error::Invalid(format!("{} is not a staging directory", tmp.display())));
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+    std::fs::create_dir(tmp).map_err(|e| Error::io(e, tmp))
+}
+
+/// Parts of an earlier run that the parts just written did not replace (they would
+/// make the directory look like one larger output).
+pub fn leftover_parts(dir: &Path, pattern: &str, extension: &str, written: usize) -> Vec<PathBuf> {
+    (written..written + 100_000)
+        .map(|n| dir.join(format!("{}{extension}", part_name(pattern, n))))
+        .take_while(|p| p.exists())
+        .collect()
+}
+
 pub struct SplitSpec {
     pub rows: Option<u64>,
     pub bytes: Option<u64>,
@@ -67,7 +143,9 @@ pub fn split_csv_bytes(
     let input = io::open_input(src)?;
     let consumed = input.consumed.clone();
     let total = input.file_size;
-    let mut chunker = Chunker::new(input.reader, 8 << 20, td.quote, dialect.split_byte());
+    let mut chunker = Chunker::new(input.reader, 8 << 20, td.quote, dialect.split_byte()).with_escape(td.escape);
+    // a blank line is a row only in a single-column file (as in conversion)
+    let blank_is_row = dialect.columns.len() == 1;
     std::fs::create_dir_all(&spec.dir).map_err(|e| Error::io(e, &spec.dir))?;
     let mut header: Vec<u8> = Vec::new();
     let mut leading = dialect.leading_records();
@@ -78,12 +156,12 @@ pub fn split_csv_bytes(
     let result = (|| -> Result<()> {
         while let Some(chunk) = chunker.next_chunk()? {
             let data = &chunk.data;
-            let mut pending: Vec<(usize, usize)> = Vec::new();
+            let mut pending: Vec<(usize, usize, bool)> = Vec::new();
             tok.for_each(data, |r| {
-                pending.push((r.start, r.end));
+                pending.push((r.start, r.end, r.is_blank() && !blank_is_row));
                 true
             });
-            for (start, end) in pending {
+            for (start, end, skipped) in pending {
                 let rec = &data[start..end];
                 if leading > 0 {
                     leading -= 1;
@@ -98,7 +176,9 @@ pub fn split_csv_bytes(
                 }
                 let (f, rows, bytes) = current.as_mut().unwrap();
                 f.writer().write_all(rec)?;
-                *rows += 1;
+                if !skipped {
+                    *rows += 1;
+                }
                 *bytes += rec.len() as u64;
                 let full = spec.rows.is_some_and(|n| *rows >= n) || spec.bytes.is_some_and(|b| *bytes >= b);
                 if full {

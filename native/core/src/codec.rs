@@ -136,38 +136,49 @@ pub fn compress(codec: CodecId, data: &[u8], level: i32) -> Result<Vec<u8>> {
     }
 }
 
+/// Largest up-front reservation for a decoded length read from a file.  Bigger
+/// outputs grow as they are produced, so a corrupt length cannot reserve memory the
+/// data does not really expand to.
+const RESERVE_CAP: usize = 256 << 20;
+
+/// An output buffer for `len` bytes, where `len` came from untrusted input: running
+/// out of memory is an error instead of an abort.
+pub fn buffer(len: usize) -> Result<Vec<u8>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(len.min(RESERVE_CAP))
+        .map_err(|_| Error::Data(format!("not enough memory to decode {len} bytes")))?;
+    Ok(v)
+}
+
+/// Read a decoder to the end, stopping one byte past `raw_len` (enough to prove a
+/// wrong length without inflating a decompression bomb).
+fn read_limited(reader: impl Read, raw_len: usize, name: &str) -> Result<Vec<u8>> {
+    let mut out = buffer(raw_len)?;
+    reader.take(raw_len as u64 + 1).read_to_end(&mut out).map_err(|e| Error::Integrity(format!("{name}: {e}")))?;
+    Ok(out)
+}
+
 /// Decompress `data`, which must expand to exactly `raw_len` bytes.
 pub fn decompress(codec: CodecId, data: &[u8], raw_len: usize) -> Result<Vec<u8>> {
     let out = match codec {
         CodecId::None => data.to_vec(),
-        CodecId::Zstd => {
-            if raw_len == 0 {
-                Vec::new()
-            } else {
-                zstd::bulk::decompress(data, raw_len).map_err(|e| Error::Integrity(format!("zstd: {e}")))?
-            }
-        }
-        CodecId::Zlib => {
-            let mut out = Vec::with_capacity(raw_len);
-            flate2::read::ZlibDecoder::new(data)
-                .read_to_end(&mut out)
-                .map_err(|e| Error::Integrity(format!("zlib: {e}")))?;
+        CodecId::Zstd if raw_len == 0 => Vec::new(),
+        CodecId::Zstd if raw_len <= RESERVE_CAP => {
+            // bulk decoding into a buffer of exactly raw_len fails on larger output
+            let mut out = buffer(raw_len)?;
+            zstd::bulk::Decompressor::new()
+                .and_then(|mut d| d.decompress_to_buffer(data, &mut out))
+                .map_err(|e| Error::Integrity(format!("zstd: {e}")))?;
             out
         }
-        CodecId::Lz4 => {
-            let mut out = Vec::with_capacity(raw_len);
-            lz4_flex::frame::FrameDecoder::new(data)
-                .read_to_end(&mut out)
-                .map_err(|e| Error::Integrity(format!("lz4: {e}")))?;
-            out
-        }
-        CodecId::Brotli => {
-            let mut out = Vec::with_capacity(raw_len);
-            brotli::Decompressor::new(data, 1 << 16)
-                .read_to_end(&mut out)
-                .map_err(|e| Error::Integrity(format!("brotli: {e}")))?;
-            out
-        }
+        CodecId::Zstd => read_limited(
+            zstd::stream::read::Decoder::with_buffer(data).map_err(|e| Error::Integrity(format!("zstd: {e}")))?,
+            raw_len,
+            "zstd",
+        )?,
+        CodecId::Zlib => read_limited(flate2::read::ZlibDecoder::new(data), raw_len, "zlib")?,
+        CodecId::Lz4 => read_limited(lz4_flex::frame::FrameDecoder::new(data), raw_len, "lz4")?,
+        CodecId::Brotli => read_limited(brotli::Decompressor::new(data, 1 << 16), raw_len, "brotli")?,
         CodecId::Lzma => lzma_alone_decompress(data, raw_len)?,
     };
     if out.len() != raw_len {
@@ -214,12 +225,10 @@ fn lzma_alone_compress(data: &[u8], level: u32) -> Result<Vec<u8>> {
 
 fn lzma_alone_decompress(data: &[u8], raw_len: usize) -> Result<Vec<u8>> {
     use liblzma::stream::Stream;
-    let stream = Stream::new_lzma_decoder(u64::MAX).map_err(|e| Error::Integrity(format!("lzma: {e}")))?;
-    let mut out = Vec::with_capacity(raw_len);
-    liblzma::read::XzDecoder::new_stream(data, stream)
-        .read_to_end(&mut out)
-        .map_err(|e| Error::Integrity(format!("lzma: {e}")))?;
-    Ok(out)
+    // The header names the dictionary size; the encoder never uses more than 64 MiB,
+    // so a corrupt header cannot make the decoder allocate gigabytes.
+    let stream = Stream::new_lzma_decoder(1 << 30).map_err(|e| Error::Integrity(format!("lzma: {e}")))?;
+    read_limited(liblzma::read::XzDecoder::new_stream(data, stream), raw_len, "lzma")
 }
 
 /// Compress with each candidate and keep the smallest result (ties prefer the earlier,

@@ -91,6 +91,27 @@ pub fn truncated() -> Error {
     Error::Integrity("DCZ data is truncated or corrupt".into())
 }
 
+/// An empty vector with room for `n` items, where `n` came from untrusted input:
+/// running out of memory is an error instead of an abort.
+pub fn alloc<T>(n: usize) -> Result<Vec<T>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(n).map_err(|_| Error::Data(format!("not enough memory to decode {n} values")))?;
+    Ok(v)
+}
+
+/// `n` copies of `value` (see [`alloc`]).
+pub fn filled<T: Clone>(n: usize, value: T) -> Result<Vec<T>> {
+    let mut v = alloc(n)?;
+    v.resize(n, value);
+    Ok(v)
+}
+
+/// A non-negative length or position stored as an integer.
+#[inline]
+pub fn index(v: i64) -> Result<usize> {
+    usize::try_from(v).map_err(|_| truncated())
+}
+
 #[inline]
 fn width_for(max: u64) -> u8 {
     (64 - max.leading_zeros()).div_ceil(8) as u8
@@ -113,7 +134,7 @@ fn put_planes(out: &mut Vec<u8>, values: &[u64], width: u8) {
 
 fn get_planes(c: &mut Cursor<'_>, n: usize, width: u8) -> Result<Vec<u64>> {
     let data = c.bytes(n.checked_mul(width as usize).ok_or_else(truncated)?)?;
-    let mut out = vec![0u64; n];
+    let mut out = filled(n, 0u64)?;
     for plane in 0..width as usize {
         let shift = plane * 8;
         let row = &data[plane * n..(plane + 1) * n];
@@ -225,21 +246,29 @@ pub fn encode(out: &mut Vec<u8>, values: &[i64]) {
     encode_with(out, values, choose(values));
 }
 
-pub fn decode(c: &mut Cursor<'_>) -> Result<Vec<i64>> {
+/// Decode an int_array of at most `max` values.  The caller knows the bound from the
+/// surrounding structure (rows in the block, entries in a dictionary), so a corrupt
+/// count fails instead of allocating without limit: a width of 0 lets any count
+/// decode from a few bytes.
+pub fn decode(c: &mut Cursor<'_>, max: usize) -> Result<Vec<i64>> {
+    decode_at(c, max, false)
+}
+
+fn decode_at(c: &mut Cursor<'_>, max: usize, nested: bool) -> Result<Vec<i64>> {
     let n = c.usize()?;
     let t = c.u8()?;
+    if n > max {
+        return Err(truncated());
+    }
     if n == 0 {
         return Ok(Vec::new());
-    }
-    if n > (1 << 34) {
-        return Err(truncated());
     }
     match t {
         0 => get_for(c, n),
         1 => {
             let first = c.zigzag()?;
             let d = get_for(c, n - 1)?;
-            let mut out = Vec::with_capacity(n);
+            let mut out = alloc(n)?;
             out.push(first);
             let mut acc = first;
             for x in d {
@@ -248,19 +277,25 @@ pub fn decode(c: &mut Cursor<'_>) -> Result<Vec<i64>> {
             }
             Ok(out)
         }
+        // The encoder never nests runs, which also bounds the recursion depth.
+        2 if nested => Err(truncated()),
         2 => {
             let runs = c.usize()?;
-            let values = decode(c)?;
-            let lengths = decode(c)?;
+            if runs > n {
+                return Err(truncated());
+            }
+            let values = decode_at(c, runs, true)?;
+            let lengths = decode_at(c, runs, true)?;
             if values.len() != runs || lengths.len() != runs {
                 return Err(truncated());
             }
-            let mut out = Vec::with_capacity(n);
+            let mut out = alloc(n)?;
             for (v, len) in values.into_iter().zip(lengths) {
-                if len < 0 || out.len() + len as usize > n {
+                let len = index(len)?;
+                if len > n - out.len() {
                     return Err(truncated());
                 }
-                out.extend(std::iter::repeat_n(v, len as usize));
+                out.extend(std::iter::repeat_n(v, len));
             }
             if out.len() != n {
                 return Err(truncated());
@@ -277,9 +312,10 @@ pub fn encode_to_vec(values: &[i64]) -> Vec<u8> {
     out
 }
 
-pub fn decode_all(data: &[u8]) -> Result<Vec<i64>> {
+/// Decode a stream holding one int_array of at most `max` values.
+pub fn decode_all(data: &[u8], max: usize) -> Result<Vec<i64>> {
     let mut c = Cursor::new(data);
-    decode(&mut c)
+    decode(&mut c, max)
 }
 
 /// Pack booleans LSB-first.
@@ -306,10 +342,10 @@ mod tests {
         for t in [Transform::Plain, Transform::Delta, Transform::Rle] {
             let mut out = Vec::new();
             encode_with(&mut out, values, t);
-            assert_eq!(decode_all(&out).unwrap(), values, "{t:?}");
+            assert_eq!(decode_all(&out, values.len()).unwrap(), values, "{t:?}");
         }
         let out = encode_to_vec(values);
-        assert_eq!(decode_all(&out).unwrap(), values);
+        assert_eq!(decode_all(&out, values.len()).unwrap(), values);
         out.len()
     }
 
@@ -353,9 +389,22 @@ mod tests {
     fn corrupt_input_errors() {
         let out = encode_to_vec(&(0..100).map(|i| i * 3 + 7).collect::<Vec<i64>>());
         for cut in 0..out.len() {
-            let _ = decode_all(&out[..cut]); // must not panic
+            let _ = decode_all(&out[..cut], 100); // must not panic
         }
-        assert!(decode_all(&[5, 9]).is_err());
+        assert!(decode_all(&[5, 9], 100).is_err());
+        // more values than the caller allows (a width of 0 costs no bytes per value)
+        let mut bomb = Vec::new();
+        put_varint(&mut bomb, 1 << 40);
+        bomb.extend_from_slice(&[0, 0, 0]);
+        assert!(decode_all(&bomb, 1000).is_err());
+        // nested run-length arrays are never written, so they are rejected
+        let mut nested = Vec::new();
+        put_varint(&mut nested, 4);
+        nested.push(2);
+        put_varint(&mut nested, 1);
+        put_varint(&mut nested, 1);
+        nested.push(2);
+        assert!(decode_all(&nested, 100).is_err());
     }
 
     #[test]

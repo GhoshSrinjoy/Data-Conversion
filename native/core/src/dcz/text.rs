@@ -563,7 +563,15 @@ impl Cells {
     }
 }
 
-pub fn decode_column(meta: &mut Cursor<'_>, streams: &mut dyn FnMut() -> Result<Vec<u8>>, n: usize) -> Result<Cells> {
+/// Decode one column of `n` cells.  `budget` is how many cell bytes may still be
+/// produced (the block's decoded size): every cell lands in the output, so a column
+/// that expands beyond it is corrupt and stops before using the memory.
+pub fn decode_column(
+    meta: &mut Cursor<'_>,
+    streams: &mut dyn FnMut() -> Result<Vec<u8>>,
+    n: usize,
+    budget: &mut usize,
+) -> Result<Cells> {
     let enc = meta.u8()?;
     let quoting = meta.u8()?;
     let n_exc = meta.usize()?;
@@ -571,8 +579,8 @@ pub fn decode_column(meta: &mut Cursor<'_>, streams: &mut dyn FnMut() -> Result<
     if n_exc > n {
         return Err(ints::truncated());
     }
-    let mut quoted = vec![quoting == 1; n];
-    let mut empty = vec![false; n];
+    let mut quoted = ints::filled(n, quoting == 1)?;
+    let mut empty = ints::filled(n, false)?;
     let mut exceptions: Vec<(usize, Vec<u8>)> = Vec::new();
     if quoting == 2 || has_empty || n_exc > 0 {
         let aux = streams()?;
@@ -584,21 +592,24 @@ pub fn decode_column(meta: &mut Cursor<'_>, streams: &mut dyn FnMut() -> Result<
             empty = ints::get_bitmap(&mut c, n)?;
         }
         if n_exc > 0 {
-            let positions = ints::decode(&mut c)?;
-            let lengths = ints::decode(&mut c)?;
+            let positions = ints::decode(&mut c, n_exc)?;
+            let lengths = ints::decode(&mut c, n_exc)?;
             if positions.len() != n_exc || lengths.len() != n_exc {
                 return Err(ints::truncated());
             }
             for (p, l) in positions.into_iter().zip(lengths) {
-                if p < 0 || p as usize >= n || l < 0 {
+                // positions are strictly increasing cell numbers
+                let p = ints::index(p)?;
+                if p >= n || exceptions.last().is_some_and(|(q, _)| p <= *q) {
                     return Err(ints::truncated());
                 }
-                exceptions.push((p as usize, c.bytes(l as usize)?.to_vec()));
+                exceptions.push((p, c.bytes(ints::index(l)?)?.to_vec()));
             }
         }
     }
+    let limit = (*budget).min(u32::MAX as usize);
     let mut data = Vec::new();
-    let mut ends = Vec::with_capacity(n);
+    let mut ends = ints::alloc(n)?;
     let mut exc = exceptions.into_iter().peekable();
     // Emits cells in order, consulting empties and exceptions; `next` produces the
     // encoder-specific cell bytes.
@@ -611,8 +622,8 @@ pub fn decode_column(meta: &mut Cursor<'_>, streams: &mut dyn FnMut() -> Result<
                 } else {
                     next(data)?;
                 }
-                if data.len() > u32::MAX as usize {
-                    return Err(Error::Format("DCZ block too large".into()));
+                if data.len() > limit {
+                    return Err(Error::Integrity("a DCZ column decodes to more bytes than its block".into()));
                 }
                 ends.push(data.len() as u32);
             }
@@ -620,15 +631,15 @@ pub fn decode_column(meta: &mut Cursor<'_>, streams: &mut dyn FnMut() -> Result<
         };
     match enc {
         RAW => {
-            let lengths = ints::decode_all(&streams()?)?;
+            let lengths = ints::decode_all(&streams()?, n)?;
             let blob = streams()?;
             let mut pos = 0usize;
             let mut li = lengths.into_iter();
             emit(&mut data, &mut ends, &mut |out| {
-                let l = li.next().ok_or_else(ints::truncated)? as usize;
-                let s = blob.get(pos..pos + l).ok_or_else(ints::truncated)?;
-                out.extend_from_slice(s);
-                pos += l;
+                let l = ints::index(li.next().ok_or_else(ints::truncated)?)?;
+                let end = pos.checked_add(l).ok_or_else(ints::truncated)?;
+                out.extend_from_slice(blob.get(pos..end).ok_or_else(ints::truncated)?);
+                pos = end;
                 Ok(())
             })?;
         }
@@ -641,26 +652,27 @@ pub fn decode_column(meta: &mut Cursor<'_>, streams: &mut dyn FnMut() -> Result<
             })?;
         }
         DICT => {
+            // every entry is used by at least one cell
             let entries = meta.usize()?;
-            let lengths = ints::decode_all(&streams()?)?;
+            if entries > n {
+                return Err(ints::truncated());
+            }
+            let lengths = ints::decode_all(&streams()?, entries)?;
             let blob = streams()?;
-            let indices = ints::decode_all(&streams()?)?;
+            let indices = ints::decode_all(&streams()?, n)?;
             if lengths.len() != entries {
                 return Err(ints::truncated());
             }
-            let mut starts = Vec::with_capacity(entries + 1);
+            let mut starts = ints::alloc(entries + 1)?;
             let mut pos = 0usize;
             for &l in &lengths {
                 starts.push(pos);
-                pos += l as usize;
+                pos = pos.checked_add(ints::index(l)?).filter(|&p| p <= blob.len()).ok_or_else(ints::truncated)?;
             }
             starts.push(pos);
-            if pos > blob.len() {
-                return Err(ints::truncated());
-            }
             let mut ii = indices.into_iter();
             emit(&mut data, &mut ends, &mut |out| {
-                let k = ii.next().ok_or_else(ints::truncated)? as usize;
+                let k = ints::index(ii.next().ok_or_else(ints::truncated)?)?;
                 if k >= entries {
                     return Err(ints::truncated());
                 }
@@ -669,7 +681,7 @@ pub fn decode_column(meta: &mut Cursor<'_>, streams: &mut dyn FnMut() -> Result<
             })?;
         }
         INT => {
-            let values = ints::decode_all(&streams()?)?;
+            let values = ints::decode_all(&streams()?, n)?;
             let mut vi = values.into_iter();
             emit(&mut data, &mut ends, &mut |out| {
                 let v = vi.next().ok_or_else(ints::truncated)?;
@@ -679,15 +691,22 @@ pub fn decode_column(meta: &mut Cursor<'_>, streams: &mut dyn FnMut() -> Result<
             })?;
         }
         DECIMAL => {
+            // canonical decimals have at most 18 digits, so scales are 0..=18
             let scale = meta.u8()?;
-            let scales = if scale == 255 { Some(ints::decode_all(&streams()?)?) } else { None };
-            let mantissas = ints::decode_all(&streams()?)?;
+            if scale != 255 && scale > 18 {
+                return Err(ints::truncated());
+            }
+            let scales = if scale == 255 { Some(ints::decode_all(&streams()?, n)?) } else { None };
+            let mantissas = ints::decode_all(&streams()?, n)?;
             let mut mi = mantissas.into_iter();
             let mut si = scales.map(|s| s.into_iter());
             emit(&mut data, &mut ends, &mut |out| {
                 let m = mi.next().ok_or_else(ints::truncated)?;
                 let s = match &mut si {
-                    Some(it) => it.next().ok_or_else(ints::truncated)? as u8,
+                    Some(it) => u8::try_from(it.next().ok_or_else(ints::truncated)?)
+                        .ok()
+                        .filter(|&s| s <= 18)
+                        .ok_or_else(ints::truncated)?,
                     None => scale,
                 };
                 write_decimal(out, m, s);
@@ -695,7 +714,11 @@ pub fn decode_column(meta: &mut Cursor<'_>, streams: &mut dyn FnMut() -> Result<
             })?;
         }
         TEMPLATE => {
+            // each part takes at least two bytes of the metadata
             let nparts = meta.usize()?;
+            if nparts > meta.data.len().saturating_sub(meta.pos) / 2 {
+                return Err(ints::truncated());
+            }
             let mut parts = Vec::with_capacity(nparts);
             for _ in 0..nparts {
                 match meta.u8()? {
@@ -710,7 +733,7 @@ pub fn decode_column(meta: &mut Cursor<'_>, streams: &mut dyn FnMut() -> Result<
             let nfields = parts.iter().filter(|p| matches!(p, Part::Field(_))).count();
             let mut fields = Vec::with_capacity(nfields);
             for _ in 0..nfields {
-                fields.push(ints::decode_all(&streams()?)?.into_iter());
+                fields.push(ints::decode_all(&streams()?, n)?.into_iter());
             }
             emit(&mut data, &mut ends, &mut |out| {
                 let mut f = 0;
@@ -729,6 +752,7 @@ pub fn decode_column(meta: &mut Cursor<'_>, streams: &mut dyn FnMut() -> Result<
         }
         other => return Err(Error::Format(format!("unknown DCZ column encoding {other}"))),
     }
+    *budget -= data.len();
     Ok(Cells { data, ends, quoted })
 }
 
@@ -745,7 +769,8 @@ mod tests {
                 let mut streams = col.streams.clone().into_iter();
                 let mut next = || streams.next().ok_or_else(ints::truncated);
                 let mut meta = Cursor::new(&col.meta);
-                let decoded = decode_column(&mut meta, &mut next, cells.len()).unwrap();
+                let mut budget = usize::MAX;
+                let decoded = decode_column(&mut meta, &mut next, cells.len(), &mut budget).unwrap();
                 for (i, c) in cells.iter().enumerate() {
                     assert_eq!(decoded.get(i), c.as_bytes(), "enc {enc} cell {i}");
                     assert_eq!(decoded.quoted[i], quoted[i]);

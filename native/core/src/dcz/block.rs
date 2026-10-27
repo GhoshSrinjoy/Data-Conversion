@@ -213,18 +213,25 @@ pub fn decode(payload: &[u8], raw_len: usize) -> Result<Vec<u8>> {
     if n > payload.len() {
         return Err(ints::truncated());
     }
+    // No stream decodes to more than a small multiple of the block (8-byte integers
+    // for one-digit cells), so a larger claim is corrupt.
+    let stream_limit = raw_len.saturating_mul(8).saturating_add(1 << 16);
     let mut dir = Vec::with_capacity(n);
     for _ in 0..n {
         let codec = CodecId::from_u8(c.u8()?)?;
         let raw = c.usize()?;
         let stored = c.usize()?;
+        if raw > stream_limit {
+            return Err(ints::truncated());
+        }
         dir.push((codec, raw, stored));
     }
     let mut pos = c.pos;
     let mut raw_streams = Vec::with_capacity(n);
     for &(codec, raw, stored) in &dir {
-        let bytes = payload.get(pos..pos + stored).ok_or_else(ints::truncated)?;
-        pos += stored;
+        let end = pos.checked_add(stored).ok_or_else(ints::truncated)?;
+        let bytes = payload.get(pos..end).ok_or_else(ints::truncated)?;
+        pos = end;
         raw_streams.push((codec, raw, bytes));
     }
     let mut next_stream = raw_streams.into_iter();
@@ -246,35 +253,51 @@ pub fn decode(payload: &[u8], raw_len: usize) -> Result<Vec<u8>> {
     let term_mode = meta.u8()?;
     let last_term = meta.u8()?;
     let n_raw = meta.usize()?;
-    if rows > records || n_raw > records || ncols > raw_len + 1 {
+    // Every record is a row or a raw record and holds at least one byte (the last may
+    // lack its terminator); a row of `ncols` cells holds `ncols - 1` delimiters.
+    if records > raw_len.saturating_add(1)
+        || rows.checked_add(n_raw) != Some(records)
+        || ncols > raw_len.saturating_add(1)
+        || rows.saturating_mul(ncols) > raw_len.saturating_add(1)
+    {
         return Err(ints::truncated());
     }
     let mut raw_records: Vec<(usize, Vec<u8>)> = Vec::new();
     if n_raw > 0 {
         let s = take()?;
         let mut sc = Cursor::new(&s);
-        let positions = ints::decode(&mut sc)?;
-        let lengths = ints::decode(&mut sc)?;
+        let positions = ints::decode(&mut sc, n_raw)?;
+        let lengths = ints::decode(&mut sc, n_raw)?;
         if positions.len() != n_raw || lengths.len() != n_raw {
             return Err(ints::truncated());
         }
         for (p, l) in positions.into_iter().zip(lengths) {
-            if p < 0 || l < 0 {
+            // positions are strictly increasing record numbers
+            let p = ints::index(p)?;
+            if p >= records || raw_records.last().is_some_and(|(q, _)| p <= *q) {
                 return Err(ints::truncated());
             }
-            raw_records.push((p as usize, sc.bytes(l as usize)?.to_vec()));
+            raw_records.push((p, sc.bytes(ints::index(l)?)?.to_vec()));
         }
     }
-    let terms = if term_mode == 255 { Some(ints::decode_all(&take()?)?) } else { None };
-    let mut cols: Vec<Cells> = Vec::with_capacity(ncols);
+    let terms = if term_mode == 255 { Some(ints::decode_all(&take()?, rows)?) } else { None };
+    // each column's metadata takes at least four bytes
+    if ncols > meta.data.len().saturating_sub(meta.pos) / 4 {
+        return Err(ints::truncated());
+    }
+    let mut budget = raw_len;
+    let mut cols: Vec<Cells> = ints::alloc(ncols)?;
     for _ in 0..ncols {
-        cols.push(text::decode_column(&mut meta, &mut take, rows)?);
+        cols.push(text::decode_column(&mut meta, &mut take, rows, &mut budget)?);
     }
 
-    let mut out = Vec::with_capacity(raw_len);
+    let mut out = codec::buffer(raw_len)?;
     let mut raw_iter = raw_records.into_iter().peekable();
     let mut row = 0usize;
     for rec in 0..records {
+        if out.len() > raw_len {
+            break; // reported below
+        }
         if raw_iter.peek().is_some_and(|(p, _)| *p == rec) {
             out.extend_from_slice(&raw_iter.next().unwrap().1);
             continue;

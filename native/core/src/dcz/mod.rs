@@ -252,7 +252,7 @@ impl DczWriter {
                 limit
             } else {
                 match self.csv {
-                    Some(d) => crate::chunk::last_boundary(&self.pending[..limit], d.quote, b'\n')
+                    Some(d) => crate::chunk::last_record_end(&self.pending[..limit], d.quote, d.escape, b'\n')
                         .or_else(|| memchr::memrchr(b'\n', &self.pending[..limit]).map(|i| i + 1))
                         .unwrap_or(limit),
                     None => limit,
@@ -364,7 +364,7 @@ impl crate::tables::FinishWrite for DczWriter {
     }
 }
 
-/// Read the footer of a DCZ file.
+/// Read the footer of a DCZ file and check that its block index describes the file.
 pub fn read_footer(path: &Path) -> Result<Footer> {
     let mut f = File::open(path).map_err(|e| Error::io(e, path))?;
     let len = f.metadata()?.len();
@@ -379,6 +379,9 @@ pub fn read_footer(path: &Path) -> Result<Footer> {
     if head[8] != VERSION {
         return Err(Error::Format(format!("unsupported DCZ version {}", head[8])));
     }
+    if head[9] & FLAG_PACKED != 0 {
+        return Err(Error::Format(format!("{} holds packed values, not a file (use unpack)", path.display())));
+    }
     f.seek(SeekFrom::End(-(TRAILER_LEN as i64)))?;
     let mut trailer = [0u8; TRAILER_LEN];
     f.read_exact(&mut trailer)?;
@@ -386,20 +389,57 @@ pub fn read_footer(path: &Path) -> Result<Footer> {
         return Err(Error::Integrity("DCZ trailer missing: the file is truncated".into()));
     }
     let footer_offset = u64::from_le_bytes(trailer[..8].try_into().unwrap());
+    let footer_end = len - TRAILER_LEN as u64;
+    if footer_offset < HEADER_LEN as u64 || footer_offset.saturating_add(BLOCK_HEADER_LEN as u64) > footer_end {
+        return Err(Error::Integrity("DCZ footer is corrupt".into()));
+    }
     f.seek(SeekFrom::Start(footer_offset))?;
     let mut bh = [0u8; BLOCK_HEADER_LEN];
     f.read_exact(&mut bh)?;
     let h = BlockHeader::parse(&bh);
-    if h.kind != KIND_FOOTER || h.payload_len > len {
+    // the footer runs exactly to the trailer
+    if h.kind != KIND_FOOTER || footer_offset + BLOCK_HEADER_LEN as u64 + h.payload_len.min(len) != footer_end {
         return Err(Error::Integrity("DCZ footer is corrupt".into()));
     }
     let mut payload = vec![0u8; h.payload_len as usize];
     f.read_exact(&mut payload)?;
-    let json = codec::decompress(CodecId::from_u8(h.codec)?, &payload, h.raw_len as usize)?;
+    let raw_len = usize::try_from(h.raw_len).map_err(|_| ints::truncated())?;
+    let json = codec::decompress(CodecId::from_u8(h.codec)?, &payload, raw_len)?;
     if crc32fast::hash(&json) != h.crc32 {
         return Err(Error::Integrity("DCZ footer checksum mismatch".into()));
     }
-    Ok(serde_json::from_slice(&json)?)
+    let footer: Footer = serde_json::from_slice(&json)?;
+    validate_index(&footer, footer_offset)?;
+    Ok(footer)
+}
+
+/// The block index must tile the file exactly: blocks follow one another from the
+/// header to the footer, and their decoded sizes add up to the original size.
+/// (Block headers are not checksummed; matching them against this checksummed
+/// index is what makes their lengths safe to allocate.)
+fn validate_index(footer: &Footer, footer_offset: u64) -> Result<()> {
+    let bad = || Error::Integrity("DCZ block index is corrupt".into());
+    let (mut offset, mut raw) = (HEADER_LEN as u64, 0u64);
+    for b in &footer.blocks {
+        if b.offset != offset || b.raw_offset != raw {
+            return Err(bad());
+        }
+        offset =
+            offset.checked_add(BLOCK_HEADER_LEN as u64).and_then(|o| o.checked_add(b.payload_len)).ok_or_else(bad)?;
+        raw = raw.checked_add(b.raw_len).ok_or_else(bad)?;
+    }
+    if offset != footer_offset || raw != footer.original_size {
+        return Err(bad());
+    }
+    Ok(())
+}
+
+/// A block header must agree with its entry in the index.
+fn check_header(h: &BlockHeader, b: &BlockInfo) -> Result<()> {
+    if h.kind != b.kind || h.raw_len != b.raw_len || h.payload_len != b.payload_len {
+        return Err(Error::Integrity("DCZ block header does not match the block index".into()));
+    }
+    Ok(())
 }
 
 /// Sequential streaming reader of the original bytes, verifying every block.
@@ -409,14 +449,15 @@ pub struct DczReader {
     pos: usize,
     done: bool,
     crc: crc32fast::Hasher,
-    expected: Option<(u64, u32)>,
+    footer: Footer,
+    next: usize,
     produced: u64,
     consumed: Arc<AtomicU64>,
 }
 
 impl DczReader {
     pub fn open(path: &Path) -> Result<Self> {
-        let expected = read_footer(path).ok().map(|f| (f.original_size, f.original_crc32));
+        let footer = read_footer(path)?;
         let mut inner = BufReader::with_capacity(1 << 20, File::open(path).map_err(|e| Error::io(e, path))?);
         let mut head = [0u8; HEADER_LEN];
         inner.read_exact(&mut head)?;
@@ -429,7 +470,8 @@ impl DczReader {
             pos: 0,
             done: false,
             crc: crc32fast::Hasher::new(),
-            expected,
+            footer,
+            next: 0,
             produced: 0,
             consumed: Arc::new(AtomicU64::new(HEADER_LEN as u64)),
         })
@@ -450,13 +492,17 @@ impl DczReader {
         }
         let h = BlockHeader::parse(&bh);
         if h.kind == KIND_FOOTER {
-            if let Some((size, crc)) = self.expected {
-                if size != self.produced || crc != self.crc.clone().finalize() {
-                    return Err(Error::Integrity("DCZ content checksum mismatch".into()));
-                }
+            if self.next != self.footer.blocks.len()
+                || self.produced != self.footer.original_size
+                || self.crc.clone().finalize() != self.footer.original_crc32
+            {
+                return Err(Error::Integrity("DCZ content checksum mismatch".into()));
             }
             return Ok(false);
         }
+        let info = self.footer.blocks.get(self.next).ok_or_else(ints::truncated)?;
+        check_header(&h, info)?;
+        self.next += 1;
         let mut payload = vec![0u8; usize::try_from(h.payload_len).map_err(|_| ints::truncated())?];
         self.inner.read_exact(&mut payload).map_err(|_| Error::Integrity("DCZ file is truncated".into()))?;
         self.consumed.fetch_add((BLOCK_HEADER_LEN + payload.len()) as u64, Ordering::Relaxed);
@@ -491,7 +537,8 @@ impl Read for DczReader {
     }
 }
 
-fn looks_delimited(path: &Path) -> Option<Dialect> {
+/// The dialect and record terminator byte of delimited text, or None for other data.
+fn looks_delimited(path: &Path) -> Option<(Dialect, u8)> {
     let input = io::open_input(path).ok()?;
     let mut reader = input.reader;
     let head = io::read_up_to(&mut reader, 1 << 20).ok()?;
@@ -503,7 +550,7 @@ fn looks_delimited(path: &Path) -> Option<Dialect> {
         return None;
     }
     // A single column is still worth columnar encoding (e.g. one number per line).
-    Some(d.tokenizer_dialect())
+    Some((d.tokenizer_dialect(), d.split_byte()))
 }
 
 /// Compress a file into DCZ.  Delimited text is encoded column-wise (byte-exact);
@@ -522,15 +569,20 @@ pub fn compress_file(
     let mut out = AtomicFile::create(dst, overwrite)?;
     let mut writer = DczWriter::new(out.take_writer(), opts.clone())?;
     writer = match dialect {
-        Some(d) => writer.with_dialect(d),
+        Some((d, _)) => writer.with_dialect(d),
         None => writer.raw(),
     };
     let consumed = input.consumed.clone();
     let block_size = writer.block_size;
     let mut reader = input.reader;
-    // Delimited text is cut at record boundaries; opaque bytes at fixed sizes.
-    let mut chunker = dialect
-        .map(|d| Chunker::new(std::mem::replace(&mut reader, Box::new(std::io::empty())), block_size, d.quote, b'\n'));
+    // Delimited text is cut at record boundaries (or anywhere once a block reaches
+    // twice its size without one, e.g. text without line breaks); opaque bytes at
+    // fixed sizes.  Blocks decode byte-exactly wherever they are cut.
+    let mut chunker = dialect.map(|(d, split)| {
+        Chunker::new(std::mem::replace(&mut reader, Box::new(std::io::empty())), block_size, d.quote, split)
+            .with_escape(d.escape)
+            .with_max_record(block_size.saturating_mul(2))
+    });
     loop {
         let mut wave = Vec::new();
         while wave.len() < writer.wave {
@@ -600,7 +652,8 @@ pub fn decompress_file(src: &Path, dst: &Path, overwrite: bool, threads: usize, 
             let mut bh = [0u8; BLOCK_HEADER_LEN];
             f.read_exact(&mut bh)?;
             let h = BlockHeader::parse(&bh);
-            let mut payload = vec![0u8; h.payload_len as usize];
+            check_header(&h, b)?;
+            let mut payload = vec![0u8; usize::try_from(h.payload_len).map_err(|_| ints::truncated())?];
             f.read_exact(&mut payload).map_err(|_| Error::Integrity("DCZ file is truncated".into()))?;
             bytes += h.raw_len;
             group.push((h, payload));
@@ -731,35 +784,41 @@ pub fn decompress_bytes(buf: &[u8]) -> Result<Vec<u8>> {
     if buf.len() < HEADER_LEN + TRAILER_LEN || &buf[..8] != MAGIC {
         return Err(Error::Format("not DCZ data".into()));
     }
+    if buf[8] != VERSION {
+        return Err(Error::Format(format!("unsupported DCZ version {}", buf[8])));
+    }
     if buf[9] & FLAG_PACKED != 0 {
         return Err(Error::Format("DCZ data holds packed values (use unpack)".into()));
     }
-    let trailer = &buf[buf.len() - TRAILER_LEN..];
+    let footer_end = buf.len() - TRAILER_LEN;
+    let trailer = &buf[footer_end..];
     if &trailer[8..] != MAGIC_END {
         return Err(Error::Integrity("DCZ trailer missing: the data is truncated".into()));
     }
-    let footer_offset = u64::from_le_bytes(trailer[..8].try_into().unwrap()) as usize;
-    let fh: &[u8; BLOCK_HEADER_LEN] =
-        buf.get(footer_offset..footer_offset + BLOCK_HEADER_LEN).ok_or_else(ints::truncated)?.try_into().unwrap();
-    let fh = BlockHeader::parse(fh);
-    let fstart = footer_offset + BLOCK_HEADER_LEN;
-    let fpayload = buf.get(fstart..fstart + fh.payload_len as usize).ok_or_else(ints::truncated)?;
-    let json = codec::decompress(CodecId::from_u8(fh.codec)?, fpayload, fh.raw_len as usize)?;
-    if fh.kind != KIND_FOOTER || crc32fast::hash(&json) != fh.crc32 {
+    let footer_offset =
+        usize::try_from(u64::from_le_bytes(trailer[..8].try_into().unwrap())).map_err(|_| ints::truncated())?;
+    let fstart =
+        footer_offset.checked_add(BLOCK_HEADER_LEN).filter(|&s| s <= footer_end).ok_or_else(ints::truncated)?;
+    let fh = BlockHeader::parse(buf[footer_offset..fstart].try_into().unwrap());
+    // the footer runs exactly to the trailer
+    if fh.kind != KIND_FOOTER || footer_offset < HEADER_LEN || fh.payload_len != (footer_end - fstart) as u64 {
+        return Err(Error::Integrity("DCZ footer is corrupt".into()));
+    }
+    let raw_len = usize::try_from(fh.raw_len).map_err(|_| ints::truncated())?;
+    let json = codec::decompress(CodecId::from_u8(fh.codec)?, &buf[fstart..footer_end], raw_len)?;
+    if crc32fast::hash(&json) != fh.crc32 {
         return Err(Error::Integrity("DCZ footer is corrupt".into()));
     }
     let footer: Footer = serde_json::from_slice(&json)?;
-    let mut out = Vec::with_capacity(footer.original_size as usize);
-    let mut pos = HEADER_LEN;
-    while pos < footer_offset {
-        let bh: &[u8; BLOCK_HEADER_LEN] =
-            buf.get(pos..pos + BLOCK_HEADER_LEN).ok_or_else(ints::truncated)?.try_into().unwrap();
-        let h = BlockHeader::parse(bh);
-        pos += BLOCK_HEADER_LEN;
-        let end = pos.checked_add(h.payload_len as usize).ok_or_else(ints::truncated)?;
-        let payload = buf.get(pos..end).ok_or_else(ints::truncated)?;
+    validate_index(&footer, footer_offset as u64)?;
+    let mut out = codec::buffer(usize::try_from(footer.original_size).map_err(|_| ints::truncated())?)?;
+    for b in &footer.blocks {
+        // the validated index keeps every block inside the buffer
+        let start = b.offset as usize + BLOCK_HEADER_LEN;
+        let h = BlockHeader::parse(buf[b.offset as usize..start].try_into().unwrap());
+        check_header(&h, b)?;
+        let payload = &buf[start..start + b.payload_len as usize];
         out.extend_from_slice(&decode_block(h.kind, h.codec, payload, h.raw_len, h.crc32)?);
-        pos = end;
     }
     if out.len() as u64 != footer.original_size || crc32fast::hash(&out) != footer.original_crc32 {
         return Err(Error::Integrity("DCZ content checksum mismatch".into()));

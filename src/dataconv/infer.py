@@ -52,7 +52,7 @@ def is_nan(v: str) -> bool:
 
 def parse_int(v: str, loose: bool = False) -> Tuple[str, Optional[int], int]:
     """('ok', value, digits) | ('overflow', None, significant digits) | ('no', None, 0)."""
-    if not (_INT_LOOSE if loose else _INT).fullmatch(v):
+    if not (_INT_LOOSE if loose else _INT).fullmatch(v) or (not loose and v == "-0"):
         return "no", None, 0
     value = int(v)
     if INT64_MIN <= value <= INT64_MAX:
@@ -100,11 +100,11 @@ def parse_float(v: str, loose: bool = False) -> Optional[FloatInfo]:
         lossless = math.isfinite(value) or loose
     elif not math.isfinite(value) or value == 0.0:
         lossless = False
-    elif len(sig) <= 15:
-        lossless = True
     elif len(sig) >= 18:
         lossless = False
-    else:
+    elif len(sig) <= 15 and abs(value) >= 2.2250738585072014e-308:
+        lossless = True
+    else:  # 16-17 digits, or a subnormal (which keeps fewer digits): check exactly
         sci_exp = len(int_part) - 1 - lead + int(exp or 0)
         lossless = _faithful(value, sig, sci_exp)
     return FloatInfo(
@@ -492,13 +492,14 @@ def converter(ty: LogicalType, mode: str = "infer", extra_nulls: Sequence[str] =
         def conv(v, missing=False):
             if missing or nullish(v):
                 return None
-            if not re.fullmatch(r"-?[0-9]*(?:\.[0-9]*)?", v) or v in ("-", ".", "-."):
+            # canonical only: leading zeros and the sign of -0 would be lost
+            if not re.fullmatch(r"-?(?:0|[1-9][0-9]*)?(?:\.[0-9]*)?", v) or v in ("", "-", ".", "-."):
                 raise ValueError(v)
             frac = v.partition(".")[2]
             if len(frac) > ty.scale:
                 raise ValueError(v)
             d = Decimal(v).quantize(quant)
-            if abs(d.scaleb(ty.scale)) >= limit:
+            if abs(d.scaleb(ty.scale)) >= limit or (v.startswith("-") and d == 0):
                 raise ValueError(v)
             return d
     elif kind == "date":

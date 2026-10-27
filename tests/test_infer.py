@@ -32,6 +32,8 @@ def decide(values, mode="infer"):
         (["2024-01-02T03:04:05Z", "2024-01-02 03:04:05.123456+00:00"], "timestamp[us,UTC]"),
         (["2024-01-02T03:04:05+05:30"], "timestamp[s,+05:30]"),
         (["2024-01-02T03:04:05+05:30", "2024-01-02T03:04:05Z"], "string"),
+        (["-0", "1"], "float64"),  # -0 keeps its sign only as a float
+        (["1.2345e-320"], "string"),
         (["true", "False", "TRUE"], "bool"),
         (["1", "0"], "int64"),
         (["", "NA"], "string"),

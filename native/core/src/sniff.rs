@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::tokenize::{unescape, Dialect, Term, Tokenizer};
 use crate::types::{parse_bool, parse_date, parse_float, parse_int, parse_timestamp, IntParse};
 
@@ -63,14 +63,23 @@ pub struct SniffOptions {
     pub extension: Option<String>,
 }
 
-pub fn parse_char_option(text: &str) -> Option<u8> {
-    match text {
+/// Parse a one-character dialect option (`;`, `tab`, `\t`, `space`, `none`).  The
+/// tokenizer works on bytes, so only single ASCII characters are accepted.
+pub fn parse_char_option(text: &str) -> Result<Option<u8>> {
+    Ok(match text {
         "\\t" | "tab" | "TAB" => Some(b'\t'),
         "\\n" => Some(b'\n'),
         "space" => Some(b' '),
         "none" | "" => None,
-        other => other.as_bytes().first().copied(),
-    }
+        other => match other.as_bytes() {
+            [b] if b.is_ascii() => Some(*b),
+            _ => {
+                return Err(Error::Invalid(format!(
+                    "{other:?} is not a single ASCII character (e.g. ',', ';', '|', 'tab' or 'none')"
+                )))
+            }
+        },
+    })
 }
 
 /// Detect the text encoding of a sample.  Returns (WHATWG label, has_bom).
@@ -235,12 +244,12 @@ pub fn sniff(raw: &[u8], complete: bool, opts: &SniffOptions) -> Result<CsvDiale
     let encoding = opts.encoding.clone().unwrap_or_else(|| detected.to_string());
     let text = to_utf8(if complete { raw } else { trim_partial_utf8(raw) }, &encoding);
     let quote = match &opts.quote {
-        Some(q) => parse_char_option(q),
+        Some(q) => parse_char_option(q)?,
         None => Some(b'"'),
     };
     let has_quotes = quote.is_some_and(|q| memchr::memchr(q, &text).is_some());
     let escape = match &opts.escape {
-        Some(e) => parse_char_option(e),
+        Some(e) => parse_char_option(e)?,
         None => detect_backslash_escape(&text, quote),
     };
     let base = Dialect { delimiter: b',', quote, escape, double_quote: escape.is_none() };
@@ -250,7 +259,7 @@ pub fn sniff(raw: &[u8], complete: bool, opts: &SniffOptions) -> Result<CsvDiale
         let e = e.trim_start_matches('.').to_ascii_lowercase();
         e == "tsv" || e == "tab"
     });
-    let (delimiter, confidence) = match opts.delimiter.as_deref().and_then(parse_char_option) {
+    let (delimiter, confidence) = match opts.delimiter.as_deref().map(parse_char_option).transpose()?.flatten() {
         Some(d) => (d, 1.0),
         None => {
             let mut best = (b',', 0.0f64);
