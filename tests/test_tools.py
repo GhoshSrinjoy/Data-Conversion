@@ -21,10 +21,10 @@ def test_info_head_count_schema(tricky):
 def test_split_byte_exact(tmp_path):
     src = tmp_path / "in.csv"
     body = "".join(f'{i},"q, {i}","multi\nline"\r\n' for i in range(9000))
-    src.write_text("a,b,c\r\n" + body, newline="")
+    src.write_bytes(("a,b,c\r\n" + body).encode())
     r = dc.split(src, tmp_path / "parts", rows=2500, pattern="chunk_{n:04}")
     assert [Path(p["path"]).name for p in r.parts] == [f"chunk_{i:04}.csv" for i in range(4)]
-    joined = "".join(Path(p["path"]).read_text(newline="")[len("a,b,c\r\n"):] for p in r.parts)
+    joined = "".join(Path(p["path"]).read_bytes().decode()[len("a,b,c\r\n"):] for p in r.parts)
     assert joined == body
 
 

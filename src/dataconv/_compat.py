@@ -33,6 +33,7 @@ THIRD_PARTY = {
     "polars": "polars",
     "openpyxl": "openpyxl",
     "charset_normalizer": "charset-normalizer",
+    "dataconv_native": "dataconv-native",
 }
 
 _lock = threading.Lock()

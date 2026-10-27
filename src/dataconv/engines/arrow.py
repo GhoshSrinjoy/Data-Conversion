@@ -435,6 +435,15 @@ class Writer:
         else:
             self._inner.write_batch(batch)
 
+    def abort(self) -> None:
+        """Close everything after a failure, ignoring errors."""
+        for obj in (self._inner, self._stream):
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+
     def close(self) -> None:
         if self._text is not None:
             self._text.close()
@@ -505,22 +514,28 @@ def convert(src: Path, dst: Path, src_fmt: str, dst_fmt: str, dst_comp: Optional
             limit = o.limit
             with atomic_output(dst, overwrite=o.overwrite) as tmp:
                 writer: Optional[Writer] = None
-                for batch in stream:
-                    if limit is not None and rows + batch.num_rows > limit:
-                        batch = batch.slice(0, limit - rows)
+                try:
+                    for batch in stream:
+                        if limit is not None and rows + batch.num_rows > limit:
+                            batch = batch.slice(0, limit - rows)
+                        if writer is None:
+                            writer = Writer(tmp, dst_fmt, dst_comp, schema, o, batch)
+                        writer.write(batch)
+                        rows += batch.num_rows
+                        if progress is not None:
+                            done = reader.consumed if reader is not None else 0
+                            if progress(done, bytes_in) is False:
+                                raise KeyboardInterrupt
+                        if limit is not None and rows >= limit:
+                            break
                     if writer is None:
-                        writer = Writer(tmp, dst_fmt, dst_comp, schema, o, batch)
-                    writer.write(batch)
-                    rows += batch.num_rows
-                    if progress is not None:
-                        done = reader.consumed if reader is not None else 0
-                        if progress(done, bytes_in) is False:
-                            raise KeyboardInterrupt
-                    if limit is not None and rows >= limit:
-                        break
-                if writer is None:
-                    writer = Writer(tmp, dst_fmt, dst_comp, schema, o, None)
-                writer.close()
+                        writer = Writer(tmp, dst_fmt, dst_comp, schema, o, None)
+                    writer.close()
+                except BaseException:
+                    # release the file so the temporary output can be removed (Windows)
+                    if writer is not None:
+                        writer.abort()
+                    raise
             if pool is not None:
                 pool.shutdown()
             break

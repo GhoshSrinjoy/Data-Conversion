@@ -419,13 +419,15 @@ def convert(src: Path, dst: Path, src_fmt: str, dst_fmt: str, dst_comp: Optional
                         break
                     sink.write(row)
                     rows += 1
-                    if progress is not None and rows % 4096 == 0:
+                    if progress is not None and rows % 1024 == 0:
                         now = time.perf_counter()
                         if now - last > 0.1:
                             last = now
                             if progress(source.consumed(), bytes_in) is False:
                                 raise KeyboardInterrupt
                 sink.close()
+                if progress is not None and progress(bytes_in, bytes_in) is False:
+                    raise KeyboardInterrupt
             break
         except _Restart as r:
             restarts += 1

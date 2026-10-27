@@ -54,7 +54,11 @@ def test_strings_and_containers(mode):
 
 
 def test_numpy(mode):
-    np = pytest.importorskip("numpy")
+    from dataconv import _compat
+
+    np = _compat.optional("numpy")
+    if np is None:
+        pytest.skip("numpy not available (or disabled)")
     for arr in (
         np.arange(12, dtype=np.float32).reshape(3, 4) / 3,
         np.arange(-5, 5, dtype=np.int8),

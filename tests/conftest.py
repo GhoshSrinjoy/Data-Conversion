@@ -54,7 +54,7 @@ def tricky_csv(rows: int = 2000, bad: bool = True) -> str:
 @pytest.fixture
 def tricky(tmp_path: Path) -> Path:
     p = tmp_path / "tricky.csv"
-    p.write_text(tricky_csv(), encoding="utf-8", newline="")
+    p.write_bytes(tricky_csv().encode("utf-8"))
     return p
 
 
