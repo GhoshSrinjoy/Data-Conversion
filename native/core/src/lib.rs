@@ -19,6 +19,7 @@ pub mod io;
 pub mod pack;
 pub mod resources;
 pub mod sniff;
+pub mod split;
 pub mod tables;
 pub mod tokenize;
 pub mod types;

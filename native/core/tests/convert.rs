@@ -199,3 +199,56 @@ fn max_profile_tunes_parquet() {
     assert!(rm.bytes_out <= rf.bytes_out, "max {} vs fast {}", rm.bytes_out, rf.bytes_out);
     assert_eq!(read_parquet(&max).num_rows(), 100_000);
 }
+
+#[test]
+fn split_csv_is_byte_exact() {
+    let d = dir().join("split-exact");
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let src = d.join("in.csv");
+    let mut body = String::new();
+    for i in 0..10_000 {
+        body.push_str(&format!("{i},\"q, {i}\",\"multi\nline\"\r\n"));
+    }
+    let header = "a,b,c\r\n";
+    std::fs::write(&src, format!("{header}{body}")).unwrap();
+    let out = d.join("parts");
+    let opts = ConvertOptions { split_rows: Some(3000), split_pattern: Some("chunk_{n:04}".into()), ..Default::default() };
+    let r = convert(&src, &out, &opts, &NoHooks).unwrap();
+    assert_eq!(r.parts.len(), 4);
+    assert_eq!(r.rows, 10_000);
+    let mut joined = String::new();
+    for (i, p) in r.parts.iter().enumerate() {
+        assert!(p.path.ends_with(&format!("chunk_{i:04}.csv")), "{}", p.path);
+        let text = std::fs::read_to_string(&p.path).unwrap();
+        assert!(text.starts_with(header));
+        joined.push_str(&text[header.len()..]);
+    }
+    assert_eq!(joined, body);
+}
+
+#[test]
+fn split_by_size_lands_near_target() {
+    let d = dir().join("split-size");
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    let src = d.join("in.csv");
+    let mut s = String::from("id,v,name\n");
+    for i in 0..400_000 {
+        s.push_str(&format!("{i},{}.{},name{}\n", i % 1000, i % 7, i % 5000));
+    }
+    std::fs::write(&src, &s).unwrap();
+    let out = d.join("pq");
+    let target = 256 * 1024u64;
+    let opts = ConvertOptions { split_bytes: Some(target), to: Some("parquet".into()), ..Default::default() };
+    let r = convert(&src, &out, &opts, &NoHooks).unwrap();
+    assert_eq!(r.rows, 400_000);
+    assert!(r.parts.len() >= 3, "{} parts", r.parts.len());
+    // all but the last part should be within 40% of the target
+    for p in &r.parts[..r.parts.len() - 1] {
+        let ratio = p.bytes as f64 / target as f64;
+        assert!((0.6..1.4).contains(&ratio), "part {} is {} bytes ({ratio:.2}x target)", p.path, p.bytes);
+    }
+    let total: i64 = r.parts.iter().map(|p| read_parquet(&PathBuf::from(&p.path)).num_rows() as i64).sum();
+    assert_eq!(total, 400_000);
+}

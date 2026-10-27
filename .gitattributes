@@ -1,0 +1,12 @@
+* text=auto eol=lf
+*.rs text eol=lf
+*.py text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+# test fixtures must keep their exact bytes
+tests/data/** -text
+*.parquet binary
+*.dcz binary
+*.arrow binary

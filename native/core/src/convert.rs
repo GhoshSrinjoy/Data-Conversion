@@ -32,6 +32,14 @@ use crate::tables::{self, IpcSink, JsonlSink, ParquetOptions, ParquetSink, Sink,
 use crate::tokenize::{malformed_value, unescape, Dialect, Tokenizer};
 use crate::types::{ColumnStats, LogicalType, TypesMode};
 
+/// Phase timings on stderr when DATACONV_TRACE is set (diagnosing slow jobs).
+pub(crate) fn trace(phase: &str, started: Instant) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("DATACONV_TRACE").is_some()) {
+        eprintln!("[dataconv] {phase:<24} {:>8.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
 /// Callbacks from a running job.  `progress` returns false to cancel.
 pub trait Hooks: Sync {
     fn progress(&self, _done: u64, _total: u64) -> bool {
@@ -90,6 +98,13 @@ pub struct ConvertOptions {
     pub overwrite: bool,
     pub columns: Option<Vec<String>>,
     pub limit: Option<u64>,
+    /// Split into parts of at most this many rows / bytes (the destination is a directory).
+    pub split_rows: Option<u64>,
+    pub split_bytes: Option<u64>,
+    /// Part name pattern, `{n}` or `{n:05}` is the part number (default `part-{n:05}`).
+    pub split_pattern: Option<String>,
+    /// Part file extension including the dot (default from the format).
+    pub split_extension: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -116,6 +131,7 @@ pub struct Report {
     pub quarantine: Option<String>,
     pub restarts: u32,
     pub warnings: Vec<String>,
+    pub parts: Vec<crate::split::Part>,
 }
 
 // ---------------------------------------------------------------------------------
@@ -243,6 +259,7 @@ pub fn sniff_file(path: &Path, opts: &SniffOptions) -> Result<CsvDialect> {
     sniff::sniff(&head, complete, &o)
 }
 
+#[derive(Clone)]
 struct CsvPlan {
     dialect: Dialect,
     split: u8,
@@ -394,14 +411,76 @@ fn observe_chunk(plan: &CsvPlan, data: &[u8], skip: usize, stats: &mut [ColumnSt
     (good, bad)
 }
 
+/// Up to `n` record-aligned ranges covering `data` (which starts at a record boundary).
+fn record_ranges(data: &[u8], quote: Option<u8>, term: u8, n: usize) -> Vec<std::ops::Range<usize>> {
+    // One forward pass: quote parity is carried from cut to cut, so the whole split
+    // costs O(len) rather than one scan per part.
+    let count = |s: &[u8], q: u8| s.iter().filter(|&&b| b == q).count();
+    let mut cuts = vec![0usize];
+    let mut pos = 0usize;
+    let mut parity = 0usize;
+    for k in 1..n {
+        let target = data.len() * k / n;
+        if target <= pos {
+            continue;
+        }
+        if let Some(q) = quote {
+            parity += count(&data[pos..target], q);
+        }
+        pos = target;
+        loop {
+            let Some(i) = memchr::memchr(term, &data[pos..]) else {
+                pos = data.len();
+                break;
+            };
+            let nl = pos + i;
+            if let Some(q) = quote {
+                parity += count(&data[pos..nl], q);
+            }
+            pos = nl + 1;
+            if parity % 2 == 0 {
+                cuts.push(pos);
+                break;
+            }
+        }
+        if pos >= data.len() {
+            break;
+        }
+    }
+    cuts.push(data.len());
+    cuts.dedup();
+    cuts.windows(2).filter(|w| w[1] > w[0]).map(|w| w[0]..w[1]).collect()
+}
+
 fn sample_stats(path: &Path, plan: &CsvPlan, encoding: &str, sample_bytes: usize, file_size: u64) -> Result<Vec<ColumnStats>> {
     let ncols = plan.projection.len();
     let mut stats = vec![ColumnStats::default(); ncols];
+    let t = Instant::now();
     let (reader, _, _) = open_csv_stream(path, encoding)?;
     let mut chunker = Chunker::new(reader, sample_bytes, plan.dialect.quote, plan.split);
-    if let Some(head) = chunker.next_chunk()? {
-        observe_chunk(plan, &head.data, plan.leading, &mut stats);
+    let head = chunker.next_chunk()?;
+    trace("  read head sample", t);
+    let t = Instant::now();
+    if let Some(head) = head {
+        // Split the head sample at record boundaries and observe the parts in parallel.
+        let parts = record_ranges(&head.data, plan.dialect.quote, plan.split, rayon::current_num_threads().max(1));
+        let partials: Vec<Vec<ColumnStats>> = parts
+            .par_iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let mut local = vec![ColumnStats::default(); ncols];
+                observe_chunk(plan, &head.data[r.clone()], if i == 0 { plan.leading } else { 0 }, &mut local);
+                local
+            })
+            .collect();
+        for part in &partials {
+            for (s, p) in stats.iter_mut().zip(part) {
+                s.merge(p);
+            }
+        }
+        trace(&format!("  observe head ({} parts)", partials.len()), t);
     }
+    let t = Instant::now();
     // Spread samples across uncompressed UTF-8 files catch type changes late in the file.
     let plain = io::detect_compression(path, &io::read_head(path, 16)?) == Compression::None
         && detect_format(path, None)?.0 != Format::Dcz
@@ -409,7 +488,8 @@ fn sample_stats(path: &Path, plan: &CsvPlan, encoding: &str, sample_bytes: usize
     if plain && file_size > (sample_bytes as u64) * 2 {
         use std::io::{Seek, SeekFrom};
         const WINDOWS: u64 = 16;
-        let window = (sample_bytes as u64 / 4).clamp(64 << 10, 4 << 20) as usize;
+        // The spread windows together read about as much as the head sample.
+        let window = (sample_bytes as u64 / WINDOWS).clamp(64 << 10, 1 << 20) as usize;
         let mut parts: Vec<Vec<ColumnStats>> = (1..=WINDOWS)
             .into_par_iter()
             .filter_map(|i| {
@@ -437,6 +517,7 @@ fn sample_stats(path: &Path, plan: &CsvPlan, encoding: &str, sample_bytes: usize
                 s.merge(p);
             }
         }
+        trace("  spread samples", t);
     }
     Ok(stats)
 }
@@ -545,56 +626,38 @@ fn decide_types(stats: &[ColumnStats], names: &[String], opts: &ConvertOptions, 
 // Sinks
 // ---------------------------------------------------------------------------------
 
-struct Output {
-    file: AtomicFile,
-    format: Format,
-    compression: Compression,
+/// Where a job writes: one file, or a directory of parts.
+pub(crate) struct Target {
+    pub format: Format,
+    pub compression: Compression,
+    pub dst: PathBuf,
+    /// (rows per part, bytes per part, name pattern, extension)
+    pub split: Option<(Option<u64>, Option<u64>, String, String)>,
 }
 
-fn make_sink(
-    out: &mut Output,
+#[allow(clippy::too_many_arguments)]
+fn build_sink(
+    file: BufWriter<File>,
+    format: Format,
+    compression: Compression,
     schema: &SchemaRef,
     first: Option<&RecordBatch>,
     opts: &ConvertOptions,
     plan: &Plan,
     pool: &Arc<rayon::ThreadPool>,
-    describe: &mut String,
+    row_group_rows: Option<usize>,
 ) -> Result<Box<dyn Sink>> {
-    let file = out.file.take_writer();
-    Ok(match out.format {
+    Ok(match format {
         Format::Parquet => {
-            let mut popts = opts.parquet.clone();
-            if popts.compression.is_none() {
-                popts.compression = opts.compression.clone();
-            }
-            if popts.level.is_none() {
-                popts.level = opts.level;
-            }
-            if popts.profile.is_none() {
-                popts.profile = opts.profile.clone();
-            }
-            if popts.should_tune() {
-                if let Some(sample) = first {
-                    let sample = sample.slice(0, sample.num_rows().min(200_000));
-                    popts.encodings = pool.install(|| tables::tune_encodings(&sample, &popts));
-                }
-            }
-            let rows = popts.row_group_rows.unwrap_or(plan.row_group_rows);
+            let popts = pool.install(|| effective_parquet_options(opts, first));
+            let rows = row_group_rows.or(popts.row_group_rows).unwrap_or(plan.row_group_rows).max(1);
             let props = popts.properties(schema, rows)?;
-            *describe = format!("parquet/{}", tables::describe_codec(&popts.codec()?));
             Box::new(ParquetSink::new(file, schema.clone(), props, rows, pool.clone())?)
         }
-        Format::Ipc => {
-            *describe = format!("ipc/{}", opts.compression.as_deref().unwrap_or("zstd"));
-            Box::new(IpcSink::new(file, schema, opts.compression.as_deref())?)
-        }
+        Format::Ipc => Box::new(IpcSink::new(file, schema, opts.compression.as_deref())?),
         Format::Csv | Format::Jsonl => {
-            let w = tables::compressed_writer(file, out.compression, opts.level, plan.threads)?;
-            *describe = format!("{}{}", out.format.name(), match out.compression {
-                Compression::None => String::new(),
-                c => format!("/{}", c.name()),
-            });
-            if out.format == Format::Jsonl {
+            let w = tables::compressed_writer(file, compression, opts.level, plan.threads)?;
+            if format == Format::Jsonl {
                 Box::new(JsonlSink::new(w))
             } else {
                 let mut o = CsvWriteOptions::default();
@@ -610,16 +673,134 @@ fn make_sink(
         }
         Format::Dcz => {
             let profile = crate::codec::Profile::parse(opts.profile.as_deref().unwrap_or("balanced"))?;
-            let mut enc = crate::dcz::DczWriter::new(file, crate::dcz::EncodeOptions { profile, threads: plan.threads, block_size: None })?;
-            *describe = format!("dcz/{:?}", profile).to_lowercase();
             let mut o = CsvWriteOptions::default();
             if let Some(d) = opts.out_delimiter.as_deref().and_then(sniff::parse_char_option) {
                 o.delimiter = d;
             }
+            let mut enc = crate::dcz::DczWriter::new(file, crate::dcz::EncodeOptions { profile, threads: plan.threads, block_size: None })?
+                .with_dialect(Dialect { delimiter: o.delimiter, ..Dialect::default() });
             crate::csvout::write_header(&mut enc, &schema.fields().iter().map(|f| f.name().clone()).collect::<Vec<_>>(), &o)?;
             Box::new(tables::CsvSink::new(Box::new(enc), schema, CsvWriteOptions { header: false, ..o })?)
         }
     })
+}
+
+/// Parquet options for a job, refined by its first batch: per-column encoding trials
+/// for the max profile, otherwise no dictionary for high-cardinality columns.  The
+/// split size estimator uses the same options, so its measurements match.
+pub(crate) fn effective_parquet_options(opts: &ConvertOptions, first: Option<&RecordBatch>) -> ParquetOptions {
+    let mut popts = parquet_options(opts);
+    if let Some(sample) = first {
+        if popts.should_tune() {
+            let sample = sample.slice(0, sample.num_rows().min(200_000));
+            popts.encodings = tables::tune_encodings(&sample, &popts);
+        } else if popts.dictionary.is_none() && popts.encodings.is_empty() {
+            popts.plain_columns = tables::high_cardinality_columns(sample);
+        }
+    }
+    popts
+}
+
+fn parquet_options(opts: &ConvertOptions) -> ParquetOptions {
+    let mut popts = opts.parquet.clone();
+    if popts.compression.is_none() {
+        popts.compression = opts.compression.clone();
+    }
+    if popts.level.is_none() {
+        popts.level = opts.level;
+    }
+    if popts.profile.is_none() {
+        popts.profile = opts.profile.clone();
+    }
+    popts
+}
+
+fn describe(format: Format, compression: Compression, opts: &ConvertOptions) -> String {
+    match format {
+        Format::Parquet => format!(
+            "parquet/{}",
+            parquet_options(opts).codec().map(|c| tables::describe_codec(&c)).unwrap_or_else(|_| "?".into())
+        ),
+        Format::Ipc => format!("ipc/{}", opts.compression.as_deref().unwrap_or("zstd")),
+        Format::Dcz => format!("dcz/{}", opts.profile.as_deref().unwrap_or("balanced")),
+        Format::Csv | Format::Jsonl => match compression {
+            Compression::None => format.name().to_string(),
+            c => format!("{}/{}", format.name(), c.name()),
+        },
+    }
+}
+
+type Opener<'a> = Box<dyn FnMut(&Path, Option<&RecordBatch>, usize) -> Result<(AtomicFile, Box<dyn Sink>)> + 'a>;
+
+/// The output of a job, opened lazily so the first batch can tune the writer.
+struct Out<'a> {
+    target: &'a Target,
+    schema: SchemaRef,
+    opts: &'a ConvertOptions,
+    plan: &'a Plan,
+    pool: &'a Arc<rayon::ThreadPool>,
+    single: Option<(AtomicFile, Box<dyn Sink>)>,
+    rolling: Option<crate::split::RollingSink<Opener<'a>>>,
+}
+
+impl<'a> Out<'a> {
+    fn new(target: &'a Target, schema: SchemaRef, opts: &'a ConvertOptions, plan: &'a Plan, pool: &'a Arc<rayon::ThreadPool>) -> Self {
+        Out { target, schema, opts, plan, pool, single: None, rolling: None }
+    }
+
+    fn open(&mut self, first: Option<&RecordBatch>) -> Result<()> {
+        let t = self.target;
+        match &t.split {
+            None => {
+                let mut file = AtomicFile::create(&t.dst, self.opts.overwrite)?;
+                let sink = build_sink(file.take_writer(), t.format, t.compression, &self.schema, first, self.opts, self.plan, self.pool, None)?;
+                self.single = Some((file, sink));
+            }
+            Some((rows, bytes, pattern, extension)) => {
+                let spec = crate::split::SplitSpec {
+                    rows: *rows,
+                    bytes: *bytes,
+                    dir: t.dst.clone(),
+                    pattern: pattern.clone(),
+                    extension: extension.clone(),
+                    overwrite: self.opts.overwrite,
+                };
+                let (format, compression, schema, opts, plan, pool) =
+                    (t.format, t.compression, self.schema.clone(), self.opts, self.plan, self.pool);
+                let opener: Opener<'a> = Box::new(move |path: &Path, first: Option<&RecordBatch>, rows: usize| {
+                    let mut file = AtomicFile::create(path, opts.overwrite)?;
+                    let rg = Some(rows.clamp(1, plan.row_group_rows));
+                    let sink = build_sink(file.take_writer(), format, compression, &schema, first, opts, plan, pool, rg)?;
+                    Ok((file, sink))
+                });
+                self.rolling = Some(crate::split::RollingSink::new(spec, format, compression, self.schema.clone(), self.opts.clone(), opener)?);
+            }
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        if self.single.is_none() && self.rolling.is_none() {
+            self.open(Some(batch))?;
+        }
+        match (&mut self.single, &mut self.rolling) {
+            (Some((_, sink)), _) => sink.write(batch),
+            (None, Some(r)) => r.write(batch),
+            _ => unreachable!(),
+        }
+    }
+
+    fn finish(mut self) -> Result<(u64, Vec<crate::split::Part>)> {
+        if self.single.is_none() && self.rolling.is_none() {
+            self.open(None)?;
+        }
+        if let Some((file, sink)) = self.single.take() {
+            sink.finish()?;
+            return Ok((file.commit(None)?, Vec::new()));
+        }
+        let parts = self.rolling.take().expect("output opened").finish()?;
+        Ok((parts.iter().map(|p| p.bytes).sum(), parts))
+    }
 }
 
 // ---------------------------------------------------------------------------------
@@ -646,10 +827,14 @@ pub fn convert(src: &Path, dst: &Path, opts: &ConvertOptions, hooks: &dyn Hooks)
     if src.canonicalize().ok() == dst.canonicalize().ok() {
         return Err(Error::Invalid("source and destination are the same file".into()));
     }
-    let (src_fmt, _) = detect_format(src, opts.from.as_deref())?;
+    let (src_fmt, src_comp) = detect_format(src, opts.from.as_deref())?;
+    let splitting = opts.split_rows.is_some() || opts.split_bytes.is_some();
+    let bytes_in = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+    if splitting {
+        return split(src, src_fmt, src_comp, dst, opts, hooks, started, bytes_in);
+    }
     let (dst_fmt, dst_comp) = target_format(dst, opts.to.as_deref())?;
     io::ensure_writable(dst, opts.overwrite)?;
-    let bytes_in = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
 
     // Byte-exact paths: CSV <-> DCZ never re-encode values.
     if dst_fmt == Format::Dcz && src_fmt == Format::Csv {
@@ -675,11 +860,97 @@ pub fn convert(src: &Path, dst: &Path, opts: &ConvertOptions, hooks: &dyn Hooks)
         ..Report::default()
     };
 
+    let target = Target { format: dst_fmt, compression: dst_comp, dst: dst.to_path_buf(), split: None };
     match src_fmt {
-        Format::Csv | Format::Dcz => convert_csv(src, dst, dst_fmt, dst_comp, opts, &plan, &pool, hooks, &mut report)?,
-        Format::Parquet | Format::Ipc | Format::Jsonl => {
-            convert_table(src, src_fmt, dst, dst_fmt, dst_comp, opts, &plan, &pool, hooks, &mut report)?
+        Format::Csv | Format::Dcz => convert_csv(src, &target, opts, &plan, &pool, hooks, &mut report)?,
+        Format::Parquet | Format::Ipc | Format::Jsonl => convert_table(src, src_fmt, &target, opts, &plan, &pool, hooks, &mut report)?,
+    }
+    report.seconds = started.elapsed().as_secs_f64();
+    Ok(report)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn split(
+    src: &Path,
+    src_fmt: Format,
+    src_comp: Compression,
+    dir: &Path,
+    opts: &ConvertOptions,
+    hooks: &dyn Hooks,
+    started: Instant,
+    bytes_in: u64,
+) -> Result<Report> {
+    if opts.split_rows == Some(0) || opts.split_bytes == Some(0) {
+        return Err(Error::Invalid("split sizes must be positive".into()));
+    }
+    if dir.is_file() {
+        return Err(Error::Invalid(format!("{} is a file; splitting writes into a directory", dir.display())));
+    }
+    let to = opts.to.clone().unwrap_or_else(|| src_fmt.name().to_string());
+    let dst_fmt = Format::parse(&to)?;
+    let extension = opts.split_extension.clone().unwrap_or_else(|| {
+        match dst_fmt {
+            Format::Csv => ".csv",
+            Format::Jsonl => ".jsonl",
+            Format::Parquet => ".parquet",
+            Format::Ipc => ".arrow",
+            Format::Dcz => ".dcz",
         }
+        .to_string()
+    });
+    let dst_comp = Compression::from_extension(Path::new(&format!("x{extension}")));
+    let pattern = opts.split_pattern.clone().unwrap_or_else(|| "part-{n:05}".to_string());
+    let plan = resources::plan(Some(bytes_in), opts.threads, opts.memory, opts.chunk_size);
+    let mut report = Report {
+        source: src.display().to_string(),
+        destination: dir.display().to_string(),
+        source_format: src_fmt.name().into(),
+        destination_format: dst_fmt.name().into(),
+        engine: "native",
+        bytes_in,
+        threads: plan.threads,
+        memory_budget: plan.memory_budget,
+        chunk_size: plan.chunk_size,
+        ..Report::default()
+    };
+    let byte_exact = src_fmt == Format::Csv
+        && dst_fmt == Format::Csv
+        && dst_comp == Compression::None
+        && opts.columns.is_none()
+        && opts.limit.is_none()
+        && opts.out_delimiter.is_none()
+        && opts.schema.is_empty()
+        && src_comp == Compression::None;
+    if byte_exact {
+        let dialect = sniff_file(src, &opts.sniff)?;
+        let spec = crate::split::SplitSpec {
+            rows: opts.split_rows,
+            bytes: opts.split_bytes,
+            dir: dir.to_path_buf(),
+            pattern,
+            extension,
+            overwrite: opts.overwrite,
+        };
+        let parts = crate::split::split_csv_bytes(src, &spec, &dialect, hooks)?;
+        report.rows = parts.iter().map(|p| p.rows).sum();
+        report.bytes_out = parts.iter().map(|p| p.bytes).sum();
+        report.columns = dialect.columns.len();
+        report.compression = "csv (byte-exact)".into();
+        report.parts = parts;
+        report.dialect = Some(dialect);
+        report.seconds = started.elapsed().as_secs_f64();
+        return Ok(report);
+    }
+    let pool = Arc::new(resources::thread_pool(plan.threads));
+    let target = Target {
+        format: dst_fmt,
+        compression: dst_comp,
+        dst: dir.to_path_buf(),
+        split: Some((opts.split_rows, opts.split_bytes, pattern, extension)),
+    };
+    match src_fmt {
+        Format::Csv | Format::Dcz => convert_csv(src, &target, opts, &plan, &pool, hooks, &mut report)?,
+        Format::Parquet | Format::Ipc | Format::Jsonl => convert_table(src, src_fmt, &target, opts, &plan, &pool, hooks, &mut report)?,
     }
     report.seconds = started.elapsed().as_secs_f64();
     Ok(report)
@@ -688,16 +959,16 @@ pub fn convert(src: &Path, dst: &Path, opts: &ConvertOptions, hooks: &dyn Hooks)
 #[allow(clippy::too_many_arguments)]
 fn convert_csv(
     src: &Path,
-    dst: &Path,
-    dst_fmt: Format,
-    dst_comp: Compression,
+    target: &Target,
     opts: &ConvertOptions,
     plan: &Plan,
     pool: &Arc<rayon::ThreadPool>,
     hooks: &dyn Hooks,
     report: &mut Report,
 ) -> Result<()> {
+    let t = Instant::now();
     let mut dialect = sniff_file(src, &opts.sniff)?;
+    trace("sniff", t);
     let projection: Vec<usize> = match &opts.columns {
         None => (0..dialect.columns.len()).collect(),
         Some(cols) => cols
@@ -708,7 +979,7 @@ fn convert_csv(
             .collect::<Result<_>>()?,
     };
     let names: Vec<String> = projection.iter().map(|&i| dialect.columns[i].clone()).collect();
-    let mode = if matches!(dst_fmt, Format::Csv | Format::Dcz) && opts.schema.is_empty() {
+    let mode = if matches!(target.format, Format::Csv | Format::Dcz) && opts.schema.is_empty() {
         // Text to text: values pass through untouched.
         TypesMode::String
     } else {
@@ -731,17 +1002,22 @@ fn convert_csv(
     let mut warnings = Vec::new();
     let mut full_done = opts.infer == InferMode::Full;
     if mode != TypesMode::String || !opts.schema.is_empty() {
+        let t = Instant::now();
         let stats = if full_done {
             full_stats(src, &cplan, &dialect.encoding, plan, pool)?
         } else {
-            sample_stats(src, &cplan, &dialect.encoding, sample_bytes, report.bytes_in)?
+            pool.install(|| sample_stats(src, &cplan, &dialect.encoding, sample_bytes, report.bytes_in))?
         };
         cplan.types = decide_types(&stats, &names, opts, &mut warnings)?;
+        trace("infer types", t);
     }
 
     let mut restarts = 0u32;
     loop {
-        match csv_attempt(src, dst, dst_fmt, dst_comp, &cplan, &dialect.encoding, opts, plan, pool, hooks, report) {
+        let t = Instant::now();
+        let attempt = csv_attempt(src, target, &cplan, &dialect.encoding, opts, plan, pool, hooks, report);
+        trace("convert", t);
+        match attempt {
             Ok(()) => break,
             Err(Retry::Fatal(e)) => return Err(e),
             Err(Retry::Encoding) => {
@@ -792,9 +1068,7 @@ fn convert_csv(
 #[allow(clippy::too_many_arguments)]
 fn csv_attempt(
     src: &Path,
-    dst: &Path,
-    dst_fmt: Format,
-    dst_comp: Compression,
+    target: &Target,
     cplan: &CsvPlan,
     encoding: &str,
     opts: &ConvertOptions,
@@ -803,26 +1077,51 @@ fn csv_attempt(
     hooks: &dyn Hooks,
     report: &mut Report,
 ) -> std::result::Result<(), Retry> {
+    let started_attempt = Instant::now();
     let (reader, consumed, total) = open_csv_stream(src, encoding)?;
     let rx = spawn_chunker(Chunker::new(reader, plan.chunk_size, cplan.dialect.quote, cplan.split), plan.wave_chunks);
     let schema = cplan.schema();
-    let mut out = Output { file: AtomicFile::create(dst, opts.overwrite)?, format: dst_fmt, compression: dst_comp };
-    let mut sink: Option<Box<dyn Sink>> = None;
-    let mut quarantine: Option<(PathBuf, BufWriter<File>)> = None;
+    let dst = target.dst.as_path();
+    let mut out = Out::new(target, schema.clone(), opts, plan, pool);
+    // Rejected rows go to a temporary file too, published only if the job succeeds.
+    let mut quarantine: Option<(PathBuf, AtomicFile)> = None;
     let (mut rows, mut bad, mut blank, mut irregular) = (0u64, 0u64, 0u64, 0u64);
     let limit = opts.limit.unwrap_or(u64::MAX);
-    let mut describe = String::new();
-    loop {
-        let wave = next_wave(&rx, plan.wave_chunks).map_err(|e| match e {
-            Error::Data(m) if m.contains("decoding failed") => Retry::Encoding,
-            other => Retry::Fatal(other),
-        })?;
-        if wave.is_empty() {
+    // Ordered streaming pipeline: chunks are decoded on worker threads as soon as
+    // they are read, and written in file order as they complete, so reading,
+    // decoding and encoding overlap.  At most `depth` chunks are in flight.
+    let shared = Arc::new(cplan.clone());
+    let (res_tx, res_rx) = std::sync::mpsc::channel::<(usize, Result<Decoded>)>();
+    let depth = plan.wave_chunks.max(2);
+    let mut pending: std::collections::BTreeMap<usize, Result<Decoded>> = std::collections::BTreeMap::new();
+    let (mut spawned, mut emitted, mut in_flight) = (0usize, 0usize, 0usize);
+    let mut input_done = false;
+    'stream: loop {
+        while !input_done && in_flight < depth {
+            match rx.recv() {
+                Ok(Ok(chunk)) => {
+                    let (tx, p, s, idx) = (res_tx.clone(), shared.clone(), schema.clone(), spawned);
+                    pool.spawn(move || {
+                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_chunk(&p, &s, &chunk)))
+                            .unwrap_or_else(|_| Err(Error::Data("internal error while decoding a chunk".into())));
+                        let _ = tx.send((idx, r));
+                    });
+                    spawned += 1;
+                    in_flight += 1;
+                }
+                Ok(Err(Error::Data(m))) if m.contains("decoding failed") => return Err(Retry::Encoding),
+                Ok(Err(e)) => return Err(Retry::Fatal(e)),
+                Err(_) => input_done = true,
+            }
+        }
+        if in_flight == 0 {
             break;
         }
-        let decoded: Vec<Result<Decoded>> = pool.install(|| wave.par_iter().map(|c| decode_chunk(cplan, &schema, c)).collect());
-        drop(wave);
-        for d in decoded {
+        let (idx, result) = res_rx.recv().map_err(|_| Retry::Fatal(Error::Data("a worker thread stopped".into())))?;
+        in_flight -= 1;
+        pending.insert(idx, result);
+        while let Some(d) = pending.remove(&emitted) {
+            emitted += 1;
             let d = match d {
                 Ok(d) => d,
                 Err(Error::Data(m)) if m.contains("UTF-8") => return Err(Retry::Encoding),
@@ -841,14 +1140,14 @@ fn csv_attempt(
                 if cplan.bad_lines != BadLines::Skip {
                     if quarantine.is_none() {
                         let path = opts.quarantine.as_ref().map(PathBuf::from).unwrap_or_else(|| default_quarantine(dst));
-                        let mut w = BufWriter::new(File::create(&path).map_err(|e| Error::io(e, &path))?);
-                        crate::csvout::write_header(&mut w, &cplan.names, &CsvWriteOptions {
+                        let mut f = AtomicFile::create(&path, true)?;
+                        crate::csvout::write_header(f.writer(), &cplan.names, &CsvWriteOptions {
                             delimiter: cplan.dialect.delimiter,
                             ..CsvWriteOptions::default()
                         })?;
-                        quarantine = Some((path, w));
+                        quarantine = Some((path, f));
                     }
-                    let (_, w) = quarantine.as_mut().unwrap();
+                    let w = quarantine.as_mut().unwrap().1.writer();
                     for raw in &d.bad {
                         w.write_all(raw).map_err(Error::from)?;
                         if !raw.ends_with(b"\n") && !raw.ends_with(b"\r") {
@@ -858,42 +1157,36 @@ fn csv_attempt(
                 }
             }
             if let Some(mut batch) = d.batch {
-                if rows >= limit {
-                    continue;
-                }
                 if rows + batch.num_rows() as u64 > limit {
                     batch = batch.slice(0, (limit - rows) as usize);
                 }
-                if sink.is_none() {
-                    sink = Some(make_sink(&mut out, &schema, Some(&batch), opts, plan, pool, &mut describe)?);
-                }
                 rows += batch.num_rows() as u64;
-                sink.as_mut().unwrap().write(&batch)?;
+                out.write(&batch)?;
+            }
+            if rows >= limit {
+                break 'stream;
             }
         }
         if !hooks.progress(consumed.load(Ordering::Relaxed), total) {
             return Err(Retry::Fatal(Error::Cancelled));
         }
-        if rows >= limit {
-            break;
-        }
     }
     drop(rx);
-    let sink = match sink {
-        Some(s) => s,
-        None => make_sink(&mut out, &schema, None, opts, plan, pool, &mut describe)?,
-    };
-    sink.finish()?;
-    report.bytes_out = out.file.commit(None)?;
-    if let Some((path, mut w)) = quarantine {
-        w.flush().map_err(Error::from)?;
+    trace("  decode + write", started_attempt);
+    let t = Instant::now();
+    let (bytes_out, parts) = out.finish()?;
+    trace("  finish output", t);
+    report.bytes_out = bytes_out;
+    report.parts = parts;
+    if let Some((path, f)) = quarantine {
+        f.commit(None)?;
         report.quarantine = Some(path.display().to_string());
     }
     report.rows = rows;
     report.bad_rows = bad;
     report.blank_lines = blank;
     report.irregular_records = irregular;
-    report.compression = describe;
+    report.compression = describe(target.format, target.compression, opts);
     if bad > 0 {
         report.warnings.push(match cplan.bad_lines {
             BadLines::Skip => format!("{bad} malformed rows skipped"),
@@ -912,9 +1205,7 @@ pub fn default_quarantine(dst: &Path) -> PathBuf {
 fn convert_table(
     src: &Path,
     src_fmt: Format,
-    dst: &Path,
-    dst_fmt: Format,
-    dst_comp: Compression,
+    target: &Target,
     opts: &ConvertOptions,
     plan: &Plan,
     pool: &Arc<rayon::ThreadPool>,
@@ -929,11 +1220,9 @@ fn convert_table(
         _ => unreachable!(),
     };
     let schema = source.schema();
-    let mut out = Output { file: AtomicFile::create(dst, opts.overwrite)?, format: dst_fmt, compression: dst_comp };
-    let mut sink: Option<Box<dyn Sink>> = None;
+    let mut out = Out::new(target, schema.clone(), opts, plan, pool);
     let mut rows = 0u64;
     let limit = opts.limit.unwrap_or(u64::MAX);
-    let mut describe = String::new();
     while let Some(wave) = source.next_wave()? {
         for mut batch in wave {
             if rows >= limit {
@@ -942,11 +1231,8 @@ fn convert_table(
             if rows + batch.num_rows() as u64 > limit {
                 batch = batch.slice(0, (limit - rows) as usize);
             }
-            if sink.is_none() {
-                sink = Some(make_sink(&mut out, &schema, Some(&batch), opts, plan, pool, &mut describe)?);
-            }
             rows += batch.num_rows() as u64;
-            sink.as_mut().unwrap().write(&batch)?;
+            out.write(&batch)?;
         }
         let (done, total) = source.progress();
         if !hooks.progress(done, total) {
@@ -956,15 +1242,12 @@ fn convert_table(
             break;
         }
     }
-    let sink = match sink {
-        Some(s) => s,
-        None => make_sink(&mut out, &schema, None, opts, plan, pool, &mut describe)?,
-    };
-    sink.finish()?;
-    report.bytes_out = out.file.commit(None)?;
+    let (bytes_out, parts) = out.finish()?;
+    report.bytes_out = bytes_out;
+    report.parts = parts;
     report.rows = rows;
     report.columns = schema.fields().len();
     report.schema = schema.fields().iter().map(|f| (f.name().clone(), f.data_type().to_string())).collect();
-    report.compression = describe;
+    report.compression = describe(target.format, target.compression, opts);
     Ok(())
 }

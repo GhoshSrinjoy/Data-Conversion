@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dataconv"
+version = "1.0.0"
+description = "Fast, lossless, resource-aware data conversion and compression for CSV, Parquet, Arrow, JSON and more"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "PolyForm-Noncommercial-1.0.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Srinjoy Ghosh" }]
+keywords = ["csv", "parquet", "arrow", "compression", "conversion", "lossless", "etl", "data-engineering"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: Implementation :: PyPy",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering",
+    "Topic :: System :: Archiving :: Compression",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+# The Rust engine: fastest path, no other dependencies (CPython 3.9+ wheels).
+native = ["dataconv-native==1.0.0; python_version >= '3.9'"]
+# pyarrow engine: ORC, Excel/JSON arrays, in-memory tables (load/write/merge/stats).
+arrow = ["pyarrow>=10"]
+# Extra codecs and better resource detection for the pure-Python engine.
+fast = ["zstandard>=0.15", "lz4>=3", "brotli>=1", "numpy>=1.20", "psutil>=5"]
+excel = ["openpyxl>=3"]
+all = ["dataconv[native,arrow,fast,excel]"]
+dev = ["pytest>=7", "ruff>=0.5"]
+
+[project.scripts]
+dataconv = "dataconv.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+dataconv = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 130
+target-version = "py38"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501", "UP006", "UP007", "UP035", "UP045", "RUF012", "SIM105", "B904", "SIM108", "RUF001", "RUF002", "RUF003"]

@@ -6,10 +6,10 @@ members = ["core", "python", "cli"]
 version = "1.0.0"
 edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
-rust-version = "1.75"
+rust-version = "1.88"
 
 [workspace.dependencies]
-arrow = { version = "60", default-features = false, features = ["csv", "json", "ipc", "ipc_compression"] }
+arrow = { version = "60", default-features = false, features = ["csv", "json", "ipc", "ipc_compression", "chrono-tz"] }
 parquet = { version = "60", default-features = false, features = ["arrow", "snap", "zstd", "lz4", "brotli", "flate2-zlib-rs", "simdutf8"] }
 
 [profile.release]

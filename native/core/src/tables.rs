@@ -130,6 +130,10 @@ pub struct ParquetOptions {
     pub statistics: Option<bool>,
     /// "1.0" (most compatible, default) or "2.0"
     pub version: Option<String>,
+    /// Columns written without dictionary encoding (high cardinality); filled in
+    /// automatically from the first batch.
+    #[serde(skip)]
+    pub plain_columns: Vec<String>,
 }
 
 pub fn parquet_compression(name: &str, level: Option<i32>) -> Result<PqCompression> {
@@ -207,6 +211,11 @@ impl ParquetOptions {
         if let Some(d) = self.dictionary {
             b = b.set_dictionary_enabled(d);
         }
+        for name in &self.plain_columns {
+            if schema.field_with_name(name).is_ok() && !self.encodings.contains_key(name) {
+                b = b.set_column_dictionary_enabled(ColumnPath::new(vec![name.clone()]), false);
+            }
+        }
         for (name, enc) in &self.encodings {
             if schema.field_with_name(name).is_err() {
                 continue;
@@ -238,6 +247,56 @@ fn candidates(dt: &DataType) -> &'static [&'static str] {
         }
         _ => &[],
     }
+}
+
+/// Columns whose sample is at least 90% distinct values: dictionary encoding would be
+/// built and then abandoned, so it is skipped for them.
+pub fn high_cardinality_columns(sample: &RecordBatch) -> Vec<String> {
+    use arrow::array::{Array, AsArray};
+    use std::hash::{BuildHasher, Hash, Hasher};
+    let n = sample.num_rows().min(32_768);
+    if n < 1024 {
+        return Vec::new();
+    }
+    let state = ahash::RandomState::with_seeds(1, 2, 3, 4);
+    let schema = sample.schema();
+    let mut out = Vec::new();
+    for (field, col) in schema.fields().iter().zip(sample.columns()) {
+        let mut seen = ahash::AHashSet::with_capacity(n);
+        let mut count = |h: u64| {
+            seen.insert(h);
+        };
+        let hash = |f: &dyn Fn(&mut ahash::AHasher)| {
+            let mut h = state.build_hasher();
+            f(&mut h);
+            h.finish()
+        };
+        match field.data_type() {
+            DataType::Utf8 => {
+                let a = col.as_string::<i32>();
+                for i in (0..n).filter(|&i| !a.is_null(i)) {
+                    count(hash(&|h| a.value(i).hash(h)));
+                }
+            }
+            DataType::Float64 => {
+                let a = col.as_primitive::<arrow::datatypes::Float64Type>();
+                for i in (0..n).filter(|&i| !a.is_null(i)) {
+                    count(a.value(i).to_bits());
+                }
+            }
+            DataType::Int64 => {
+                let a = col.as_primitive::<arrow::datatypes::Int64Type>();
+                for i in (0..n).filter(|&i| !a.is_null(i)) {
+                    count(a.value(i) as u64);
+                }
+            }
+            _ => continue,
+        }
+        if seen.len() * 10 > n * 9 {
+            out.push(field.name().clone());
+        }
+    }
+    out
 }
 
 /// Try each candidate encoding on a sample of every column and keep the smallest.
@@ -277,14 +336,25 @@ pub fn tune_encodings(sample: &RecordBatch, opts: &ParquetOptions) -> HashMap<St
         .collect()
 }
 
+type EncodedGroup = std::result::Result<Vec<ArrowColumnChunk>, parquet::errors::ParquetError>;
+
+/// Parquet output whose row groups are encoded on worker threads (every column of a
+/// row group in parallel, and up to `max_in_flight` row groups at once) while the
+/// finished ones are appended to the file in order.
 pub struct ParquetSink {
     writer: Option<SerializedFileWriter<BufWriter<File>>>,
-    factory: ArrowRowGroupWriterFactory,
+    factory: Arc<ArrowRowGroupWriterFactory>,
     schema: SchemaRef,
     pending: Vec<RecordBatch>,
     pending_rows: usize,
     row_group_rows: usize,
-    row_groups: usize,
+    next_group: usize,
+    appended: usize,
+    in_flight: usize,
+    max_in_flight: usize,
+    done_tx: std::sync::mpsc::Sender<(usize, EncodedGroup)>,
+    done_rx: std::sync::mpsc::Receiver<(usize, EncodedGroup)>,
+    finished: std::collections::BTreeMap<usize, EncodedGroup>,
     pool: Arc<rayon::ThreadPool>,
 }
 
@@ -299,51 +369,98 @@ impl ParquetSink {
         let options = ArrowWriterOptions::new().with_properties(props);
         let writer = ArrowWriter::try_new_with_options(file, schema.clone(), options)?;
         let (writer, factory) = writer.into_serialized_writer()?;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
         Ok(ParquetSink {
             writer: Some(writer),
-            factory,
+            factory: Arc::new(factory),
             schema,
             pending: Vec::new(),
             pending_rows: 0,
             row_group_rows: row_group_rows.max(1),
-            row_groups: 0,
+            next_group: 0,
+            appended: 0,
+            in_flight: 0,
+            max_in_flight: 2,
+            done_tx,
+            done_rx,
+            finished: std::collections::BTreeMap::new(),
             pool,
         })
     }
 
-    fn flush_row_group(&mut self) -> Result<()> {
+    /// Hand the pending batches to the workers as the next row group.
+    fn dispatch(&mut self) -> Result<()> {
         if self.pending_rows == 0 {
             return Ok(());
         }
-        let writers = self.factory.create_column_writers(self.row_groups)?;
-        let mut jobs: Vec<(_, Vec<_>)> = writers.into_iter().map(|w| (w, Vec::new())).collect();
-        for batch in self.pending.drain(..) {
-            let mut leaf = 0;
-            for (field, column) in self.schema.fields().iter().zip(batch.columns()) {
-                for l in compute_leaves(field, column)? {
-                    jobs[leaf].1.push(l);
-                    leaf += 1;
-                }
-            }
+        while self.in_flight >= self.max_in_flight {
+            self.wait_one()?;
         }
-        let chunks: Vec<ArrowColumnChunk> = self.pool.install(|| {
-            jobs.into_par_iter()
-                .map(|(mut w, leaves)| {
-                    for l in &leaves {
-                        w.write(l)?;
-                    }
-                    w.close()
-                })
-                .collect::<std::result::Result<Vec<_>, _>>()
-        })?;
-        let writer = self.writer.as_mut().expect("writer open");
-        let mut rg = writer.next_row_group()?;
-        for chunk in chunks {
-            chunk.append_to_row_group(&mut rg)?;
-        }
-        rg.close()?;
-        self.row_groups += 1;
+        let batches = std::mem::take(&mut self.pending);
         self.pending_rows = 0;
+        let index = self.next_group;
+        self.next_group += 1;
+        self.in_flight += 1;
+        let (factory, schema, pool, tx) = (self.factory.clone(), self.schema.clone(), self.pool.clone(), self.done_tx.clone());
+        self.pool.spawn(move || {
+            let encode = || -> EncodedGroup {
+                let writers = factory.create_column_writers(index)?;
+                let mut jobs: Vec<(_, Vec<_>)> = writers.into_iter().map(|w| (w, Vec::new())).collect();
+                for batch in &batches {
+                    let mut leaf = 0;
+                    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+                        for l in compute_leaves(field, column)? {
+                            jobs[leaf].1.push(l);
+                            leaf += 1;
+                        }
+                    }
+                }
+                drop(batches);
+                pool.install(|| {
+                    jobs.into_par_iter()
+                        .map(|(mut w, leaves)| {
+                            for l in &leaves {
+                                w.write(l)?;
+                            }
+                            w.close()
+                        })
+                        .collect()
+                })
+            };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(encode)).unwrap_or_else(|_| {
+                Err(parquet::errors::ParquetError::General("internal error while encoding a row group".into()))
+            });
+            let _ = tx.send((index, result));
+        });
+        self.append_ready()
+    }
+
+    fn wait_one(&mut self) -> Result<()> {
+        let (index, result) = self
+            .done_rx
+            .recv()
+            .map_err(|_| Error::Data("a Parquet encoding worker stopped".into()))?;
+        self.in_flight -= 1;
+        self.finished.insert(index, result);
+        self.append_ready()
+    }
+
+    /// Append every finished row group that is next in file order.
+    fn append_ready(&mut self) -> Result<()> {
+        while let Ok((index, result)) = self.done_rx.try_recv() {
+            self.in_flight -= 1;
+            self.finished.insert(index, result);
+        }
+        while let Some(result) = self.finished.remove(&self.appended) {
+            let chunks = result?;
+            let writer = self.writer.as_mut().expect("writer open");
+            let mut rg = writer.next_row_group()?;
+            for chunk in chunks {
+                chunk.append_to_row_group(&mut rg)?;
+            }
+            rg.close()?;
+            self.appended += 1;
+        }
         Ok(())
     }
 }
@@ -359,14 +476,18 @@ impl Sink for ParquetSink {
             self.pending_rows += take;
             offset += take;
             if self.pending_rows >= self.row_group_rows {
-                self.flush_row_group()?;
+                self.dispatch()?;
             }
         }
         Ok(())
     }
 
     fn finish(mut self: Box<Self>) -> Result<()> {
-        self.flush_row_group()?;
+        self.dispatch()?;
+        while self.in_flight > 0 {
+            self.wait_one()?;
+        }
+        self.append_ready()?;
         let writer = self.writer.take().expect("writer open");
         let mut inner = writer.into_inner()?;
         inner.flush()?;

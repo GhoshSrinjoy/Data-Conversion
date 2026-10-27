@@ -173,7 +173,7 @@ fn parquet_info(path: &Path) -> Result<Value> {
             let c = rg.column(i);
             compressed += c.compressed_size();
             uncompressed += c.uncompressed_size();
-            codecs.insert(format!("{}", c.compression()));
+            codecs.insert(crate::tables::describe_codec(&c.compression()));
             for e in c.encodings() {
                 encodings.insert(format!("{e:?}"));
             }

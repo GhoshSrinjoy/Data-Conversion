@@ -395,7 +395,8 @@ fn encode_template(cells: &[&[u8]], quoted: &[bool]) -> Option<EncodedColumn> {
             *counts.entry(sig.clone()).or_insert(0) += 1;
         }
     }
-    let (best, hits) = counts.into_iter().max_by_key(|(_, n)| *n)?;
+    // Deterministic: highest count, then the smallest signature.
+    let (best, hits) = counts.into_iter().max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))?;
     if hits * 10 < sampled * 9 {
         return None;
     }
@@ -423,7 +424,7 @@ fn encode_template(cells: &[&[u8]], quoted: &[bool]) -> Option<EncodedColumn> {
         for d in field_runs {
             *freq.entry(d.len()).or_insert(0) += 1;
         }
-        let (w, n) = freq.into_iter().max_by_key(|(_, n)| *n).unwrap_or((0, 0));
+        let (w, n) = freq.into_iter().max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0))).unwrap_or((0, 0));
         let canonical = field_runs.iter().filter(|d| d.len() == 1 || d[0] != b'0').count();
         widths.push(if n * 100 >= field_runs.len() * 99 && n >= canonical { w as u8 } else { 0 });
     }

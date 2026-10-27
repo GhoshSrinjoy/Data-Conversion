@@ -26,14 +26,19 @@ _SIZE_RE = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s*([kmgtp]?)(?:i?b)?\s*$", re.IGNO
 
 
 def parse_size(value: Union[str, int, float, None], default_unit: str = "") -> Optional[int]:
-    """Parse '64MB', '1.5g', '512k' or a plain number into bytes (units are powers of 1024).
+    """Parse '64MB', '1.5g', '512k' or a number into bytes (units are powers of 1024).
 
-    ``default_unit`` applies to bare numbers, e.g. ``parse_size("100", "m")`` is 100 MiB.
+    Numbers are bytes.  ``default_unit`` applies only to unit-less *strings* (the
+    command line), e.g. ``parse_size("100", "m")`` is 100 MiB.
     """
     if value is None:
         return None
+    if isinstance(value, bool):
+        raise ValueError(f"invalid size {value!r}")
     if isinstance(value, (int, float)):
-        return int(value * _UNITS[default_unit.lower()[:1]])
+        if value < 0:
+            raise ValueError(f"invalid size {value!r}")
+        return int(value)
     match = _SIZE_RE.match(str(value))
     if not match:
         raise ValueError(f"invalid size {value!r}; use forms like 512K, 64MB, 1.5G")
@@ -59,7 +64,7 @@ def format_duration(seconds: float) -> str:
         return f"{seconds * 1000:.0f} ms"
     if seconds < 60:
         return f"{seconds:.2f} s"
-    minutes, secs = divmod(int(round(seconds)), 60)
+    minutes, secs = divmod(round(seconds), 60)
     if minutes < 60:
         return f"{minutes}m {secs:02d}s"
     hours, minutes = divmod(minutes, 60)
@@ -160,7 +165,7 @@ def prefetch(items: Iterable[T], depth: int = 1) -> Iterator[T]:
     one.  Exceptions are re-raised in the consumer; abandoning the iterator stops
     the producer.
     """
-    buffer: "queue.Queue[object]" = queue.Queue(maxsize=max(1, depth))
+    buffer: queue.Queue[object] = queue.Queue(maxsize=max(1, depth))
     stop = threading.Event()
 
     def produce() -> None:

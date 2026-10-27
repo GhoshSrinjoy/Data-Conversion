@@ -11,6 +11,10 @@ class MissingDependencyError(DataconvError, ImportError):
     """An optional package is needed for the requested operation."""
 
 
+class FileError(DataconvError, OSError):
+    """A file could not be read or written."""
+
+
 class FormatError(DataconvError, ValueError):
     """A file format is unknown, unsupported, or does not match its contents."""
 
@@ -29,3 +33,7 @@ class IntegrityError(DataconvError):
 
 class OutputExistsError(DataconvError, FileExistsError):
     """The destination exists and overwriting was not requested."""
+
+
+class OptionsError(DataconvError, ValueError):
+    """Invalid or conflicting options."""
