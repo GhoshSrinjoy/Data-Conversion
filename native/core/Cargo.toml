@@ -1,0 +1,29 @@
+[package]
+name = "dataconv-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Native engine for dataconv: lossless CSV/columnar conversion and compression"
+
+[dependencies]
+arrow = { workspace = true }
+parquet = { workspace = true }
+rayon = "1.12"
+memchr = "2.8"
+crc32fast = "1.5"
+simdutf8 = "0.1"
+encoding_rs = "0.8"
+ahash = "0.8"
+itoa = "1"
+ryu = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zstd = { version = "0.14", default-features = false, features = ["zstdmt"] }
+lz4_flex = { version = "0.14", default-features = false, features = ["std", "frame"] }
+brotli = { version = "9", default-features = false, features = ["std"] }
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+liblzma = { version = "0.4", features = ["static"] }
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+
+[dev-dependencies]

@@ -1,0 +1,31 @@
+# Rust
+native/target/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Native extension builds copied next to the package
+src/dataconv/*.pyd
+src/dataconv/*.so
+*.pyd
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local data and outputs
+*.rejected.csv

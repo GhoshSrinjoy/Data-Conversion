@@ -1,0 +1,12 @@
+[package]
+name = "dataconv-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dataconv"
+path = "src/main.rs"
+
+[dependencies]
+dataconv-core = { path = "../core" }

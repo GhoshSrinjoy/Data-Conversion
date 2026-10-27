@@ -1,0 +1,13 @@
+[package]
+name = "dataconv-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "dataconv_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+dataconv-core = { path = "../core" }
+pyo3 = { version = "0.30", features = ["extension-module", "abi3-py39"] }

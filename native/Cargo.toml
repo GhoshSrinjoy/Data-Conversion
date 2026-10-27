@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["core", "python", "cli"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"
+rust-version = "1.75"
+
+[workspace.dependencies]
+arrow = { version = "60", default-features = false, features = ["csv", "json", "ipc", "ipc_compression"] }
+parquet = { version = "60", default-features = false, features = ["arrow", "snap", "zstd", "lz4", "brotli", "flate2-zlib-rs", "simdutf8"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "unwind"
+strip = "symbols"
+
+[profile.dev.package."*"]
+opt-level = 2

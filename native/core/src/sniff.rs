@@ -1,0 +1,444 @@
+//! CSV dialect detection: encoding, delimiter, quoting, terminator, header row and
+//! leading preamble lines.
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::Result;
+use crate::tokenize::{unescape, Dialect, Term, Tokenizer};
+use crate::types::{parse_bool, parse_date, parse_float, parse_int, parse_timestamp, IntParse};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CsvDialect {
+    pub delimiter: String,
+    pub quote: Option<String>,
+    pub escape: Option<String>,
+    pub double_quote: bool,
+    pub terminator: String,
+    pub encoding: String,
+    pub bom: bool,
+    pub header: bool,
+    pub skip_rows: usize,
+    pub columns: Vec<String>,
+    pub has_quotes: bool,
+    pub max_record_len: usize,
+    pub sample_records: usize,
+    pub confidence: f64,
+}
+
+impl CsvDialect {
+    pub fn tokenizer_dialect(&self) -> Dialect {
+        Dialect {
+            delimiter: self.delimiter.as_bytes().first().copied().unwrap_or(b','),
+            quote: self.quote.as_ref().and_then(|q| q.as_bytes().first().copied()),
+            escape: self.escape.as_ref().and_then(|e| e.as_bytes().first().copied()),
+            double_quote: self.double_quote,
+        }
+    }
+
+    /// The byte the chunker splits on.
+    pub fn split_byte(&self) -> u8 {
+        if self.terminator == "\r" { b'\r' } else { b'\n' }
+    }
+
+    /// Records to skip at the start of the data (preamble lines plus the header).
+    pub fn leading_records(&self) -> usize {
+        self.skip_rows + usize::from(self.header)
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct SniffOptions {
+    pub delimiter: Option<String>,
+    pub quote: Option<String>,
+    pub escape: Option<String>,
+    pub encoding: Option<String>,
+    pub header: Option<bool>,
+    pub skip_rows: Option<usize>,
+    /// File extension hint (".tsv" prefers tabs).
+    pub extension: Option<String>,
+}
+
+pub fn parse_char_option(text: &str) -> Option<u8> {
+    match text {
+        "\\t" | "tab" | "TAB" => Some(b'\t'),
+        "\\n" => Some(b'\n'),
+        "space" => Some(b' '),
+        "none" | "" => None,
+        other => other.as_bytes().first().copied(),
+    }
+}
+
+/// Detect the text encoding of a sample.  Returns (WHATWG label, has_bom).
+pub fn detect_encoding(sample: &[u8], complete: bool) -> (&'static str, bool) {
+    if sample.starts_with(b"\xEF\xBB\xBF") {
+        return ("utf-8", true);
+    }
+    if sample.starts_with(b"\xFF\xFE") {
+        return ("utf-16le", true);
+    }
+    if sample.starts_with(b"\xFE\xFF") {
+        return ("utf-16be", true);
+    }
+    // BOM-less UTF-16: ASCII text has a NUL in every other byte.
+    if sample.len() >= 64 {
+        let pairs = sample.len() / 2;
+        let odd_nul = sample.chunks_exact(2).filter(|p| p[1] == 0 && p[0] != 0).count();
+        let even_nul = sample.chunks_exact(2).filter(|p| p[0] == 0 && p[1] != 0).count();
+        if odd_nul * 10 > pairs * 7 {
+            return ("utf-16le", false);
+        }
+        if even_nul * 10 > pairs * 7 {
+            return ("utf-16be", false);
+        }
+    }
+    let check = if complete { sample } else { trim_partial_utf8(sample) };
+    if simdutf8::basic::from_utf8(check).is_ok() {
+        ("utf-8", false)
+    } else {
+        ("windows-1252", false)
+    }
+}
+
+/// Drop a multi-byte UTF-8 sequence cut off at the end of a sample.
+pub fn trim_partial_utf8(sample: &[u8]) -> &[u8] {
+    let n = sample.len();
+    for back in 1..=3.min(n) {
+        let b = sample[n - back];
+        if b & 0xC0 == 0xC0 {
+            let needed = if b >= 0xF0 { 4 } else if b >= 0xE0 { 3 } else { 2 };
+            return if back < needed { &sample[..n - back] } else { sample };
+        }
+        if b & 0x80 == 0 {
+            return sample;
+        }
+    }
+    sample
+}
+
+pub fn to_utf8(sample: &[u8], encoding: &str) -> Vec<u8> {
+    match encoding_rs::Encoding::for_label(encoding.as_bytes()) {
+        Some(enc) if enc != encoding_rs::UTF_8 => {
+            let (text, _, _) = enc.decode(sample);
+            text.into_owned().into_bytes()
+        }
+        _ => sample.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(sample).to_vec(),
+    }
+}
+
+/// Backslash-escaped quotes (`\"`) and no RFC 4180 doubled quotes (`""` not preceded by
+/// a backslash) mean the writer escapes with backslashes.
+fn detect_backslash_escape(text: &[u8], quote: Option<u8>) -> Option<u8> {
+    let q = quote?;
+    let mut backslashed = 0usize;
+    let mut doubled = 0usize;
+    let mut i = 1;
+    while i < text.len() {
+        if text[i] == q {
+            if text[i - 1] == b'\\' {
+                backslashed += 1;
+            } else if i + 1 < text.len() && text[i + 1] == q && text[i - 1] != q {
+                doubled += 1;
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    (backslashed > 0 && doubled == 0).then_some(b'\\')
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    Empty,
+    Number,
+    Bool,
+    Temporal,
+    Text,
+}
+
+fn kind(v: &[u8]) -> Kind {
+    if v.is_empty() {
+        Kind::Empty
+    } else if !matches!(parse_int(v, true), IntParse::No) || parse_float(v, true).is_some() {
+        Kind::Number
+    } else if parse_bool(v).is_some() {
+        Kind::Bool
+    } else if parse_date(v).is_some() || parse_timestamp(v).is_some() {
+        Kind::Temporal
+    } else {
+        Kind::Text
+    }
+}
+
+struct Sampled {
+    rows: Vec<Vec<Vec<u8>>>,
+    terms: [usize; 4],
+    max_len: usize,
+}
+
+fn sample_records(text: &[u8], d: Dialect, limit: usize, complete: bool) -> Sampled {
+    let mut t = Tokenizer::new(d);
+    let mut rows = Vec::new();
+    let mut terms = [0usize; 4];
+    let mut max_len = 0;
+    let mut scratch = Vec::new();
+    t.for_each(text, |r| {
+        if r.term == Term::Eof && !complete {
+            // The last record was cut off by the sample boundary.
+            return false;
+        }
+        terms[r.term.code() as usize] += 1;
+        max_len = max_len.max(r.end - r.start);
+        let row: Vec<Vec<u8>> =
+            r.fields.iter().map(|f| unescape(&r.data[f.start..f.end], f, &d, &mut scratch).to_vec()).collect();
+        rows.push(row);
+        rows.len() < limit
+    });
+    Sampled { rows, terms, max_len }
+}
+
+fn field_count_score(rows: &[Vec<Vec<u8>>]) -> (f64, usize) {
+    let data: Vec<usize> = rows.iter().filter(|r| !(r.len() == 1 && r[0].is_empty())).map(|r| r.len()).collect();
+    if data.is_empty() {
+        return (0.0, 1);
+    }
+    // (count, frequency) in order of first appearance; ties go to the earliest.
+    let mut counts: Vec<(usize, usize)> = Vec::new();
+    for &n in &data {
+        match counts.iter_mut().find(|(k, _)| *k == n) {
+            Some(entry) => entry.1 += 1,
+            None => counts.push((n, 1)),
+        }
+    }
+    let best = counts.iter().map(|&(_, f)| f).max().unwrap();
+    let (mode, freq) = counts.iter().copied().find(|&(_, f)| f == best).unwrap();
+    let consistency = freq as f64 / data.len() as f64;
+    if mode < 2 {
+        return (0.0, mode);
+    }
+    (consistency * (1.0 + (mode.min(64) as f64) / 200.0), mode)
+}
+
+/// Detect the dialect of a CSV sample (raw bytes from the start of the file).
+pub fn sniff(raw: &[u8], complete: bool, opts: &SniffOptions) -> Result<CsvDialect> {
+    let (detected, bom) = detect_encoding(raw, complete);
+    let encoding = opts.encoding.clone().unwrap_or_else(|| detected.to_string());
+    let text = to_utf8(if complete { raw } else { trim_partial_utf8(raw) }, &encoding);
+    let quote = match &opts.quote {
+        Some(q) => parse_char_option(q),
+        None => Some(b'"'),
+    };
+    let has_quotes = quote.map_or(false, |q| memchr::memchr(q, &text).is_some());
+    let escape = match &opts.escape {
+        Some(e) => parse_char_option(e),
+        None => detect_backslash_escape(&text, quote),
+    };
+    let base = Dialect { delimiter: b',', quote, escape, double_quote: escape.is_none() };
+    const LIMIT: usize = 400;
+
+    let tsv_hint = opts.extension.as_deref().map_or(false, |e| {
+        let e = e.trim_start_matches('.').to_ascii_lowercase();
+        e == "tsv" || e == "tab"
+    });
+    let (delimiter, confidence) = match opts.delimiter.as_deref().and_then(parse_char_option) {
+        Some(d) => (d, 1.0),
+        None => {
+            let mut best = (b',', 0.0f64);
+            for cand in [b',', b'\t', b';', b'|', b'^', b'~', b':'] {
+                let s = sample_records(&text, Dialect { delimiter: cand, ..base }, LIMIT, complete);
+                let (mut score, _) = field_count_score(&s.rows);
+                if cand == b'\t' && tsv_hint {
+                    score *= 1.25;
+                }
+                if score > best.1 + 1e-9 {
+                    best = (cand, score);
+                }
+            }
+            if best.1 == 0.0 {
+                (if tsv_hint { b'\t' } else { b',' }, 0.0)
+            } else {
+                best
+            }
+        }
+    };
+    let d = Dialect { delimiter, ..base };
+    let sampled = sample_records(&text, d, LIMIT.max(2000), complete);
+    let rows = &sampled.rows;
+
+    let terminator = {
+        let [lf, crlf, cr, _] = sampled.terms;
+        if crlf >= lf && crlf >= cr && crlf > 0 {
+            "\r\n"
+        } else if cr > lf && cr > crlf {
+            "\r"
+        } else {
+            "\n"
+        }
+    };
+
+    // Dominant field count from the body of the sample (so preamble lines cannot
+    // outvote the data); small samples use every row.
+    let body = if rows.len() >= 20 { &rows[rows.len() / 4..] } else { &rows[..] };
+    let (_, ncols) = field_count_score(body);
+
+    let skip_rows = match opts.skip_rows {
+        Some(n) => n,
+        None => {
+            let mut k = 0;
+            while k < rows.len() && k < 50 {
+                let n = rows[k].len();
+                let blank = n == 1 && rows[k][0].is_empty();
+                if n == ncols && !blank {
+                    break;
+                }
+                if !(blank || (ncols >= 2 && n <= ncols / 2)) {
+                    k = 0;
+                    break;
+                }
+                k += 1;
+            }
+            if k >= rows.len() { 0 } else { k }
+        }
+    };
+
+    let data_rows: Vec<&Vec<Vec<u8>>> = rows.iter().skip(skip_rows).collect();
+    let header = match opts.header {
+        Some(h) => h,
+        None => looks_like_header(&data_rows),
+    };
+    let width = data_rows.first().map_or(ncols, |r| r.len()).max(ncols).max(1);
+    let columns = if header {
+        let raw: Vec<String> = data_rows
+            .first()
+            .map(|r| r.iter().map(|v| String::from_utf8_lossy(v).into_owned()).collect())
+            .unwrap_or_default();
+        unique_names(&raw, width)
+    } else {
+        (1..=width).map(|i| format!("column_{i}")).collect()
+    };
+
+    Ok(CsvDialect {
+        delimiter: (delimiter as char).to_string(),
+        quote: quote.map(|q| (q as char).to_string()),
+        escape: escape.map(|e| (e as char).to_string()),
+        double_quote: escape.is_none(),
+        terminator: terminator.to_string(),
+        encoding,
+        bom,
+        header,
+        skip_rows,
+        columns,
+        has_quotes,
+        max_record_len: sampled.max_len,
+        sample_records: rows.len(),
+        confidence,
+    })
+}
+
+fn looks_like_header(rows: &[&Vec<Vec<u8>>]) -> bool {
+    let Some(first) = rows.first() else { return true };
+    let rest = &rows[1..rows.len().min(101)];
+    if rest.is_empty() {
+        return true;
+    }
+    let mut score = 0i32;
+    for (j, name) in first.iter().enumerate() {
+        let col: Vec<&Vec<u8>> = rest.iter().filter_map(|r| r.get(j)).filter(|v| !v.is_empty()).collect();
+        let k = kind(name);
+        if col.is_empty() {
+            continue;
+        }
+        let kinds: Vec<Kind> = col.iter().map(|v| kind(v)).collect();
+        let typed = kinds.iter().all(|&x| x != Kind::Text);
+        if k == Kind::Text && typed {
+            score += 3;
+        } else if k == Kind::Number && kinds.iter().all(|&x| x == Kind::Number) {
+            score -= 3;
+        } else if k != Kind::Text && k != Kind::Empty && typed {
+            score -= 2;
+        } else if col.iter().any(|v| v.as_slice() == name.as_slice()) {
+            score -= 1;
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    if first.iter().any(|n| !n.is_empty() && !seen.insert(n.as_slice())) {
+        score -= 2;
+    }
+    score >= 0
+}
+
+/// Non-empty, unique, whitespace-trimmed column names.
+pub fn unique_names(raw: &[String], width: usize) -> Vec<String> {
+    let mut out = Vec::with_capacity(width);
+    let mut seen = std::collections::HashSet::new();
+    for i in 0..width {
+        let base = raw.get(i).map(|s| s.trim().to_string()).unwrap_or_default();
+        let base = if base.is_empty() { format!("column_{}", i + 1) } else { base };
+        let mut name = base.clone();
+        let mut n = 2;
+        while !seen.insert(name.clone()) {
+            name = format!("{base}_{n}");
+            n += 1;
+        }
+        out.push(name);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sn(text: &str) -> CsvDialect {
+        sniff(text.as_bytes(), true, &SniffOptions::default()).unwrap()
+    }
+
+    #[test]
+    fn delimiters() {
+        assert_eq!(sn("a,b,c\n1,2,3\n4,5,6\n").delimiter, ",");
+        assert_eq!(sn("a;b;c\n1,5;2,5;3\n4;5;6\n").delimiter, ";");
+        assert_eq!(sn("a\tb\n1\t2\n").delimiter, "\t");
+        assert_eq!(sn("a|b|c\nx|y|z\n").delimiter, "|");
+        let d = sn("name,notes\n\"Smith, J\",\"a;b;c\"\n\"Doe, A\",\"x;y\"\n");
+        assert_eq!(d.delimiter, ",");
+        assert!(d.has_quotes);
+    }
+
+    #[test]
+    fn headers() {
+        assert!(sn("id,price\n1,2.5\n2,3.5\n").header);
+        assert!(!sn("1,2.5\n2,3.5\n3,4.5\n").header);
+        assert!(sn("name,city\nann,paris\nbob,rome\n").header);
+        let d = sn(",x,x\n1,2,3\n");
+        assert_eq!(d.columns, vec!["column_1", "x", "x_2"]);
+    }
+
+    #[test]
+    fn preamble_and_terminators() {
+        let d = sn("Exported report\nGenerated 2024-01-01\n\nid,value,flag\n1,2,true\n3,4,false\n5,6,true\n7,8,false\n");
+        assert_eq!(d.skip_rows, 3);
+        assert_eq!(d.columns, vec!["id", "value", "flag"]);
+        assert_eq!(sn("a,b\r\n1,2\r\n").terminator, "\r\n");
+        assert_eq!(sn("a,b\r1,2\r3,4\r").terminator, "\r");
+    }
+
+    #[test]
+    fn encodings() {
+        assert_eq!(detect_encoding(b"\xEF\xBB\xBFa,b\n", true), ("utf-8", true));
+        assert_eq!(detect_encoding("café,x\n".as_bytes(), true), ("utf-8", false));
+        assert_eq!(detect_encoding(b"caf\xe9,x\n", true).0, "windows-1252");
+        // a sample cut in the middle of a multi-byte character is still UTF-8
+        let s = "ab€".as_bytes();
+        assert_eq!(detect_encoding(&s[..s.len() - 1], false).0, "utf-8");
+        let d = sniff(b"caf\xe9,prix\nth\xe9,2\n", true, &SniffOptions::default()).unwrap();
+        assert_eq!(d.encoding, "windows-1252");
+        assert_eq!(d.columns, vec!["café", "prix"]);
+    }
+
+    #[test]
+    fn escapes() {
+        let d = sn("a,b\n\"x \\\"y\\\"\",1\n");
+        assert_eq!(d.escape.as_deref(), Some("\\"));
+        assert!(!d.double_quote);
+    }
+}
