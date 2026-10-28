@@ -1,5 +1,7 @@
 import json
 import math
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -310,3 +312,15 @@ def test_native_gets_the_detected_format(tmp_path):
     data = native.options(vegg.ConvertOptions.build(), "jsonl", "parquet")
     assert data["from"] == "jsonl" and data["to"] == "parquet"
     assert native.options(vegg.ConvertOptions.build(), "tsv", "csv")["sniff"]["delimiter"] == "\t"
+
+
+@needs_native
+def test_native_jobs_leave_pyarrow_unloaded(tmp_path):
+    # importing pyarrow takes about 0.1 s, which a job of the native engine alone
+    # should not pay (the command line starts a new process for every job)
+    src = tmp_path / "a.csv"
+    src.write_text("id,zip\n1,007\n", encoding="utf-8")
+    code = "import sys, vegg; vegg.convert(sys.argv[1], sys.argv[2]); vegg.info(sys.argv[2]); print('pyarrow' in sys.modules)"
+    out = subprocess.run([sys.executable, "-c", code, str(src), str(tmp_path / "a.parquet")],
+                         capture_output=True, text=True, check=True).stdout
+    assert out.strip() == "False"

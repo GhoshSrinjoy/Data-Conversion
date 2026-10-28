@@ -12,8 +12,9 @@ working name `dataconv`.
   - a quote-aware chunker and zero-copy tokenizer;
   - parallel, memory-bounded conversion between CSV/TSV, JSON Lines, Parquet,
     Arrow IPC and DCZ;
-  - Parquet writing that encodes columns and row groups in parallel and tunes
-    encodings per column;
+  - Parquet writing that encodes every column while the input is still being
+    read, several row groups at once (256 Ki rows each, 1 Mi with
+    `--profile max`), and tunes encodings per column;
   - a standalone `vegg` binary that needs no Python (`cargo install vegg`).
 - **One package everywhere.** `pip install vegg` gets the native engine on
   CPython 3.9+ for Windows, macOS and Linux (x86-64 and ARM64, glibc and musl),
@@ -56,6 +57,9 @@ working name `dataconv`.
   numpy arrays.
 - **Resource-aware planning.** Threads and memory come from CPU affinity, cgroup
   quotas and available memory; `vegg doctor` and `plan()` show them.
+- **Quick start-up.** A job that the native engine handles does not import
+  pyarrow, and counting CPUs on Windows no longer reads every CPU's details:
+  together about 0.25 s less per command.
 - **New commands:** `convert` for files and whole directory trees, `split` (by
   rows or measured target size, byte-exact for CSV), `merge` (schema
   unification), `info`, `head`, `count`, `schema`, `sniff`, `stats`, `verify`,

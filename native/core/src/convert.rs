@@ -12,9 +12,9 @@ use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver};
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{Field, Schema, SchemaRef};
@@ -484,9 +484,10 @@ fn sample_stats(
     let mut stats = vec![ColumnStats::default(); ncols];
     let (mut chunker, _, _) = open_records(path, encoding, plan, sample_bytes)?;
     // The head sample is one chunk, unless a stray quote cut that chunk short at its line:
-    // then the chunks after it fill the sample.
+    // then the chunks after it fill the sample.  A chunk ends at the last whole record,
+    // a little short of the sample size, which is no reason to read another.
     let mut sampled = 0;
-    while sampled < sample_bytes {
+    while sampled < sample_bytes / 2 {
         let t = Instant::now();
         let Some(head) = chunker.next_chunk()? else { break };
         sampled += head.data.len().max(1);
@@ -697,7 +698,9 @@ fn build_sink(
     Ok(match format {
         Format::Parquet => {
             let popts = pool.install(|| effective_parquet_options(opts, first));
-            let rows = row_group_rows.or(popts.row_group_rows).unwrap_or(plan.row_group_rows).max(1);
+            // the max profile trades time for size: longer row groups share dictionaries
+            let default_rows = if popts.profile() == "max" && !plan.low_memory { 1 << 20 } else { plan.row_group_rows };
+            let rows = row_group_rows.or(popts.row_group_rows).unwrap_or(default_rows).max(1);
             let props = popts.properties(schema, rows)?;
             Box::new(ParquetSink::new(file, schema.clone(), props, rows, pool.clone())?)
         }
@@ -1250,7 +1253,9 @@ fn csv_attempt(
         crate::split::reset_staging(&target.dst)?;
     }
     let (chunker, consumed, total) = open_records(src, encoding, cplan, plan.chunk_size)?;
-    let rx = spawn_chunker(chunker, plan.wave_chunks);
+    // decoded chunks hand their buffers back to the reader
+    let (spare_tx, spare_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let rx = spawn_chunker(chunker.with_spares(spare_rx), plan.wave_chunks);
     let schema = cplan.schema();
     let dst = target.final_dst.as_path();
     let mut out = Out::new(target, schema.clone(), opts, plan, pool);
@@ -1262,7 +1267,9 @@ fn csv_attempt(
     let limit = opts.limit.unwrap_or(u64::MAX);
     // Ordered streaming pipeline: chunks are decoded on worker threads as soon as
     // they are read, and written in file order as they complete, so reading,
-    // decoding and encoding overlap.  At most `depth` chunks are in flight.
+    // decoding and encoding overlap.  At most `depth` chunks are in flight.  The loop
+    // never waits for input while a decoded chunk could be written: writing starts
+    // with the first chunk, not after the last one has been read.
     let shared = Arc::new(cplan.clone());
     let (res_tx, res_rx) = std::sync::mpsc::channel::<(usize, Result<Decoded>)>();
     let depth = plan.wave_chunks.max(2);
@@ -1271,29 +1278,45 @@ fn csv_attempt(
     let mut input_done = false;
     'stream: loop {
         while !input_done && in_flight < depth {
-            match rx.recv() {
+            let next = if in_flight == 0 { rx.recv().map_err(|_| TryRecvError::Disconnected) } else { rx.try_recv() };
+            match next {
                 Ok(Ok(chunk)) => {
                     if chunk.forced && forced_at.is_none() {
                         forced_at = Some(chunk.offset + chunk.data.len() as u64);
                     }
-                    let (tx, p, s, idx) = (res_tx.clone(), shared.clone(), schema.clone(), spawned);
+                    let (tx, p, s, idx, spare) =
+                        (res_tx.clone(), shared.clone(), schema.clone(), spawned, spare_tx.clone());
                     pool.spawn(move || {
                         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_chunk(&p, &s, &chunk)))
                             .unwrap_or_else(|_| Err(Error::Data("internal error while decoding a chunk".into())));
                         let _ = tx.send((idx, r));
+                        let _ = spare.send(chunk.data);
                     });
                     spawned += 1;
                     in_flight += 1;
                 }
                 Ok(Err(Error::Data(m))) if m.contains("decoding failed") => return Err(Retry::Encoding),
                 Ok(Err(e)) => return Err(Retry::Fatal(e)),
-                Err(_) => input_done = true,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => input_done = true,
             }
         }
         if in_flight == 0 {
             break;
         }
-        let (idx, result) = res_rx.recv().map_err(|_| Retry::Fatal(Error::Data("a worker thread stopped".into())))?;
+        // while more input can be taken, look for it again within a millisecond
+        let received = if input_done || in_flight >= depth {
+            res_rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
+        } else {
+            res_rx.recv_timeout(Duration::from_millis(1))
+        };
+        let (idx, result) = match received {
+            Ok(r) => r,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(Retry::Fatal(Error::Data("a worker thread stopped".into())))
+            }
+        };
         in_flight -= 1;
         pending.insert(idx, result);
         while let Some(d) = pending.remove(&emitted) {

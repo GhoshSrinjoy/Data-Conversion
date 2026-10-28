@@ -854,7 +854,8 @@ class Writer:
             except pa.ArrowException as exc:
                 self._stream.close()
                 raise _write_error("Parquet", exc) from None
-            self.row_group = o.row_group_rows or 1 << 20
+            # as the native engine writes: the max profile shares dictionaries over more rows
+            self.row_group = o.row_group_rows or (1 << 20 if o.profile == "max" else 1 << 18)
             self._date64 = any(_holds(pa, f.type, pa.types.is_date64) for f in schema)
         elif fmt == "ipc":
             comp = {"none": None, "uncompressed": None}.get((o.compression or "zstd").lower(), (o.compression or "zstd").lower())

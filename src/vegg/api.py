@@ -46,7 +46,7 @@ def _engine_for(engine: str, src_fmt: str, dst_fmt: str, src_comp: Optional[str]
 
 def _feather_v1(path: Path, fmt: str) -> bool:
     """A Feather version 1 file (which only the arrow engine reads) when pyarrow is there."""
-    return fmt == "ipc" and "arrow" in engines.installed() and formats.is_feather_v1(path)
+    return fmt == "ipc" and engines.available("arrow") and formats.is_feather_v1(path)
 
 
 def _check_input(path: Path) -> None:
@@ -849,16 +849,16 @@ def unpack(data: bytes) -> Any:
 def _inspect_engine(path: Path, o: ConvertOptions) -> Tuple[str, str]:
     _check_input(path)
     fmt, comp = formats.detect(path, o.source_format)
-    installed = engines.installed()
     if o.engine == "auto" and _feather_v1(path, fmt):
         return "arrow", fmt
-    for candidate in installed:
+    for candidate in engines.ORDER:
         if o.engine not in ("auto", candidate):
             continue
-        if formats.engine_supports(candidate, fmt, "ipc" if candidate != "pure" else "csv", comp, None):
+        target = "ipc" if candidate != "pure" else "csv"
+        if formats.engine_supports(candidate, fmt, target, comp, None) and engines.available(candidate):
             return candidate, fmt
     if o.engine != "auto":
-        if o.engine not in installed:
+        if not engines.available(o.engine):
             raise engines.missing(o.engine)
         if formats.engine_supports(o.engine, fmt, "ipc" if o.engine != "pure" else "csv", None, None):
             raise OptionsError(f"the {o.engine} engine cannot read {comp}-compressed input (use engine='auto')")

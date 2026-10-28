@@ -393,6 +393,8 @@ pub struct Chunker<R> {
     /// in memory as one chunk), or with `cut_anywhere` is cut where it stands.
     max_record: usize,
     cut_anywhere: bool,
+    /// Buffers of earlier chunks, handed back by their consumers once done with them.
+    spares: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
 }
 
 impl<R: Read> Chunker<R> {
@@ -410,7 +412,15 @@ impl<R: Read> Chunker<R> {
             eof: false,
             max_record: (chunk_size.max(1) * 8).max(MAX_LINE),
             cut_anywhere: false,
+            spares: None,
         }
+    }
+
+    /// Reuse the buffers that consumers send back on `spares` for later chunks, instead
+    /// of allocating fresh memory of the chunk size for every chunk.
+    pub fn with_spares(mut self, spares: std::sync::mpsc::Receiver<Vec<u8>>) -> Self {
+        self.spares = Some(spares);
+        self
     }
 
     /// The CSV dialect (delimiter, quote, escape) that decides where fields start.
@@ -519,7 +529,10 @@ impl<R: Read> Chunker<R> {
                 return Ok(None);
             }
             if let Some((cut, forced)) = self.cut(target)? {
-                let rest = self.carry.split_off(cut);
+                let mut rest = self.spares.as_ref().and_then(|s| s.try_recv().ok()).unwrap_or_default();
+                rest.clear();
+                rest.extend_from_slice(&self.carry[cut..]);
+                self.carry.truncate(cut);
                 let data = std::mem::replace(&mut self.carry, rest);
                 let chunk = Chunk { data, offset: self.offset, index: self.index, forced };
                 self.offset += cut as u64;

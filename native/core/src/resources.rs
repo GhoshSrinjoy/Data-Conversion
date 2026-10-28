@@ -63,6 +63,19 @@ pub fn detect() -> SystemInfo {
     }
 }
 
+#[cfg(windows)]
+fn num_logical() -> usize {
+    // sysinfo's CPU list takes over 100 ms on Windows (it reads every CPU's details),
+    // which a short job would spend just starting up
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        safe fn GetActiveProcessorCount(group: u16) -> u32;
+    }
+    const ALL_PROCESSOR_GROUPS: u16 = 0xffff;
+    GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) as usize
+}
+
+#[cfg(not(windows))]
 fn num_logical() -> usize {
     let mut sys = sysinfo::System::new();
     sys.refresh_cpu_list(sysinfo::CpuRefreshKind::nothing());
@@ -123,7 +136,9 @@ pub fn plan_with(
         memory_budget: budget,
         chunk_size,
         wave_chunks,
-        row_group_rows: if low_memory { 128 * 1024 } else { 1024 * 1024 },
+        // 256 Ki rows: enough row groups to encode a narrow table on every thread and to
+        // read it back in parallel (DuckDB and Polars write smaller ones still)
+        row_group_rows: if low_memory { 128 * 1024 } else { 256 * 1024 },
         low_memory,
     }
 }

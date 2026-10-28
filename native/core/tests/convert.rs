@@ -93,6 +93,41 @@ fn csv_to_parquet_is_lossless() {
 }
 
 #[test]
+fn parquet_row_groups_stream_in_order() {
+    // many small row groups, batches that straddle them and a struct column with two
+    // Parquet leaves, on one thread and on several: every row comes back in order
+    let d = dir("parquet-row-groups-stream-in-order");
+    let src = d.join("rows.jsonl");
+    let mut s = String::new();
+    for i in 0..50_000 {
+        s.push_str(&format!("{{\"id\":{i},\"name\":\"n{}\",\"point\":{{\"x\":{i},\"y\":\"y{}\"}}}}\n", i % 97, i % 13));
+    }
+    std::fs::write(&src, s).unwrap();
+    for threads in [1, 4] {
+        let dst = d.join(format!("rows-{threads}.parquet"));
+        let mut opts = ConvertOptions {
+            overwrite: true,
+            chunk_size: Some(64 << 10),
+            threads: Some(threads),
+            ..Default::default()
+        };
+        opts.parquet.row_group_rows = Some(3_000);
+        assert_eq!(convert(&src, &dst, &opts, &NoHooks).unwrap().rows, 50_000);
+        let file = ParquetRecordBatchReaderBuilder::try_new(File::open(&dst).unwrap()).unwrap();
+        assert_eq!(file.metadata().num_row_groups(), 17);
+        let batch = read_parquet(&dst);
+        let id = batch.column_by_name("id").unwrap().as_primitive::<Int64Type>();
+        let point = batch.column_by_name("point").unwrap().as_struct();
+        let x = point.column_by_name("x").unwrap().as_primitive::<Int64Type>();
+        let y = point.column_by_name("y").unwrap().as_string::<i32>();
+        for i in 0..50_000 {
+            assert_eq!((id.value(i), x.value(i)), (i as i64, i as i64), "row {i}");
+            assert_eq!(y.value(i), format!("y{}", i % 13), "row {i}");
+        }
+    }
+}
+
+#[test]
 fn every_format_roundtrips_through_csv() {
     let d = dir("every-format-roundtrips-through-csv");
     let src = d.join("fmt.csv");

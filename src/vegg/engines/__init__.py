@@ -2,7 +2,8 @@
 
 ``native`` (Rust, in vegg's platform wheels) is the fastest; ``arrow`` uses pyarrow; ``pure``
 needs nothing but the standard library.  ``auto`` picks the first that supports
-both formats on this machine.
+both formats on this machine.  Formats are checked before availability, so pyarrow
+(slow to import) is imported only for jobs that would use it.
 """
 
 from __future__ import annotations
@@ -12,15 +13,19 @@ from typing import List, Optional
 from .. import _compat, _native, formats
 from ..errors import MissingDependencyError, OptionsError
 
+ORDER = ("native", "arrow", "pure")
+
+
+def available(engine: str) -> bool:
+    if engine == "native":
+        return _native.available()
+    if engine == "arrow":
+        return _compat.have("pyarrow")
+    return engine == "pure"
+
 
 def installed() -> List[str]:
-    found = []
-    if _native.available():
-        found.append("native")
-    if _compat.have("pyarrow"):
-        found.append("arrow")
-    found.append("pure")
-    return found
+    return [engine for engine in ORDER if available(engine)]
 
 
 def missing(engine: str) -> MissingDependencyError:
@@ -40,15 +45,14 @@ def unsupported(engine: str, src_fmt: str, dst_fmt: str, src_comp: Optional[str]
 
 
 def choose(engine: str, src_fmt: str, dst_fmt: str, src_comp: Optional[str] = None, dst_comp: Optional[str] = None) -> str:
-    have = installed()
     if engine != "auto":
-        if engine not in have:
+        if not available(engine):
             raise missing(engine)
         if not formats.engine_supports(engine, src_fmt, dst_fmt, src_comp, dst_comp):
             raise OptionsError(unsupported(engine, src_fmt, dst_fmt, src_comp, dst_comp))
         return engine
-    for candidate in have:
-        if formats.engine_supports(candidate, src_fmt, dst_fmt, src_comp, dst_comp):
+    for candidate in ORDER:
+        if formats.engine_supports(candidate, src_fmt, dst_fmt, src_comp, dst_comp) and available(candidate):
             return candidate
     needs = "pyarrow" if formats.FORMATS[src_fmt].arrow and formats.FORMATS[dst_fmt].arrow else "an engine"
     raise MissingDependencyError(

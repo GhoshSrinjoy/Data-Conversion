@@ -1,21 +1,27 @@
 //! Columnar sources and sinks: Parquet, Arrow IPC (Feather v2), JSON Lines and CSV.
 //!
-//! Sinks receive record batches in order.  The Parquet sink encodes the columns of a
-//! row group in parallel (most writers do this on one thread), and can tune each
-//! column's encoding by trial for the smallest output.
+//! Sinks receive record batches in order.  The Parquet sink encodes every column in
+//! parallel as the batches arrive (most writers encode a row group on one thread once
+//! it is complete), and can tune each column's encoding by trial for the smallest
+//! output.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 use arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
 use arrow::datatypes::{DataType, Date64Type, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
-use parquet::arrow::arrow_writer::{compute_leaves, ArrowColumnChunk, ArrowRowGroupWriterFactory, ArrowWriterOptions};
+use parquet::arrow::arrow_writer::{
+    compute_leaves, ArrowColumnChunk, ArrowColumnWriter, ArrowRowGroupWriterFactory, ArrowWriterOptions,
+};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{BrotliLevel, Compression as PqCompression, Encoding, GzipLevel, ZstdLevel};
+use parquet::errors::ParquetError;
 use parquet::file::properties::{EnabledStatistics, WriterProperties, WriterVersion};
 use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::types::ColumnPath;
@@ -203,7 +209,7 @@ fn encoding_from_name(name: &str) -> Result<Option<Encoding>> {
 }
 
 impl ParquetOptions {
-    fn profile(&self) -> &str {
+    pub(crate) fn profile(&self) -> &str {
         self.profile.as_deref().unwrap_or("balanced")
     }
 
@@ -375,11 +381,8 @@ pub fn tune_encodings(sample: &RecordBatch, opts: &ParquetOptions) -> HashMap<St
         .collect()
 }
 
-type EncodedGroup = std::result::Result<Vec<ArrowColumnChunk>, parquet::errors::ParquetError>;
+type EncodedGroup = std::result::Result<Vec<ArrowColumnChunk>, ParquetError>;
 
-/// Parquet output whose row groups are encoded on worker threads (every column of a
-/// row group in parallel, and up to `max_in_flight` row groups at once) while the
-/// finished ones are appended to the file in order.
 /// The type a column is stored as in Parquet, when its own has no Parquet form that
 /// readers recognise: there is no unit for seconds (such timestamps and times would
 /// read back as bare integers) and no 64-bit date.  None when the type is fine.
@@ -437,22 +440,190 @@ fn check_date64(name: &str, array: &dyn Array) -> Result<()> {
     Ok(())
 }
 
+fn internal_error() -> ParquetError {
+    ParquetError::General("internal error while encoding a row group".into())
+}
+
+/// One top-level column of a row group: its writers (one per Parquet leaf column) and
+/// the slices waiting for them.  At most one task works on a lane at a time, so the
+/// slices are written in order.
+struct Lane {
+    /// None while a task holds them, and once the lane is closed.
+    writers: Option<Vec<ArrowColumnWriter>>,
+    queue: VecDeque<ArrayRef>,
+    busy: bool,
+    closing: bool,
+}
+
+/// A row group whose columns are encoded as its batches arrive, each in its own lane.
+struct Group {
+    index: usize,
+    schema: SchemaRef,
+    lanes: Vec<Mutex<Lane>>,
+    /// The column chunks of each lane, filled in as the lanes close.
+    chunks: Mutex<Vec<Vec<ArrowColumnChunk>>>,
+    error: Mutex<Option<ParquetError>>,
+    /// Lanes not closed yet; the last one to close hands the group on.
+    open: AtomicUsize,
+    done: Sender<(usize, EncodedGroup)>,
+}
+
+impl Group {
+    fn lane(&self, lane: usize) -> std::sync::MutexGuard<'_, Lane> {
+        self.lanes[lane].lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn failed(&self) -> bool {
+        self.error.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    fn fail(&self, e: ParquetError) {
+        self.error.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(e);
+    }
+
+    /// Queue a slice of every column, and start a task for each idle lane.
+    fn push(self: &Arc<Self>, columns: &[ArrayRef], pool: &rayon::ThreadPool) {
+        for (lane, column) in columns.iter().enumerate() {
+            let start = {
+                let mut l = self.lane(lane);
+                l.queue.push_back(column.clone());
+                if l.busy {
+                    None
+                } else {
+                    l.busy = true;
+                    l.writers.take()
+                }
+            };
+            if let Some(writers) = start {
+                let group = self.clone();
+                pool.spawn(move || group.run(lane, writers));
+            }
+        }
+    }
+
+    /// No more rows: each lane closes once its queue is empty.
+    fn close(self: &Arc<Self>, pool: &rayon::ThreadPool) {
+        if self.lanes.is_empty() {
+            let _ = self.done.send((self.index, Ok(Vec::new())));
+            return;
+        }
+        for lane in 0..self.lanes.len() {
+            let start = {
+                let mut l = self.lane(lane);
+                l.closing = true;
+                if l.busy {
+                    None
+                } else {
+                    l.busy = true;
+                    l.writers.take()
+                }
+            };
+            if let Some(writers) = start {
+                let group = self.clone();
+                pool.spawn(move || group.run(lane, writers));
+            }
+        }
+    }
+
+    /// A lane's task: write its queued slices in order, then hand the writers back,
+    /// or close them when the group is complete.
+    fn run(&self, lane: usize, mut writers: Vec<ArrowColumnWriter>) {
+        let field = self.schema.fields()[lane].clone();
+        loop {
+            let column = {
+                let mut l = self.lane(lane);
+                match l.queue.pop_front() {
+                    Some(column) => column,
+                    None if l.closing => break,
+                    None => {
+                        l.writers = Some(writers);
+                        l.busy = false;
+                        return;
+                    }
+                }
+            };
+            if !self.failed() {
+                let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let leaves = compute_leaves(&field, &column)?;
+                    if leaves.len() != writers.len() {
+                        return Err(ParquetError::General(format!(
+                            "column '{}' has {} leaves, the schema {}",
+                            field.name(),
+                            leaves.len(),
+                            writers.len()
+                        )));
+                    }
+                    for (w, leaf) in writers.iter_mut().zip(&leaves) {
+                        w.write(leaf)?;
+                    }
+                    Ok(())
+                }));
+                match written {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => self.fail(e),
+                    Err(_) => self.fail(internal_error()),
+                }
+            }
+        }
+        let chunks = if self.failed() {
+            Vec::new()
+        } else {
+            let closed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                writers.into_iter().map(ArrowColumnWriter::close).collect::<std::result::Result<Vec<_>, _>>()
+            }));
+            match closed {
+                Ok(Ok(chunks)) => chunks,
+                Ok(Err(e)) => {
+                    self.fail(e);
+                    Vec::new()
+                }
+                Err(_) => {
+                    self.fail(internal_error());
+                    Vec::new()
+                }
+            }
+        };
+        self.chunks.lock().unwrap_or_else(|e| e.into_inner())[lane] = chunks;
+        if self.open.fetch_sub(1, AtomicOrdering::AcqRel) == 1 {
+            let result = match self.error.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                Some(e) => Err(e),
+                None => Ok(std::mem::take(&mut *self.chunks.lock().unwrap_or_else(|e| e.into_inner()))
+                    .into_iter()
+                    .flatten()
+                    .collect()),
+            };
+            let _ = self.done.send((self.index, result));
+        }
+    }
+}
+
+/// Parquet output that encodes as the batches arrive.  Each top-level column of the
+/// row group being filled has a lane where its slices queue, and one task at a time
+/// encodes a lane, so columns encode in parallel with each other and with the
+/// decoding of later input.  A full row group closes its lanes while the next one
+/// starts filling, and finished row groups are appended to the file in order.
+/// Several row groups encode at once, since one column (long text, say) can take
+/// much longer than the rest; `write` waits while `max_open` are unfinished, which
+/// also bounds the decoded data held to `max_open` row groups.
 pub struct ParquetSink {
     writer: Option<SerializedFileWriter<BufWriter<File>>>,
-    factory: Arc<ArrowRowGroupWriterFactory>,
+    factory: ArrowRowGroupWriterFactory,
     schema: SchemaRef,
     /// Per column, the type it is stored as when that differs (see `parquet_type`).
     casts: Vec<Option<DataType>>,
-    pending: Vec<RecordBatch>,
-    pending_rows: usize,
+    /// Parquet leaf columns per top-level column.
+    leaves: Vec<usize>,
+    current: Option<Arc<Group>>,
+    current_rows: usize,
     row_group_rows: usize,
     next_group: usize,
     appended: usize,
-    in_flight: usize,
-    max_in_flight: usize,
-    done_tx: std::sync::mpsc::Sender<(usize, EncodedGroup)>,
-    done_rx: std::sync::mpsc::Receiver<(usize, EncodedGroup)>,
-    finished: std::collections::BTreeMap<usize, EncodedGroup>,
+    /// Groups started whose result has not come back yet, and their limit.
+    open_groups: usize,
+    max_open: usize,
+    done_tx: Sender<(usize, EncodedGroup)>,
+    done_rx: Receiver<(usize, EncodedGroup)>,
+    finished: BTreeMap<usize, EncodedGroup>,
     pool: Arc<rayon::ThreadPool>,
 }
 
@@ -482,78 +653,78 @@ impl ParquetSink {
         let options = ArrowWriterOptions::new().with_properties(props);
         let writer = ArrowWriter::try_new_with_options(file, schema.clone(), options)?;
         let (writer, factory) = writer.into_serialized_writer()?;
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let descr = writer.schema_descr();
+        let mut leaves = vec![0; schema.fields().len()];
+        for leaf in 0..descr.num_columns() {
+            leaves[descr.get_column_root_idx(leaf)] += 1;
+        }
+        // enough row groups at once to keep every thread busy, fewer for wide tables
+        let max_open = (pool.current_num_threads().div_ceil(leaves.len().max(1)) + 2).clamp(4, 16);
+        let (done_tx, done_rx) = channel();
         Ok(ParquetSink {
             writer: Some(writer),
-            factory: Arc::new(factory),
+            factory,
             schema,
             casts,
-            pending: Vec::new(),
-            pending_rows: 0,
+            leaves,
+            current: None,
+            current_rows: 0,
             row_group_rows: row_group_rows.max(1),
             next_group: 0,
             appended: 0,
-            in_flight: 0,
-            max_in_flight: 2,
+            open_groups: 0,
+            max_open,
             done_tx,
             done_rx,
-            finished: std::collections::BTreeMap::new(),
+            finished: BTreeMap::new(),
             pool,
         })
     }
 
-    /// Hand the pending batches to the workers as the next row group.
-    fn dispatch(&mut self) -> Result<()> {
-        if self.pending_rows == 0 {
-            return Ok(());
-        }
-        while self.in_flight >= self.max_in_flight {
+    fn start_group(&mut self) -> Result<Arc<Group>> {
+        while self.open_groups >= self.max_open {
             self.wait_one()?;
         }
-        let batches = std::mem::take(&mut self.pending);
-        self.pending_rows = 0;
         let index = self.next_group;
-        self.next_group += 1;
-        self.in_flight += 1;
-        let (factory, schema, pool, tx) =
-            (self.factory.clone(), self.schema.clone(), self.pool.clone(), self.done_tx.clone());
-        self.pool.spawn(move || {
-            let encode = || -> EncodedGroup {
-                let writers = factory.create_column_writers(index)?;
-                let mut jobs: Vec<(_, Vec<_>)> = writers.into_iter().map(|w| (w, Vec::new())).collect();
-                for batch in &batches {
-                    let mut leaf = 0;
-                    for (field, column) in schema.fields().iter().zip(batch.columns()) {
-                        for l in compute_leaves(field, column)? {
-                            jobs[leaf].1.push(l);
-                            leaf += 1;
-                        }
-                    }
-                }
-                drop(batches);
-                pool.install(|| {
-                    jobs.into_par_iter()
-                        .map(|(mut w, leaves)| {
-                            for l in &leaves {
-                                w.write(l)?;
-                            }
-                            w.close()
-                        })
-                        .collect()
+        let mut writers = self.factory.create_column_writers(index)?.into_iter();
+        let lanes: Vec<Mutex<Lane>> = self
+            .leaves
+            .iter()
+            .map(|&n| {
+                Mutex::new(Lane {
+                    writers: Some(writers.by_ref().take(n).collect()),
+                    queue: VecDeque::new(),
+                    busy: false,
+                    closing: false,
                 })
-            };
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(encode)).unwrap_or_else(|_| {
-                Err(parquet::errors::ParquetError::General("internal error while encoding a row group".into()))
-            });
-            let _ = tx.send((index, result));
+            })
+            .collect();
+        let group = Arc::new(Group {
+            index,
+            schema: self.schema.clone(),
+            chunks: Mutex::new((0..lanes.len()).map(|_| Vec::new()).collect()),
+            open: AtomicUsize::new(lanes.len()),
+            lanes,
+            error: Mutex::new(None),
+            done: self.done_tx.clone(),
         });
-        self.append_ready()
+        self.next_group += 1;
+        self.open_groups += 1;
+        self.current_rows = 0;
+        self.current = Some(group.clone());
+        Ok(group)
+    }
+
+    fn close_group(&mut self) {
+        if let Some(group) = self.current.take() {
+            group.close(&self.pool);
+        }
     }
 
     fn wait_one(&mut self) -> Result<()> {
         let (index, result) =
             self.done_rx.recv().map_err(|_| Error::Data("a Parquet encoding worker stopped".into()))?;
-        self.in_flight -= 1;
+        self.open_groups -= 1;
         self.finished.insert(index, result);
         self.append_ready()
     }
@@ -561,7 +732,7 @@ impl ParquetSink {
     /// Append every finished row group that is next in file order.
     fn append_ready(&mut self) -> Result<()> {
         while let Ok((index, result)) = self.done_rx.try_recv() {
-            self.in_flight -= 1;
+            self.open_groups -= 1;
             self.finished.insert(index, result);
         }
         while let Some(result) = self.finished.remove(&self.appended) {
@@ -600,21 +771,24 @@ impl Sink for ParquetSink {
         let mut offset = 0;
         let rows = batch.num_rows();
         while offset < rows {
-            let room = self.row_group_rows - self.pending_rows;
-            let take = room.min(rows - offset);
-            self.pending.push(batch.slice(offset, take));
-            self.pending_rows += take;
+            let group = match &self.current {
+                Some(group) => group.clone(),
+                None => self.start_group()?,
+            };
+            let take = (self.row_group_rows - self.current_rows).min(rows - offset);
+            group.push(batch.slice(offset, take).columns(), &self.pool);
+            self.current_rows += take;
             offset += take;
-            if self.pending_rows >= self.row_group_rows {
-                self.dispatch()?;
+            if self.current_rows >= self.row_group_rows {
+                self.close_group();
             }
         }
-        Ok(())
+        self.append_ready()
     }
 
     fn finish(mut self: Box<Self>) -> Result<()> {
-        self.dispatch()?;
-        while self.in_flight > 0 {
+        self.close_group();
+        while self.open_groups > 0 {
             self.wait_one()?;
         }
         self.append_ready()?;
