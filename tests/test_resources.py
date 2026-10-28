@@ -28,7 +28,10 @@ def fake(cpus, avail):
     return resources.SystemInfo("test", "", "x86_64", "3", "CPython", 64, True, cpus, cpus, cpus, avail * 2, avail, None, False, "test")
 
 
-def test_plan_adapts():
+def test_plan_adapts(monkeypatch):
+    # the machines are the fake ones, not overrides from the environment
+    monkeypatch.delenv("DATACONV_THREADS", raising=False)
+    monkeypatch.delenv("DATACONV_MEMORY", raising=False)
     big = resources.make_plan(100 * GiB, info=fake(32, 64 * GiB))
     assert big.threads == 32 and big.chunk_size == 64 * MiB
     tiny = resources.make_plan(10 * GiB, info=fake(1, 128 * MiB))

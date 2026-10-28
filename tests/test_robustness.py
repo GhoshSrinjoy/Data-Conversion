@@ -224,11 +224,15 @@ def test_a_50mb_quote_that_never_closes(tmp_path, engine):
 def test_a_quote_read_as_a_stray_by_its_size_is_reported(tmp_path, engine, monkeypatch):
     from dataconv import _csvtok
 
-    # MAX_QUOTED (1 GiB, as in the native engine) cut down so that it is reached
+    # MAX_QUOTED (1 GiB, as in the native engine) cut down so that it is reached, and
+    # chunks kept smaller than the file whatever the machine: a chunk holding all of it
+    # would show that the quote never closes, which needs no note
     monkeypatch.setattr(_csvtok, "MAX_QUOTED", 1 << 16)
+    init = _csvtok.Chunker.__init__
+    monkeypatch.setattr(_csvtok.Chunker, "__init__", lambda self, f, size, *a, **k: init(self, f, min(size, 1 << 20), *a, **k))
     head = b'a,b\n1,"never closed\n'
     src = tmp_path / "long.csv"
-    src.write_bytes(head + b"".join(b"%d,x\n" % i for i in range(700_000)))  # past one arrow chunk
+    src.write_bytes(head + b"".join(b"%d,x\n" % i for i in range(700_000)))  # past one chunk
     r = dc.convert(src, tmp_path / "long.jsonl", engine=engine)
     assert (r.rows, r.bad_rows) == (700_000, 1)
     notes = [w for w in r.warnings if "read as a stray quote" in w]
