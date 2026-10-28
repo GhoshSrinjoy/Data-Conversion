@@ -9,7 +9,7 @@ import zipfile
 from typing import IO, Any, Optional
 
 from . import _compat, formats
-from .errors import DataconvError, FormatError, IntegrityError, MissingDependencyError
+from .errors import FormatError, IntegrityError, MissingDependencyError, VeggError
 
 
 def _c1(error: UnicodeError) -> Any:
@@ -20,11 +20,11 @@ def _c1(error: UnicodeError) -> Any:
     raise error
 
 
-codecs.register_error("dataconv-c1", _c1)
+codecs.register_error("vegg-c1", _c1)
 
 
 def text_errors(encoding: str) -> str:
-    return "dataconv-c1" if encoding.lower().replace("-", "").replace("_", "") in ("cp1252", "windows1252") else "strict"
+    return "vegg-c1" if encoding.lower().replace("-", "").replace("_", "") in ("cp1252", "windows1252") else "strict"
 
 
 # Python codec names -> labels understood by the native engine.  Latin-1 stays true
@@ -194,7 +194,7 @@ def _zstd_reader(raw: IO[bytes]) -> IO[bytes]:
     pa = _compat.optional("pyarrow")
     if pa is not None:
         return pa.CompressedInputStream(pa.PythonFile(raw, mode="r"), "zstd")  # type: ignore[no-any-return]
-    raise MissingDependencyError('reading .zst files needs zstandard or pyarrow: pip install "dataconv[fast]"')
+    raise MissingDependencyError('reading .zst files needs zstandard or pyarrow: pip install "vegg[fast]"')
 
 
 def _zstd_writer(raw: IO[bytes], level: int) -> IO[bytes]:
@@ -207,7 +207,7 @@ def _zstd_writer(raw: IO[bytes], level: int) -> IO[bytes]:
     pz = _compat.optional("pyzstd")
     if pz is not None:
         return pz.ZstdFile(raw, "w", level_or_option=level)  # type: ignore[no-any-return]
-    raise MissingDependencyError('writing .zst files needs zstandard: pip install "dataconv[fast]"')
+    raise MissingDependencyError('writing .zst files needs zstandard: pip install "vegg[fast]"')
 
 
 class _Closing(io.RawIOBase):
@@ -228,7 +228,7 @@ class _Closing(io.RawIOBase):
     def readinto(self, b: Any) -> int:
         try:
             data = self.inner.read(len(b))
-        except DataconvError:
+        except VeggError:
             raise
         except Exception as exc:
             raise _corrupt(self.what, exc) from None

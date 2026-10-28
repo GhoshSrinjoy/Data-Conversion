@@ -1,10 +1,18 @@
 [package]
-name = "dataconv-core"
+name = "vegg-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Native engine for dataconv: lossless CSV/columnar conversion and compression"
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "The engine behind vegg: lossless, parallel CSV/columnar conversion and compression"
+readme = "README.md"
+# the license text travels with the published crate
+license-file = "../../LICENSE"
+keywords = ["csv", "parquet", "arrow", "compression", "lossless"]
+categories = ["encoding", "compression", "parser-implementations"]
 
 [dependencies]
 arrow = { workspace = true }

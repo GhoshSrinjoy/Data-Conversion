@@ -55,9 +55,9 @@ def main() -> int:
     out = [
         "# Third-party licenses",
         "",
-        "The native engine (`dataconv-native`) and the standalone `dataconv` binary include",
-        "the open-source components below. Regenerate this file with",
-        "`python native/scripts/third_party_licenses.py`.",
+        "The native engine (`vegg._rust`, in vegg's platform wheels) and the standalone",
+        "`vegg` binary include the open-source components below. Regenerate this file",
+        "with `python native/scripts/third_party_licenses.py`.",
         "",
         "| component | version | license |",
         "|-----------|---------|---------|",
@@ -73,10 +73,9 @@ def main() -> int:
         out.append(text)
         out.append("```")
         out.append("")
-    # one copy for the repository, one shipped inside the wheel
-    for target in (NATIVE / "THIRD_PARTY_LICENSES.md", NATIVE / "python" / "THIRD_PARTY_LICENSES.md"):
-        with open(target, "w", encoding="utf-8", newline="\n") as f:
-            f.write("\n".join(out) + "\n")
+    # shipped in the wheels (license-files in pyproject.toml) and next to the binaries
+    with open(NATIVE / "THIRD_PARTY_LICENSES.md", "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(out) + "\n")
     print(f"wrote THIRD_PARTY_LICENSES.md: {len(bundled)} components, {len(texts)} distinct license texts")
     return 0
 

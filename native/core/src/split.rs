@@ -87,7 +87,7 @@ pub fn check_pattern(pattern: &str, extension: &str) -> Result<()> {
     Ok(())
 }
 
-const STAGING_PREFIX: &str = ".dataconv-staging-";
+const STAGING_PREFIX: &str = ".vegg-staging-";
 
 /// A private directory inside the destination that parts are written to.  They are
 /// moved into place only when the whole job has succeeded, so a failed, cancelled

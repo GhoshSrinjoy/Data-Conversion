@@ -4,7 +4,7 @@ DCZ stores a file **losslessly**: decompression always reproduces the original
 bytes exactly, and every block carries a checksum of its decoded contents.
 Delimited text (CSV, TSV, logs) is encoded column by column; anything else is
 stored as compressed raw blocks. This document is the normative description;
-`native/core/src/dcz/` (Rust) and `src/dataconv/dcz.py` (Python) implement it and
+`native/core/src/dcz/` (Rust) and `src/vegg/dcz.py` (Python) implement it and
 read each other's files.
 
 All integers are little-endian. `varint` is unsigned LEB128; `zigzag` maps a
@@ -59,7 +59,7 @@ A UTF-8 JSON object, compressed with `codec` (zlib or none):
 
 ```json
 {
-  "format": "dcz", "version": 1, "created_by": "dataconv 1.0.0",
+  "format": "dcz", "version": 1, "created_by": "vegg 1.0.0",
   "kind": "csv" | "raw", "profile": "balanced",
   "original_size": 142107433, "original_crc32": 1234567890,
   "delimiter": ",", "quote": "\"",
@@ -221,5 +221,5 @@ present); the remaining streams cover the present values only:
   * 1, XOR planes: one stream of `count` 8-byte numbers in byte planes; each is
     the XOR of a value's bits with the previous value's bits.
 
-`tag` is opaque caller metadata (dataconv stores the container type and numpy
+`tag` is opaque caller metadata (vegg stores the container type and numpy
 dtype and shape there, as JSON).

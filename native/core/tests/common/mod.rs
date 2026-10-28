@@ -8,7 +8,7 @@ pub struct TestDir(PathBuf);
 
 impl TestDir {
     pub fn new(name: &str) -> TestDir {
-        let d = std::env::temp_dir().join(format!("dcv-test-{}-{name}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("vegg-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         TestDir(d)

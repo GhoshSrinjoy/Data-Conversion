@@ -1,8 +1,12 @@
-name: Release builds
+name: Release
 
-# Builds the distributable artifacts: the pure-Python package, abi3 wheels of the
-# native engine for every major platform, and standalone binaries. Publishing is
-# left to the maintainer (download the artifacts from the run).
+# Builds every distributable: the sdist and the pure-Python wheel, the platform wheels
+# with the Rust engine, and the standalone binaries, then installs the wheels on each
+# OS to check that pip picks the right one. A manual run stops there.
+#
+# A pushed tag v* also publishes: the wheels and the sdist to PyPI (trusted publishing,
+# with attestations), a GitHub release with the binaries and checksums, and the crates
+# to crates.io (trusted publishing; the first version of a crate is published by hand).
 on:
   push:
     tags: ["v*"]
@@ -13,7 +17,7 @@ permissions:
 
 jobs:
   package:
-    name: dataconv (sdist and wheel)
+    name: sdist and pure-Python wheel
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -24,11 +28,11 @@ jobs:
       - run: python -m build
       - uses: actions/upload-artifact@v7
         with:
-          name: dataconv-package
+          name: python-pure
           path: dist/*
 
-  native-wheels:
-    name: dataconv-native (${{ matrix.target }})
+  wheels:
+    name: wheel (${{ matrix.os }}, ${{ matrix.target }}, ${{ matrix.manylinux }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -44,20 +48,59 @@ jobs:
           - { os: windows-latest, target: aarch64, manylinux: "off" }
     steps:
       - uses: actions/checkout@v7
+      # maturin reads [tool.maturin] in the root pyproject.toml
       - uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
-          working-directory: native/python
           args: --release --out dist
       - uses: actions/upload-artifact@v7
         with:
-          name: native-${{ matrix.os }}-${{ matrix.target }}-${{ matrix.manylinux }}
-          path: native/python/dist/*.whl
+          name: python-wheel-${{ matrix.os }}-${{ matrix.target }}-${{ matrix.manylinux }}
+          path: dist/*.whl
+
+  install:
+    name: install (${{ matrix.os }}, Python ${{ matrix.python }})
+    needs: [package, wheels]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.13", native: true }
+          - { os: ubuntu-24.04-arm, python: "3.12", native: true }
+          - { os: macos-latest, python: "3.14", native: true }
+          - { os: windows-latest, python: "3.11", native: true }
+          - { os: windows-11-arm, python: "3.13", native: true }
+          # no platform wheel fits Python 3.8: pip must fall back to the pure wheel
+          - { os: ubuntu-22.04, python: "3.8", native: false }
+    steps:
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: python-*
+          merge-multiple: true
+          path: dist
+      - name: Install vegg from the built files only
+        run: python -m pip install --no-index --find-links dist vegg
+      - name: Check the engine and convert a file
+        shell: bash
+        run: |
+          python -c "import sys, vegg._native as n; print('native engine:', n.version()); sys.exit(n.available() != ${{ matrix.native && 'True' || 'False' }})"
+          vegg doctor
+          printf 'id,zip,big\n1,007,18446744073709551615\n' > t.csv
+          vegg convert t.csv t.jsonl
+          test "$(cat t.jsonl)" = '{"id":1,"zip":"007","big":18446744073709551615}'
 
   binaries:
-    name: dataconv binary (${{ matrix.target }})
+    name: binary (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -81,19 +124,108 @@ jobs:
         working-directory: native
         run: |
           if [[ "${{ matrix.target }}" == *linux* ]]; then
-            cross build --release -p dataconv-cli --target ${{ matrix.target }}
+            cross build --release --locked -p vegg --target ${{ matrix.target }}
           else
-            cargo build --release -p dataconv-cli --target ${{ matrix.target }}
+            cargo build --release --locked -p vegg --target ${{ matrix.target }}
           fi
       - name: Package
         shell: bash
         run: |
           mkdir -p out
-          bin=native/target/${{ matrix.target }}/release/dataconv
+          bin=native/target/${{ matrix.target }}/release/vegg
           [ -f "$bin.exe" ] && bin="$bin.exe"
           cp "$bin" LICENSE native/THIRD_PARTY_LICENSES.md out/
-          tar -czf dataconv-${{ matrix.target }}.tar.gz -C out .
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            (cd out && 7z a -tzip ../vegg-${{ matrix.target }}.zip .)
+          else
+            tar -czf vegg-${{ matrix.target }}.tar.gz -C out .
+          fi
+      - uses: actions/attest-build-provenance@v4
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          subject-path: vegg-${{ matrix.target }}.*
       - uses: actions/upload-artifact@v7
         with:
-          name: dataconv-${{ matrix.target }}
-          path: dataconv-${{ matrix.target }}.tar.gz
+          name: binary-${{ matrix.target }}
+          path: vegg-${{ matrix.target }}.*
+
+  pypi:
+    name: publish to PyPI
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [install, binaries]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/vegg/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: python-*
+          merge-multiple: true
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [install, binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # the changelog section of this version
+          awk -v head="## $version" '$0 == head {on = 1; next} /^## / {on = 0} on' CHANGELOG.md > notes.md
+          (cd assets && sha256sum * > SHA256SUMS)
+          gh release create "$GITHUB_REF_NAME" assets/* --verify-tag --title "vegg $version" --notes-file notes.md
+
+  crates:
+    name: publish to crates.io
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [install, binaries]
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: native
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Find the crates this version still needs
+        id: todo
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          todo=""
+          for crate in vegg-core vegg; do
+            if curl -sf -A "vegg release (github.com/GhoshSrinjoy/vegg)" "https://crates.io/api/v1/crates/$crate/$version" > /dev/null; then
+              echo "$crate $version is already on crates.io"
+            else
+              todo="$todo $crate"
+            fi
+          done
+          echo "crates=$todo" >> "$GITHUB_OUTPUT"
+      - uses: rust-lang/crates-io-auth-action@v1
+        if: steps.todo.outputs.crates != ''
+        id: auth
+      - name: Publish
+        if: steps.todo.outputs.crates != ''
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          for crate in ${{ steps.todo.outputs.crates }}; do
+            cargo publish -p "$crate"
+          done

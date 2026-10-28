@@ -163,7 +163,7 @@ def compress(codec: int, data: bytes, level: int) -> bytes:
     b = backend(codec)
     if b is None:
         raise MissingDependencyError(f"{NAMES.get(codec, codec)} compression is not available here; "
-                                     'install it with: pip install "dataconv[fast]"')
+                                     'install it with: pip install "vegg[fast]"')
     return b[1](bytes(data), level)
 
 
@@ -173,7 +173,7 @@ def decompress(codec: int, data: bytes, size: int) -> bytes:
     b = backend(codec)
     if b is None:
         raise MissingDependencyError(f"this data uses {NAMES.get(codec, codec)} compression, which is not "
-                                     'available here; install it with: pip install "dataconv[fast]"')
+                                     'available here; install it with: pip install "vegg[fast]"')
     try:
         out = b[2](bytes(data), size)
     except MissingDependencyError:

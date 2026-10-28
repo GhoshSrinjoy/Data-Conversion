@@ -1,4 +1,4 @@
-//! Standalone `dataconv` binary: the native engine without Python.
+//! Standalone `vegg` binary: the native engine without Python.
 //!
 //! Supports the core commands of the Python CLI (convert, compress, decompress,
 //! split, info, head, count, sniff, doctor) with the same option names.
@@ -11,23 +11,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use dataconv_core::codec::Profile;
-use dataconv_core::convert::{self, BadLines, ConvertOptions, Hooks, InferMode, Report};
-use dataconv_core::types::TypesMode;
-use dataconv_core::{dcz, inspect, resources, Error};
+use vegg_core::codec::Profile;
+use vegg_core::convert::{self, BadLines, ConvertOptions, Hooks, InferMode, Report};
+use vegg_core::types::TypesMode;
+use vegg_core::{dcz, inspect, resources, Error};
 
-const USAGE: &str = "dataconv (native) - fast, lossless data conversion and compression
+const USAGE: &str = "vegg (native) - fast, lossless data conversion and compression
 
 usage:
-  dataconv convert SRC DST [options]     CSV/TSV, JSON Lines, Parquet, Arrow IPC, DCZ
-  dataconv compress SRC [DST] [--profile fast|balanced|max]
-  dataconv decompress SRC [DST]
-  dataconv split SRC DIR (--rows N | --size 100MB) [--to FORMAT] [--pattern part-{n:05}]
-  dataconv info FILE [--exact]           JSON description of a file
-  dataconv head FILE [-n 10]
-  dataconv count FILE
-  dataconv sniff FILE
-  dataconv doctor                        resources the engine will use
+  vegg convert SRC DST [options]     CSV/TSV, JSON Lines, Parquet, Arrow IPC, DCZ
+  vegg compress SRC [DST] [--profile fast|balanced|max]
+  vegg decompress SRC [DST]
+  vegg split SRC DIR (--rows N | --size 100MB) [--to FORMAT] [--pattern part-{n:05}]
+  vegg info FILE [--exact]           JSON description of a file
+  vegg head FILE [-n 10]
+  vegg count FILE
+  vegg sniff FILE
+  vegg doctor                        resources the engine will use
 
 options:
   --to FORMAT            output format when the extension does not say
@@ -375,7 +375,7 @@ fn run(raw: Vec<String>) -> Result<(), String> {
         "doctor" => {
             let info = resources::detect();
             let plan = resources::plan(Some(10 << 30), None, None, None);
-            println!("dataconv native {}", dataconv_core::VERSION);
+            println!("vegg native {}", vegg_core::VERSION);
             println!("system  {} {} ({}-bit)", info.os, info.arch, info.pointer_width);
             println!("cpu     {} usable of {} logical", info.cpu_usable, info.cpu_logical);
             println!(
@@ -391,7 +391,7 @@ fn run(raw: Vec<String>) -> Result<(), String> {
                 fmt_size(plan.chunk_size as u64)
             );
         }
-        "version" | "--version" => println!("dataconv native {}", dataconv_core::VERSION),
+        "version" | "--version" => println!("vegg native {}", vegg_core::VERSION),
         other => return Err(format!("unknown command '{other}'\n\n{USAGE}")),
     }
     Ok(())
@@ -400,7 +400,7 @@ fn run(raw: Vec<String>) -> Result<(), String> {
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if raw.first().map(String::as_str) == Some("--version") {
-        println!("dataconv native {}", dataconv_core::VERSION);
+        println!("vegg native {}", vegg_core::VERSION);
         return ExitCode::SUCCESS;
     }
     // The first Ctrl-C stops the job cleanly; a second one exits at once.
@@ -412,11 +412,11 @@ fn main() -> ExitCode {
     match run(raw) {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) if INTERRUPTED.load(Ordering::SeqCst) => {
-            eprintln!("\ndataconv: interrupted; no output was written");
+            eprintln!("\nvegg: interrupted; no output was written");
             ExitCode::from(130)
         }
         Err(e) => {
-            eprintln!("dataconv: error: {e}");
+            eprintln!("vegg: error: {e}");
             ExitCode::FAILURE
         }
     }

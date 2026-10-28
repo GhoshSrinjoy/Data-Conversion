@@ -133,7 +133,7 @@ pub fn plan_with(
 pub fn thread_pool(threads: usize) -> rayon::ThreadPool {
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads.max(1))
-        .thread_name(|i| format!("dataconv-{i}"))
+        .thread_name(|i| format!("vegg-{i}"))
         .build()
         .expect("failed to start worker threads")
 }

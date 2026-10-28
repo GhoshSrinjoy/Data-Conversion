@@ -1,39 +1,39 @@
-"""Exception hierarchy.  Everything dataconv raises on purpose derives from DataconvError."""
+"""Exception hierarchy.  Everything vegg raises on purpose derives from VeggError."""
 
 from __future__ import annotations
 
 
-class DataconvError(Exception):
-    """Base class for all dataconv errors."""
+class VeggError(Exception):
+    """Base class for all vegg errors."""
 
 
-class MissingDependencyError(DataconvError, ImportError):
+class MissingDependencyError(VeggError, ImportError):
     """An optional package is needed for the requested operation."""
 
 
-class FileError(DataconvError, OSError):
+class FileError(VeggError, OSError):
     """A file could not be read or written."""
 
 
-class FormatError(DataconvError, ValueError):
+class FormatError(VeggError, ValueError):
     """A file format is unknown, unsupported, or does not match its contents."""
 
 
-class SchemaError(DataconvError, ValueError):
+class SchemaError(VeggError, ValueError):
     """A schema specification is invalid or cannot be applied."""
 
 
-class DataError(DataconvError, ValueError):
+class DataError(VeggError, ValueError):
     """Input data is malformed and the configured policy is to fail."""
 
 
-class IntegrityError(DataconvError):
+class IntegrityError(VeggError):
     """Stored checksums do not match the data (corruption or truncation)."""
 
 
-class OutputExistsError(DataconvError, FileExistsError):
+class OutputExistsError(VeggError, FileExistsError):
     """The destination exists and overwriting was not requested."""
 
 
-class OptionsError(DataconvError, ValueError):
+class OptionsError(VeggError, ValueError):
     """Invalid or conflicting options."""

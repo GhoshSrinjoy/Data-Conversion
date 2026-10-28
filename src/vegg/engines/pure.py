@@ -326,7 +326,7 @@ def _open_csv_text(path: Path, fmt: str, encoding: str) -> IO[str]:
 
 
 class CsvSource(Source):
-    """Records split by the quote rules every engine shares (see :mod:`dataconv._csvtok`)."""
+    """Records split by the quote rules every engine shares (see :mod:`vegg._csvtok`)."""
 
     def __init__(self, path: Path, fmt: str, dialect: Dialect, o: ConvertOptions, text_output: bool) -> None:
         self.path, self.fmt, self.dialect, self.o = path, fmt, dialect, o
@@ -522,7 +522,7 @@ class JsonSource(Source):
     """JSON Lines or a JSON array of objects (streamed element by element).
 
     Column types follow the lossless JSON rules shared with the native engine (see
-    :mod:`dataconv._jsonplan`), inside nested objects and arrays too.  Keys or values
+    :mod:`vegg._jsonplan`), inside nested objects and arrays too.  Keys or values
     the sample did not show restart the plan from a full scan, so nothing is ever
     dropped."""
 

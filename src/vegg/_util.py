@@ -198,7 +198,7 @@ def prefetch(items: Iterable[T], depth: int = 1) -> Iterator[T]:
             except queue.Full:
                 continue
 
-    worker = threading.Thread(target=produce, name="dataconv-prefetch", daemon=True)
+    worker = threading.Thread(target=produce, name="vegg-prefetch", daemon=True)
     worker.start()
     try:
         while True:

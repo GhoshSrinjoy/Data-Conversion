@@ -3,7 +3,7 @@
 CSV input is read as text in record-aligned chunks, and every column is cast with
 the same lossless guards as the native engine (vectorised with pyarrow.compute).
 Records are split by the quote rules every engine shares (see
-:mod:`dataconv._csvtok`): pyarrow parses the runs of records those rules leave
+:mod:`vegg._csvtok`): pyarrow parses the runs of records those rules leave
 regular, and the few records with stray, irregular or escaped quotes go through the
 Python tokenizer.
 """
@@ -414,7 +414,7 @@ def _infer(reader: CsvReader, o: ConvertOptions, mode: str, full: bool) -> Tuple
 def _json_batches(path: Path, fmt: str, o: ConvertOptions, batch_rows: int, full: bool,
                   notes: List[str], sample: Optional[int] = None) -> Tuple[Any, Iterator[Any]]:
     """JSON and JSON Lines by the lossless JSON rules every engine shares (see
-    :mod:`dataconv._jsonplan`), as Arrow: objects as structs, arrays as lists, text
+    :mod:`vegg._jsonplan`), as Arrow: objects as structs, arrays as lists, text
     holding numbers or JSON marked so."""
     pa = _pa()
     src = pure.JsonSource(path, fmt, o, full=full, sample=sample)

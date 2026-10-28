@@ -1,16 +1,24 @@
 [package]
-name = "dataconv-cli"
+name = "vegg"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Standalone dataconv binary: lossless data conversion and compression without Python"
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Fast, lossless conversion and compression of CSV, JSON Lines, Parquet, Arrow IPC and DCZ files"
+readme = "../../README.md"
+# the license text travels with the published crate
+license-file = "../../LICENSE"
+keywords = ["csv", "parquet", "arrow", "compression", "lossless"]
+categories = ["command-line-utilities", "compression", "encoding"]
 
 [[bin]]
-name = "dataconv"
+name = "vegg"
 path = "src/main.rs"
 
 [dependencies]
-dataconv-core = { path = "../core" }
+vegg-core = { path = "../core", version = "=1.0.0" }
 serde_json = "1"
 ctrlc = "3.4"

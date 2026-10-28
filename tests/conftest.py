@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from dataconv import _compat, _native
+from vegg import _compat, _native
 
 
 def have_native() -> bool:
@@ -14,7 +14,7 @@ def have_arrow() -> bool:
     return _compat.have("pyarrow")
 
 
-needs_native = pytest.mark.skipif(not have_native(), reason="dataconv-native not installed")
+needs_native = pytest.mark.skipif(not have_native(), reason="the native engine is not installed")
 needs_arrow = pytest.mark.skipif(not have_arrow(), reason="pyarrow not installed")
 
 ENGINES = [e for e, ok in (("native", have_native()), ("arrow", have_arrow()), ("pure", True)) if ok]

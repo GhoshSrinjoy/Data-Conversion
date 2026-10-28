@@ -4,7 +4,7 @@ import sys
 
 import pytest
 
-from dataconv.cli import main
+from vegg.cli import main
 
 
 def run(args, capsys):
@@ -63,7 +63,7 @@ def test_doctor(capsys):
 
 
 def test_module_entry_point(tricky):
-    proc = subprocess.run([sys.executable, "-m", "dataconv", "count", str(tricky)], capture_output=True, text=True)
+    proc = subprocess.run([sys.executable, "-m", "vegg", "count", str(tricky)], capture_output=True, text=True)
     assert proc.returncode == 0 and int(proc.stdout) >= 2000
 
 

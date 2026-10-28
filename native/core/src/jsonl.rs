@@ -334,7 +334,7 @@ impl Plan {
 
 /// Field metadata of text columns that hold JSON: "number" (numbers kept as their
 /// text) or "value" (the JSON text of any value).
-pub const JSON_TEXT: &str = "dataconv.json";
+pub const JSON_TEXT: &str = "vegg.json";
 
 fn plan_field(name: &str, p: &Plan) -> Field {
     let field = Field::new(name, p.data_type(), true);

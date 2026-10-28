@@ -2,9 +2,9 @@ import random
 
 import pytest
 
-import dataconv as dc
+import vegg
 from conftest import needs_native, random_csv
-from dataconv import dcz
+from vegg import dcz
 
 
 @pytest.mark.parametrize("seed", range(40))
@@ -23,10 +23,10 @@ def test_pure_file_roundtrip(tmp_path, profile, no_native):
     src = tmp_path / "in.csv"
     src.write_bytes(data)
     dst = tmp_path / "in.csv.dcz"
-    dc.compress(src, dst, profile=profile, block_size=8192)
+    vegg.compress(src, dst, profile=profile, block_size=8192)
     assert dcz.read_footer(dst)["original_size"] == len(data)
     back = tmp_path / "back.csv"
-    dc.decompress(dst, back)
+    vegg.decompress(dst, back)
     assert back.read_bytes() == data
 
 
@@ -38,19 +38,19 @@ def test_native_and_python_read_each_other(tmp_path, seed, monkeypatch):
     src = tmp_path / "x.csv"
     src.write_bytes(data)
     native = tmp_path / "native.dcz"
-    dc.compress(src, native, profile=rng.choice(["balanced", "max"]), block_size=16384)
+    vegg.compress(src, native, profile=rng.choice(["balanced", "max"]), block_size=16384)
     # decode the native file with the pure-Python decoder
     assert b"".join(dcz.iter_decoded(native)) == data
     # and a pure-Python file with the native engine
-    from dataconv import _native
+    from vegg import _native
 
     real = _native.module
     monkeypatch.setattr(_native, "module", lambda: None)
     pure = tmp_path / "pure.dcz"
-    dc.compress(src, pure, profile="balanced", block_size=16384)
+    vegg.compress(src, pure, profile="balanced", block_size=16384)
     monkeypatch.setattr(_native, "module", real)
     out = tmp_path / "pure_by_native.csv"
-    dc.decompress(pure, out)
+    vegg.decompress(pure, out)
     assert out.read_bytes() == data
 
 
@@ -59,9 +59,9 @@ def test_binary_and_empty_files(tmp_path, no_native):
         src = tmp_path / name
         src.write_bytes(data)
         dst = tmp_path / (name + ".dcz")
-        dc.compress(src, dst)
+        vegg.compress(src, dst)
         out = tmp_path / (name + ".out")
-        dc.decompress(dst, out)
+        vegg.decompress(dst, out)
         assert out.read_bytes() == data
 
 
@@ -69,16 +69,16 @@ def test_corruption_is_detected(tmp_path, no_native):
     src = tmp_path / "c.csv"
     src.write_bytes(b"a,b\n" + b"".join(b"%d,%d\n" % (i, i * i) for i in range(5000)))
     dst = tmp_path / "c.dcz"
-    dc.compress(src, dst)
+    vegg.compress(src, dst)
     raw = bytearray(dst.read_bytes())
     raw[60] ^= 0xFF
     bad = tmp_path / "bad.dcz"
     bad.write_bytes(bytes(raw))
-    with pytest.raises(dc.DataconvError):
-        dc.decompress(bad, tmp_path / "bad.out")
+    with pytest.raises(vegg.VeggError):
+        vegg.decompress(bad, tmp_path / "bad.out")
     (tmp_path / "trunc.dcz").write_bytes(bytes(raw[: len(raw) // 2]))
-    with pytest.raises(dc.DataconvError):
-        dc.decompress(tmp_path / "trunc.dcz", tmp_path / "trunc.out")
+    with pytest.raises(vegg.VeggError):
+        vegg.decompress(tmp_path / "trunc.dcz", tmp_path / "trunc.out")
 
 
 def test_columnar_beats_plain_compression(tmp_path):
@@ -89,7 +89,7 @@ def test_columnar_beats_plain_compression(tmp_path):
     src = tmp_path / "s.csv"
     src.write_bytes(data)
     dst = tmp_path / "s.dcz"
-    dc.compress(src, dst, profile="balanced")
+    vegg.compress(src, dst, profile="balanced")
     assert dst.stat().st_size * 3 < len(zlib.compress(data, 9))
 
 
@@ -116,6 +116,6 @@ def test_reader_is_a_binary_stream(tmp_path, no_native):
     src = tmp_path / "r.csv"
     src.write_bytes(b"a,b\n" + b"".join(b"%d,x\n" % i for i in range(1000)))
     dst = tmp_path / "r.dcz"
-    dc.compress(src, dst)
+    vegg.compress(src, dst)
     with io.TextIOWrapper(io.BufferedReader(dcz.DczReader(dst)), encoding="utf-8", newline="") as f:
         assert f.read() == src.read_bytes().decode()

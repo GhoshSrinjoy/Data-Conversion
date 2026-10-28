@@ -1,10 +1,11 @@
 """Optional-dependency discovery.
 
-Every accelerator dataconv can use is optional.  Imports are lazy and cached so
-``import dataconv`` stays fast, and any module can be switched off with the
-``DATACONV_DISABLE`` environment variable (comma-separated module names, or
-``all`` for every third-party package).  That switch is how the pure-Python
-fallbacks are exercised on machines that do have the accelerators installed.
+Every accelerator vegg can use is optional.  Imports are lazy and cached so
+``import vegg`` stays fast, and any of them can be switched off with the
+``VEGG_DISABLE`` environment variable: comma-separated module names, ``native``
+for the Rust engine, or ``all`` for the Rust engine and every third-party
+package.  That switch is how the pure-Python fallbacks are exercised on machines
+that do have the accelerators installed.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from typing import Dict, Optional
 
 from .errors import MissingDependencyError
 
-# Third-party packages dataconv knows how to use, mapped to their pip names.
+# Third-party packages vegg knows how to use, mapped to their pip names.
 THIRD_PARTY = {
     "pyarrow": "pyarrow",
     "numpy": "numpy",
@@ -33,20 +34,24 @@ THIRD_PARTY = {
     "polars": "polars",
     "openpyxl": "openpyxl",
     "charset_normalizer": "charset-normalizer",
-    "dataconv_native": "dataconv-native",
 }
+
+# The Rust engine, part of vegg's platform wheels; VEGG_DISABLE=native turns it off.
+NATIVE = "vegg._rust"
 
 _lock = threading.Lock()
 _cache: Dict[str, Optional[ModuleType]] = {}
 
 
 def _disabled() -> set:
-    raw = os.environ.get("DATACONV_DISABLE", "")
+    raw = os.environ.get("VEGG_DISABLE", "")
     return {part.strip().lower() for part in raw.split(",") if part.strip()}
 
 
 def is_disabled(name: str) -> bool:
     disabled = _disabled()
+    if name == NATIVE:
+        return "native" in disabled or "all" in disabled
     root = name.split(".", 1)[0].lower()
     if name.lower() in disabled or root in disabled:
         return True
@@ -81,13 +86,13 @@ def require(name: str, purpose: str, extra: str = "fast") -> ModuleType:
         pip_name = THIRD_PARTY.get(name.split(".", 1)[0], name)
         raise MissingDependencyError(
             f"{purpose} needs the optional package '{pip_name}'. "
-            f'Install it with: pip install "dataconv[{extra}]"  (or: pip install {pip_name})'
+            f'Install it with: pip install "vegg[{extra}]"  (or: pip install {pip_name})'
         )
     return module
 
 
 def reset_cache() -> None:
-    """Forget cached imports (used by tests that toggle DATACONV_DISABLE)."""
+    """Forget cached imports (used by tests that toggle VEGG_DISABLE)."""
     with _lock:
         _cache.clear()
 

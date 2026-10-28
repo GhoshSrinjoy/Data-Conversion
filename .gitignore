@@ -17,8 +17,8 @@ venv/
 htmlcov/
 
 # Native extension builds copied next to the package
-src/dataconv/*.pyd
-src/dataconv/*.so
+src/vegg/*.pyd
+src/vegg/*.so
 *.pyd
 
 # Editors / OS

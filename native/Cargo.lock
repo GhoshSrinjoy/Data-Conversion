@@ -500,50 +500,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dataconv-cli"
-version = "1.0.0"
-dependencies = [
- "ctrlc",
- "dataconv-core",
- "serde_json",
-]
-
-[[package]]
-name = "dataconv-core"
-version = "1.0.0"
-dependencies = [
- "ahash",
- "arrow",
- "base64",
- "brotli",
- "crc32fast",
- "encoding_rs",
- "flate2",
- "itoa",
- "liblzma",
- "lz4_flex",
- "memchr",
- "parquet",
- "rayon",
- "ryu",
- "serde",
- "serde_json",
- "simdutf8",
- "sysinfo",
- "zstd",
-]
-
-[[package]]
-name = "dataconv-native"
-version = "1.0.0"
-dependencies = [
- "dataconv-core",
- "pyo3",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "dispatch2"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1349,6 +1305,50 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "vegg"
+version = "1.0.0"
+dependencies = [
+ "ctrlc",
+ "serde_json",
+ "vegg-core",
+]
+
+[[package]]
+name = "vegg-core"
+version = "1.0.0"
+dependencies = [
+ "ahash",
+ "arrow",
+ "base64",
+ "brotli",
+ "crc32fast",
+ "encoding_rs",
+ "flate2",
+ "itoa",
+ "liblzma",
+ "lz4_flex",
+ "memchr",
+ "parquet",
+ "rayon",
+ "ryu",
+ "serde",
+ "serde_json",
+ "simdutf8",
+ "sysinfo",
+ "zstd",
+]
+
+[[package]]
+name = "vegg-python"
+version = "1.0.0"
+dependencies = [
+ "pyo3",
+ "serde",
+ "serde_json",
+ "vegg-core",
+]
 
 [[package]]
 name = "version_check"

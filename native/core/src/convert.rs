@@ -32,11 +32,11 @@ use crate::tables::{self, IpcSink, JsonlSink, ParquetOptions, ParquetSink, Sink,
 use crate::tokenize::{malformed_value, unescape, Dialect, Tokenizer};
 use crate::types::{ColumnStats, LogicalType, TypesMode};
 
-/// Phase timings on stderr when DATACONV_TRACE is set (diagnosing slow jobs).
+/// Phase timings on stderr when VEGG_TRACE is set (diagnosing slow jobs).
 pub(crate) fn trace(phase: &str, started: Instant) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ON.get_or_init(|| std::env::var_os("DATACONV_TRACE").is_some()) {
-        eprintln!("[dataconv] {phase:<24} {:>8.1} ms", started.elapsed().as_secs_f64() * 1000.0);
+    if *ON.get_or_init(|| std::env::var_os("VEGG_TRACE").is_some()) {
+        eprintln!("[vegg] {phase:<24} {:>8.1} ms", started.elapsed().as_secs_f64() * 1000.0);
     }
 }
 
@@ -589,7 +589,7 @@ fn full_stats(
 fn spawn_chunker<R: Read + Send + 'static>(mut chunker: Chunker<R>, depth: usize) -> Receiver<Result<Chunk>> {
     let (tx, rx) = sync_channel::<Result<Chunk>>(depth.max(1));
     std::thread::Builder::new()
-        .name("dataconv-reader".into())
+        .name("vegg-reader".into())
         .spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
                 match chunker.next_chunk() {

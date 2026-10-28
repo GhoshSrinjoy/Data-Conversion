@@ -1,10 +1,10 @@
-"""Build the native release artifacts (the standalone ``dataconv`` binary and the
-``dataconv-native`` wheel) without paths of the build machine in them.
+"""Build the native release artifacts (the standalone ``vegg`` binary and the vegg
+wheel with the Rust engine) without paths of the build machine in them.
 
 Rust embeds the source path of every crate in panic messages, so a binary built in a
 home directory names that directory, and with it the user.  This builds with those
 paths remapped (the home directory to ``~``, the cargo home to ``cargo``, this checkout
-to ``dataconv``), then checks every artifact for paths of this machine that remain:
+to ``vegg``), then checks every artifact for paths of this machine that remain:
 
     python native/build_release.py                 # binary and wheel, into dist/
     python native/build_release.py --no-wheel      # the binary only
@@ -39,7 +39,7 @@ def machine_paths() -> List[Tuple[Path, str]]:
     home = Path.home()
     cargo_home = Path(os.environ.get("CARGO_HOME") or home / ".cargo")
     rustup_home = Path(os.environ.get("RUSTUP_HOME") or home / ".rustup")
-    return [(home, "~"), (rustup_home, "rustup"), (cargo_home, "cargo"), (ROOT, "dataconv")]
+    return [(home, "~"), (rustup_home, "rustup"), (cargo_home, "cargo"), (ROOT, "vegg")]
 
 
 def build_env() -> dict:
@@ -62,9 +62,9 @@ def run(cmd: List[str], cwd: Path, env: dict) -> None:
 
 
 def build_binary(env: dict) -> Path:
-    run(["cargo", "build", "--release", "-p", "dataconv-cli"], NATIVE, env)
+    run(["cargo", "build", "--release", "-p", "vegg"], NATIVE, env)
     exe = ".exe" if os.name == "nt" else ""
-    built = Path(env["CARGO_TARGET_DIR"]) / "release" / f"dataconv{exe}"
+    built = Path(env["CARGO_TARGET_DIR"]) / "release" / f"vegg{exe}"
     DIST.mkdir(exist_ok=True)
     return Path(shutil.copy2(built, DIST / built.name))
 
@@ -72,8 +72,9 @@ def build_binary(env: dict) -> Path:
 def build_wheel(env: dict) -> List[Path]:
     before = set(DIST.glob("*.whl"))
     maturin = shlex.split(os.environ.get("MATURIN", "maturin"))
-    run([*maturin, "build", "--release", "-m", str(NATIVE / "python" / "Cargo.toml"), "-o", str(DIST)], ROOT, env)
-    return sorted(set(DIST.glob("*.whl")) - before) or sorted(DIST.glob("dataconv_native-*.whl"))
+    # maturin reads [tool.maturin] in the root pyproject.toml
+    run([*maturin, "build", "--release", "-o", str(DIST)], ROOT, env)
+    return sorted(set(DIST.glob("*.whl")) - before) or sorted(DIST.glob("vegg-*-abi3-*.whl"))
 
 
 def leaks_pattern() -> re.Pattern[bytes]:

@@ -15,7 +15,7 @@ first-seen order, arrays item by item); its plan then decides how values are dec
 * a field mixing strings, numbers, booleans, objects and arrays holds each value's
   JSON text, as does an object that never has a field.
 
-Text holding numbers or JSON is marked (``dataconv.json`` = ``number`` / ``value``),
+Text holding numbers or JSON is marked (``vegg.json`` = ``number`` / ``value``),
 so that JSON output writes it as that JSON again.  A value that does not fit its plan
 raises :class:`Misfit`; the engines then plan again from the whole file.
 """
@@ -45,7 +45,7 @@ class JsonInt(JsonNumber):
 
 class JsonText(str):
     """The JSON text of a value held in a text column (a field mixing JSON types, a
-    number kept as text, or an Arrow column marked ``dataconv.json``): JSON output
+    number kept as text, or an Arrow column marked ``vegg.json``): JSON output
     writes it as the JSON it holds, CSV output as its text."""
 
     __slots__ = ()
@@ -53,7 +53,7 @@ class JsonText(str):
 
 #: Arrow field metadata of text columns that hold JSON: "number" (numbers kept as
 #: their text) or "value" (the JSON text of any value), as the native engine sets it
-JSON_TEXT_KEY = "dataconv.json"
+JSON_TEXT_KEY = "vegg.json"
 #: The strings a number field may hold for the floats JSON cannot write
 NAN_TEXT = {"NaN": math.nan, "Infinity": math.inf, "-Infinity": -math.inf}
 
@@ -390,7 +390,7 @@ class Plan:
 
     @property
     def mark(self) -> Optional[str]:
-        """The ``dataconv.json`` metadata of the field (None for none)."""
+        """The ``vegg.json`` metadata of the field (None for none)."""
         return "number" if self.kind == "number" else "value" if self.kind == "json" else None
 
     @property

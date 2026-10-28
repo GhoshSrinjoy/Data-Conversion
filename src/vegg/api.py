@@ -319,7 +319,7 @@ def _split_python(src: Path, out_dir: Path, src_fmt: str, src_comp: Optional[str
                     bytes_in=src.stat().st_size)
     created = not out_dir.exists()
     out_dir.mkdir(parents=True, exist_ok=True)
-    staging = out_dir / f".dataconv-staging-{os.getpid()}-{secrets.token_hex(4)}"
+    staging = out_dir / f".vegg-staging-{os.getpid()}-{secrets.token_hex(4)}"
     staging.mkdir()
     published = False
     try:
@@ -360,7 +360,7 @@ def _split_typed(src: Path, staging: Path, out_dir: Path, src_fmt: str, fmt: str
     ``<dir>.rejected.csv`` next to the directory."""
     if not _compat.have("pyarrow"):
         raise MissingDependencyError('splitting into other formats without the native engine needs pyarrow: '
-                                     'pip install "dataconv[arrow]"')
+                                     'pip install "vegg[arrow]"')
     delimited = src_fmt in pure_engine.DELIMITED
     default_q = out_dir.with_name(out_dir.name + ".rejected.csv")
     quarantine = pure_engine.Quarantine(src, out_dir, o, delimited, default=default_q)
@@ -595,7 +595,7 @@ def compress(src: PathLike, dst: Optional[PathLike] = None, *, profile: str = "b
         if engine in ("auto", "native") and _native.available():
             return native_engine.compress(src, dst_path, profile, threads, size, overwrite, callback, budget)
         if engine == "native":
-            raise MissingDependencyError('the native engine is not installed (pip install "dataconv[native]")')
+            raise engines.missing("native")
         return pure_engine.compress(src, dst_path, profile, overwrite, callback, size)
     finally:
         if bar is not None:
@@ -617,7 +617,7 @@ def decompress(src: PathLike, dst: Optional[PathLike] = None, *, threads: Option
         if engine in ("auto", "native") and _native.available():
             return native_engine.decompress(src, dst_path, threads, overwrite, callback, budget)
         if engine == "native":
-            raise MissingDependencyError('the native engine is not installed (pip install "dataconv[native]")')
+            raise engines.missing("native")
         return pure_engine.decompress(src, dst_path, overwrite, callback)
     finally:
         if bar is not None:
@@ -859,8 +859,7 @@ def _inspect_engine(path: Path, o: ConvertOptions) -> Tuple[str, str]:
             return candidate, fmt
     if o.engine != "auto":
         if o.engine not in installed:
-            hint = {"native": "dataconv[native]", "arrow": "dataconv[arrow]"}.get(o.engine, "dataconv")
-            raise MissingDependencyError(f"the {o.engine} engine is not installed (pip install \"{hint}\")")
+            raise engines.missing(o.engine)
         if formats.engine_supports(o.engine, fmt, "ipc" if o.engine != "pure" else "csv", None, None):
             raise OptionsError(f"the {o.engine} engine cannot read {comp}-compressed input (use engine='auto')")
         raise OptionsError(f"the {o.engine} engine cannot read {fmt}")
@@ -928,7 +927,7 @@ def sniff(path: PathLike, **options: Any) -> Dict[str, Any]:
         return native_engine.sniff(p, o, fmt)
     if o.engine == "native":
         if not _native.available():
-            raise MissingDependencyError('the native engine is not installed (pip install "dataconv[native]")')
+            raise engines.missing("native")
         raise OptionsError(f"the native engine cannot read {comp}-compressed input (use engine='auto')")
     return pure_engine._dialect(p, fmt, o).to_dict()
 

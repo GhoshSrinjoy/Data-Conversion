@@ -282,14 +282,14 @@ def make_plan(
     """Decide threads, memory budget and chunk sizes for a job.
 
     ``memory`` accepts bytes or a size string ('2GB').  Environment variables
-    ``DATACONV_THREADS`` and ``DATACONV_MEMORY`` override the detected values.
+    ``VEGG_THREADS`` and ``VEGG_MEMORY`` override the detected values.
     """
     info = info or detect()
     notes = []
-    env_threads = os.environ.get("DATACONV_THREADS")
+    env_threads = os.environ.get("VEGG_THREADS")
     threads = int(threads or (env_threads and int(env_threads)) or info.cpu_usable)
     threads = max(1, threads)
-    budget = parse_size(memory or os.environ.get("DATACONV_MEMORY") or None, "m")
+    budget = parse_size(memory or os.environ.get("VEGG_MEMORY") or None, "m")
     if budget is None:
         budget = int(min(info.mem_available * 0.5, info.mem_total * 0.8))
         notes.append(f"memory budget = 50% of available RAM ({info.mem_available // MiB} MB)")

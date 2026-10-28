@@ -313,7 +313,7 @@ impl DczWriter {
         let footer = Footer {
             format: "dcz".into(),
             version: VERSION,
-            created_by: format!("dataconv {}", crate::VERSION),
+            created_by: format!("vegg {}", crate::VERSION),
             kind: if self.csv.is_some() { "csv".into() } else { "raw".into() },
             profile: format!("{:?}", self.opts.profile).to_lowercase(),
             original_size: self.raw_offset,
@@ -737,7 +737,7 @@ pub fn compress_bytes(data: &[u8], csv: bool, profile: Profile) -> Result<Vec<u8
     let footer = Footer {
         format: "dcz".into(),
         version: VERSION,
-        created_by: format!("dataconv {}", crate::VERSION),
+        created_by: format!("vegg {}", crate::VERSION),
         kind: if csv { "csv".into() } else { "raw".into() },
         profile: format!("{profile:?}").to_lowercase(),
         original_size: data.len() as u64,
@@ -872,7 +872,7 @@ mod tests {
 
     impl TestDir {
         fn new(name: &str) -> TestDir {
-            let dir = std::env::temp_dir().join(format!("dcv-dcz-{}-{name}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!("vegg-dcz-{}-{name}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             TestDir(dir)

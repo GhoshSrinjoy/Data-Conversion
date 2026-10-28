@@ -2,17 +2,22 @@
 
 ## 1.0.0
 
-A rewrite of the three original scripts into one package, `dataconv`.
+A rewrite of the three original scripts into one package, `vegg` (from the
+Bengali বেগ, *speed*). The project was developed as Data-Conversion, with the
+working name `dataconv`.
 
 ### Added
 
-- **Native engine** (`dataconv-native`, Rust):
+- **Native engine** (Rust), compiled into vegg's platform wheels as `vegg._rust`:
   - a quote-aware chunker and zero-copy tokenizer;
   - parallel, memory-bounded conversion between CSV/TSV, JSON Lines, Parquet,
     Arrow IPC and DCZ;
   - Parquet writing that encodes columns and row groups in parallel and tunes
     encodings per column;
-  - a standalone `dataconv` binary that needs no Python.
+  - a standalone `vegg` binary that needs no Python (`cargo install vegg`).
+- **One package everywhere.** `pip install vegg` gets the native engine on
+  CPython 3.9+ for Windows, macOS and Linux (x86-64 and ARM64, glibc and musl),
+  and a pure-Python wheel on every other platform and interpreter.
 - **Lossless type inference**, shared by every engine: canonical integers only
   (leading zeros and `+` signs keep text), exact decimals for values beyond
   int64 or float64 precision, timestamps with unit and UTC offset, and
@@ -50,7 +55,7 @@ A rewrite of the three original scripts into one package, `dataconv`.
   ([format specification](docs/FORMAT.md)), and `pack`/`unpack` for lists and
   numpy arrays.
 - **Resource-aware planning.** Threads and memory come from CPU affinity, cgroup
-  quotas and available memory; `dataconv doctor` and `plan()` show them.
+  quotas and available memory; `vegg doctor` and `plan()` show them.
 - **New commands:** `convert` for files and whole directory trees, `split` (by
   rows or measured target size, byte-exact for CSV), `merge` (schema
   unification), `info`, `head`, `count`, `schema`, `sniff`, `stats`, `verify`,
@@ -70,7 +75,7 @@ A rewrite of the three original scripts into one package, `dataconv`.
 ### Removed
 
 - The original scripts `csv_to_parquet.py`, `parquet_viewer.py` and
-  `csv_splitter_converter.py`. `dataconv convert`, `info`, `head` and `split` do
+  `csv_splitter_converter.py`. `vegg convert`, `info`, `head` and `split` do
   their jobs, without the pandas-based code's losses: leading zeros, `NA`
   strings and large integers are kept, split parts hit the requested size
   (measured on the output), and malformed rows go to a `.rejected.csv` file

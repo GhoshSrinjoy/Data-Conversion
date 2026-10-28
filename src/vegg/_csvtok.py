@@ -131,7 +131,7 @@ class Dialect:
 
     @classmethod
     def of(cls, d: Any, text: bool = True) -> Dialect:
-        """From a sniffed :class:`dataconv._sniff.Dialect`."""
+        """From a sniffed :class:`vegg._sniff.Dialect`."""
         return cls(d.delimiter, d.quote, d.escape, d.double_quote, "\r" if d.terminator == "\r" else "\n", text)
 
 

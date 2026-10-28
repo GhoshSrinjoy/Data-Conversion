@@ -1,8 +1,8 @@
 *"My CSV had 12 million rows. I converted it to Parquet and suddenly felt rich in storage space."*
 
-# dataconv: fast, lossless data conversion and compression
+# vegg: fast, lossless data conversion and compression
 
-[![CI](https://github.com/GhoshSrinjoy/Data-Conversion/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/GhoshSrinjoy/Data-Conversion/actions/workflows/ci.yml)
+[![CI](https://github.com/GhoshSrinjoy/vegg/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/GhoshSrinjoy/vegg/actions/workflows/ci.yml)
 [![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-3776AB?logo=python&logoColor=white)](#install)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-B7410E?logo=rust&logoColor=white)](#engines-and-portability)
@@ -11,6 +11,7 @@
 
 Convert, compress, split, inspect and verify CSV, TSV, JSON Lines, JSON, Parquet,
 Arrow IPC/Feather, ORC, Excel and DCZ files, from the command line or Python.
+The name comes from বেগ (*beg*), Bengali for speed.
 
 - **Lossless by design.** Zip codes keep their leading zeros, 20-digit IDs stay
   exact, `NA` is only a missing value where the column is numeric, timestamps
@@ -23,9 +24,10 @@ Arrow IPC/Feather, ORC, Excel and DCZ files, from the command line or Python.
 - **Strong compression.** DCZ, a byte-exact columnar format for delimited text,
   produced a file about 1.5x smaller than Parquet and 1.6x smaller than xz on a
   typical export, and still decompresses at about 1 GB/s.
-- **Runs anywhere.** One Python package with no required dependencies, an
-  optional native engine for Windows, macOS and Linux (x86-64 and ARM), and a
-  standalone binary that needs no Python at all.
+- **Runs anywhere.** One Python package with no required dependencies. On
+  Windows, macOS and Linux (x86-64 and ARM) it comes with the native engine built
+  in, and elsewhere it runs as pure Python. A standalone binary needs no Python
+  at all.
 
 ## Contents
 
@@ -47,16 +49,16 @@ Arrow IPC/Feather, ORC, Excel and DCZ files, from the command line or Python.
 
 Converting a CSV sounds trivial until the data is real. On a 2-million-row,
 135.5 MB export (ids, timestamps, user names, prices, zip codes, country codes),
-the classic `pandas.read_csv(...).to_parquet(...)` approach and dataconv give:
+the classic `pandas.read_csv(...).to_parquet(...)` approach and vegg give:
 
-|                                            | pandas + pyarrow | dataconv (native) |
+|                                            | pandas + pyarrow | vegg (native) |
 |--------------------------------------------|-----------------:|------------------:|
 | time                                       | 1.65 s           | **0.21 s**        |
 | Parquet size                               | 51.1 MB          | **33.5 MB**       |
 | zip codes that lost their leading zero     | 199,609          | **0**             |
 | `NA` (Namibia) turned into a missing value | 250,549          | **0**             |
 
-Measured on a 24-thread Windows machine (sizes in MB of 2^20 bytes, as dataconv
+Measured on a 24-thread Windows machine (sizes in MB of 2^20 bytes, as vegg
 prints them). Your timings will differ; the losses will not.
 
 Other problems it handles for you:
@@ -72,60 +74,62 @@ Other problems it handles for you:
 
 ## Install
 
-From a checkout of this repository:
-
 ```bash
-pip install .                      # the package: pure Python, no dependencies
-pip install ./native/python        # the native engine (needs a Rust toolchain)
-pip install ".[arrow,fast]"        # pyarrow, numpy and extra codecs (optional)
+pip install vegg              # the package, with the native engine where a wheel has it
+pip install "vegg[arrow]"     # adds pyarrow: ORC, Excel, JSON arrays, in-memory tables
+pip install "vegg[all]"       # pyarrow, extra codecs and Excel support
 ```
 
-Once the packages are published, the same is:
+On CPython 3.9 or newer for Windows, macOS and Linux (x86-64 and ARM64, glibc
+and musl), pip installs a wheel with the native Rust engine built in. Everywhere
+else (Python 3.8, PyPy, other platforms) it installs the pure-Python wheel, which
+needs nothing but the standard library. `vegg doctor` shows what your machine
+offers.
+
+The standalone binary needs no Python. Download it from the
+[releases](https://github.com/GhoshSrinjoy/vegg/releases), or build it with
+Rust 1.88 or newer:
 
 ```bash
-pip install "dataconv[native]"     # recommended: the Rust engine
-pip install "dataconv[all]"        # everything: native, pyarrow, codecs, Excel
+cargo install vegg
 ```
 
-The standalone binary (no Python) builds with `cargo build --release -p
-dataconv-cli` in `native/` and lands in `native/target/release/dataconv`.
-
-Requirements: Python 3.8 or newer (the native engine needs 3.9 or newer). Check
-what your machine offers with `dataconv doctor`.
+From a checkout of this repository, `pip install .` installs the pure-Python
+package; [Development](#development) shows how to add the native engine.
 
 ## Quick start
 
 ```bash
-dataconv convert data.csv data.parquet                 # lossless, parallel, tuned
-dataconv convert data.csv --to parquet --profile max   # smallest Parquet
-dataconv convert exports/ --to parquet -o lake/        # a whole tree, in parallel
-dataconv compress huge.csv                             # huge.csv.dcz, byte-exact
-dataconv decompress huge.csv.dcz                       # the original bytes again
-dataconv split big.csv parts/ --size 100MB --to parquet
-dataconv info data.parquet                             # rows, schema, codecs, stats
-dataconv head data.csv -n 20
-dataconv verify data.csv data.parquet                  # same data?
-dataconv bench data.csv                                # which format suits this data
+vegg convert data.csv data.parquet                 # lossless, parallel, tuned
+vegg convert data.csv --to parquet --profile max   # smallest Parquet
+vegg convert exports/ --to parquet -o lake/        # a whole tree, in parallel
+vegg compress huge.csv                             # huge.csv.dcz, byte-exact
+vegg decompress huge.csv.dcz                       # the original bytes again
+vegg split big.csv parts/ --size 100MB --to parquet
+vegg info data.parquet                             # rows, schema, codecs, stats
+vegg head data.csv -n 20
+vegg verify data.csv data.parquet                  # same data?
+vegg bench data.csv                                # which format suits this data
 ```
 
 ```python
-import dataconv as dc
+import vegg
 
-report = dc.convert("data.csv", "data.parquet")
+report = vegg.convert("data.csv", "data.parquet")
 print(report)               # rows, sizes, ratio, speed, engine
 print(report.warnings)      # e.g. "column 'zip' kept as text: leading zeros ..."
 
-dc.compress("data.csv")                 # -> data.csv.dcz
-blob = dc.pack([19.99, 5.25, 7.5])      # compress a list in memory
-dc.unpack(blob)                         # -> [19.99, 5.25, 7.5], bit for bit
+vegg.compress("data.csv")                 # -> data.csv.dcz
+blob = vegg.pack([19.99, 5.25, 7.5])      # compress a list in memory
+vegg.unpack(blob)                         # -> [19.99, 5.25, 7.5], bit for bit
 
-table = dc.load("data.csv")             # a pyarrow.Table with lossless types
-dc.write(table, "out.parquet", profile="max")
+table = vegg.load("data.csv")             # a pyarrow.Table with lossless types
+vegg.write(table, "out.parquet", profile="max")
 ```
 
 ## What is the best compression for my data?
 
-It depends on what you will do with the file. `dataconv bench yourfile.csv`
+It depends on what you will do with the file. `vegg bench yourfile.csv`
 measures every option on your own data. For the 135.5 MB export above:
 
 | format            | size    | ratio | write   | read   | use it for |
@@ -148,7 +152,7 @@ Rules of thumb:
 - **To store or ship a CSV exactly**, use **DCZ**. It is lossless to the byte
   (every block is verified when written and checksummed when read), so a DCZ
   file can stand in for the original CSV.
-- **Numbers in memory** (lists, arrays, time series) go through `dc.pack`.
+- **Numbers in memory** (lists, arrays, time series) go through `vegg.pack`.
 
 ### How DCZ gets there
 
@@ -171,12 +175,12 @@ are kept verbatim. The result goes through zstd, or for `max` the best of zstd,
 lzma and brotli per stream. The format is specified in
 [docs/FORMAT.md](docs/FORMAT.md).
 
-### Lists and arrays: `dc.pack`
+### Lists and arrays: `vegg.pack`
 
-`dc.pack` applies the same ideas to in-memory values and restores them exactly,
+`vegg.pack` applies the same ideas to in-memory values and restores them exactly,
 including NaN payloads, `-0.0`, numpy dtypes and shapes. For one million values:
 
-| data                          | json + gzip-9 | pickle + zstd-19 | numpy + xz-9 | **dc.pack** |
+| data                          | json + gzip-9 | pickle + zstd-19 | numpy + xz-9 | **vegg.pack** |
 |-------------------------------|--------------:|-----------------:|-------------:|------------:|
 | prices with 2 decimals        | 2.6 MB        | 2.8 MB           | 2.1 MB       | **1.9 MB**  |
 | timestamps, 1 s steps         | 1.6 MB        | 874 KB           | 434 KB       | **261 KB**  |
@@ -282,7 +286,7 @@ and `"Infinity"`, and read back as floats.
   JSON objects become structs, and a repeated key keeps its last value).
   pyarrow's `timestamp[s]` columns keep their time zone. Feather version 1 files
   are read by the arrow engine only.
-- **Verification.** `dataconv verify a b` compares contents across formats and
+- **Verification.** `vegg verify a b` compares contents across formats and
   reports the first differences; DCZ checks a CRC-32 per block and for the
   whole file.
 
@@ -301,9 +305,9 @@ Everything adapts to the machine:
 | memory        | available RAM, cgroup limits, 32-bit address space             | chunk size, chunks in flight, row group size |
 | data          | sampled field widths, cardinality, measured output size        | dictionary use, encodings, split sizes |
 
-Override with `--threads`, `--memory 2GB`, or the `DATACONV_THREADS` and
-`DATACONV_MEMORY` environment variables. `dataconv doctor` shows what was
-detected, and `DATACONV_TRACE=1` prints phase timings for a job.
+Override with `--threads`, `--memory 2GB`, or the `VEGG_THREADS` and
+`VEGG_MEMORY` environment variables. `vegg doctor` shows what was
+detected, and `VEGG_TRACE=1` prints phase timings for a job.
 
 Directory conversion runs several files at once when they are small and gives
 large files all the threads. `--skip-existing` makes repeated runs incremental.
@@ -311,20 +315,20 @@ large files all the threads. `--skip-existing` makes repeated runs incremental.
 ## Command reference
 
 ```text
-dataconv convert SRC [DST] [options]   convert a file or a directory tree
-dataconv compress SRC [DST]            lossless DCZ compression of any file, byte for byte
-dataconv decompress SRC [DST]          restore the original bytes (a .gz stays a .gz)
-dataconv split SRC DIR --rows N | --size SIZE [--to FORMAT] [--pattern P]
-dataconv merge SRC... -o DST           concatenate, unifying schemas
-dataconv info FILE [--exact]           format, rows, schema, codecs, statistics
-dataconv head FILE [-n N]              first rows
-dataconv count FILE                    exact row count
-dataconv schema FILE                   inferred column types
-dataconv sniff FILE                    detected CSV dialect
-dataconv stats FILE                    per-column profile
-dataconv verify A B                    same data? (exit code 1 if not)
-dataconv bench FILE [--quick]          compare formats and codecs on this data
-dataconv doctor                        resources, engines and codecs
+vegg convert SRC [DST] [options]   convert a file or a directory tree
+vegg compress SRC [DST]            lossless DCZ compression of any file, byte for byte
+vegg decompress SRC [DST]          restore the original bytes (a .gz stays a .gz)
+vegg split SRC DIR --rows N | --size SIZE [--to FORMAT] [--pattern P]
+vegg merge SRC... -o DST           concatenate, unifying schemas
+vegg info FILE [--exact]           format, rows, schema, codecs, statistics
+vegg head FILE [-n N]              first rows
+vegg count FILE                    exact row count
+vegg schema FILE                   inferred column types
+vegg sniff FILE                    detected CSV dialect
+vegg stats FILE                    per-column profile
+vegg verify A B                    same data? (exit code 1 if not)
+vegg bench FILE [--quick]          compare formats and codecs on this data
+vegg doctor                        resources, engines and codecs
 ```
 
 Frequently used options:
@@ -363,21 +367,21 @@ All options of the `convert` command are keyword arguments: `to`, `profile`,
 `skip_rows`, `null_values`, `bad_lines`, `quarantine`, `columns`, `limit`,
 `threads`, `memory`, `overwrite`, `engine`, and `progress` (`True` for a progress
 bar, or a callable `(done_bytes, total_bytes)` that returns `False` to cancel).
-Errors derive from `dataconv.DataconvError`.
+Errors derive from `vegg.VeggError`.
 
 ## Engines and portability
 
 | engine | needs | reads and writes | speed |
 |--------|-------|------------------|-------|
-| `native` | the `dataconv-native` wheel (CPython 3.9+, one abi3 wheel per platform) | CSV/TSV, JSON Lines, Parquet, Arrow IPC, DCZ | fastest |
+| `native` | a platform wheel of vegg (CPython 3.9+; one abi3 wheel per platform) | CSV/TSV, JSON Lines, Parquet, Arrow IPC, DCZ | fastest |
 | `arrow` | pyarrow | all of the above plus JSON arrays, ORC and Excel (needs openpyxl) | fast |
 | `pure` | nothing (Python 3.8+) | CSV/TSV, JSON Lines, JSON, DCZ | portable |
 
 `--engine auto` (the default) picks the first engine that handles both formats.
 All engines apply the same type rules and read and write the same DCZ files,
 which the test suite cross-checks. The suite runs on Python 3.8 to 3.14, with and
-without each optional package; set `DATACONV_DISABLE=all` (or a list such as
-`dataconv_native,pyarrow`) to try the fallbacks yourself.
+without each optional package; set `VEGG_DISABLE=all` (or a list such as
+`native,pyarrow`) to try the fallbacks yourself.
 
 The native engine is plain Rust with no system dependencies. It builds for
 Windows, macOS and Linux on x86-64 and ARM64, and from source wherever Rust runs.
@@ -385,9 +389,10 @@ Windows, macOS and Linux on x86-64 and ARM64, and from source wherever Rust runs
 ## Architecture
 
 ```text
-dataconv (Python)                         dataconv-native (Rust, PyO3, abi3)
-  cli.py      command line                  python/   bindings (GIL released, Ctrl-C aware)
-  api.py      public API, engine choice     core/     the engine
+src/vegg/ (Python)                        native/ (Rust)
+  cli.py      command line                  python/   vegg._rust: PyO3 bindings (abi3, GIL
+  api.py      public API, engine choice               released, Ctrl-C aware)
+                                            core/     the engine (crate vegg-core)
   engines/    native | arrow | pure           chunk.rs     quote-aware record-aligned chunks
   infer.py    lossless type rules             tokenize.rs  zero-copy CSV tokenizer
   _sniff.py   dialect detection               types.rs     lossless type rules
@@ -398,25 +403,33 @@ dataconv (Python)                         dataconv-native (Rust, PyO3, abi3)
                                               split.rs     byte-exact and size-targeted splits
                                               dcz/         columnar codec, container, int coding
                                               pack.rs      value packing
-                                            cli/      standalone `dataconv` binary
+                                            cli/      standalone `vegg` binary (crate vegg)
 ```
 
 ## Development
 
 ```bash
-pip install -e ".[dev,arrow,fast]"
-pip install ./native/python             # or: cd native/python && maturin develop --release
+pip install -e ".[dev,arrow,fast]"      # in a virtual environment
+pip install maturin
+maturin develop --release               # build the native engine into src/vegg
 pytest                                  # Python suite (all engines available)
-DATACONV_DISABLE=all pytest             # the pure-Python fallbacks only
+VEGG_DISABLE=all pytest                 # the pure-Python fallbacks only
 cd native && cargo test                 # Rust unit and integration tests
 ```
+
+`pyproject.toml` describes two builds of the same package: `python -m build`
+makes the sdist and the pure-Python wheel, and `maturin build --release` makes
+the platform wheel with the native engine.
 
 Changes to the type rules, the CSV and JSON rules or DCZ must be made in both
 implementations; `tests/test_infer.py`, `tests/test_csv_rules.py`,
 `tests/test_json_rules.py` and `tests/test_dcz.py` check that they agree.
 
-Release artifacts come from the release workflow. To build them on your own
-machine, run `python native/build_release.py`. Rust embeds the source path of
+Releases come from the release workflow: a pushed tag `vX.Y.Z` builds the
+wheels, the sdist and the binaries, installs the wheels on every OS, then
+publishes to PyPI and crates.io (trusted publishing) and creates a GitHub release
+with checksums. To build the native artifacts on your own machine, run
+`python native/build_release.py`. Rust embeds the source path of
 every crate in panic messages, so a plain build names your home directory. The
 script remaps the paths of the build machine (home directory, cargo home,
 checkout), builds the binary and the wheel into `dist/`, and fails if either

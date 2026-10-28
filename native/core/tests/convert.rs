@@ -7,8 +7,8 @@ use std::sync::Arc;
 use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::{DataType, Float64Type, Int64Type, TimeUnit};
 use common::TestDir;
-use dataconv_core::convert::{convert, BadLines, ConvertOptions, NoHooks};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use vegg_core::convert::{convert, BadLines, ConvertOptions, NoHooks};
 
 fn dir(name: &str) -> TestDir {
     TestDir::new(name)

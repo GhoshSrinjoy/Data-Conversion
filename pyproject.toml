@@ -1,3 +1,8 @@
+# One project, two builds:
+#   python -m build        the pure-Python wheel and the sdist (hatchling, any Python 3.8+)
+#   maturin build -r       the platform wheels: the same package plus the Rust engine as
+#                          vegg._rust (configured under [tool.maturin] below)
+# pip prefers a platform wheel where one fits and falls back to the pure wheel elsewhere.
 [build-system]
 # hatchling 1.27 is the last release for Python 3.8 and 3.9, and it already writes
 # license expressions (PEP 639); setuptools only does from version 77, which needs 3.9
@@ -5,13 +10,13 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
-name = "dataconv"
+name = "vegg"
 version = "1.0.0"
-description = "Fast, lossless, resource-aware data conversion and compression for CSV, Parquet, Arrow, JSON and more"
+description = "Fast, lossless conversion and compression for CSV, Parquet, Arrow, JSON and more"
 readme = "README.md"
 requires-python = ">=3.8"
 license = "PolyForm-Noncommercial-1.0.0"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "native/THIRD_PARTY_LICENSES.md"]
 authors = [{ name = "Srinjoy Ghosh" }]
 keywords = ["csv", "parquet", "arrow", "compression", "conversion", "lossless", "etl", "data-engineering"]
 classifiers = [
@@ -23,6 +28,7 @@ classifiers = [
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
+    "Programming Language :: Rust",
     "Topic :: Database",
     "Topic :: Scientific/Engineering",
     "Topic :: System :: Archiving :: Compression",
@@ -31,24 +37,39 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-# The Rust engine: fastest path, no other dependencies (CPython 3.9+ wheels).
-native = ["dataconv-native==1.0.0; python_version >= '3.9'"]
 # pyarrow engine: ORC, Excel/JSON arrays, in-memory tables (load/write/merge/stats).
 arrow = ["pyarrow>=10"]
 # Extra codecs and better resource detection for the pure-Python engine.
 fast = ["zstandard>=0.15", "lz4>=3", "brotli>=1", "numpy>=1.20", "psutil>=5"]
 excel = ["openpyxl>=3"]
-all = ["dataconv[native,arrow,fast,excel]"]
+all = ["vegg[arrow,fast,excel]"]
 dev = ["pytest>=7", "ruff>=0.5"]
 
+[project.urls]
+Homepage = "https://github.com/GhoshSrinjoy/vegg"
+Source = "https://github.com/GhoshSrinjoy/vegg"
+Issues = "https://github.com/GhoshSrinjoy/vegg/issues"
+Changelog = "https://github.com/GhoshSrinjoy/vegg/blob/main/CHANGELOG.md"
+
 [project.scripts]
-dataconv = "dataconv.cli:main"
+vegg = "vegg.cli:main"
+
+[tool.maturin]
+manifest-path = "native/python/Cargo.toml"
+python-source = "src"
+module-name = "vegg._rust"
+features = ["pyo3/extension-module"]
+strip = true
+
+[tool.maturin.sbom]
+# no SBOM generated from cargo metadata: it names local crates by their path on disk
+rust = false
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/dataconv"]
+packages = ["src/vegg"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src", "tests", "docs", "README.md", "CHANGELOG.md", "LICENSE"]
+include = ["/src", "/tests", "/docs", "/README.md", "/CHANGELOG.md", "/LICENSE", "/native/THIRD_PARTY_LICENSES.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

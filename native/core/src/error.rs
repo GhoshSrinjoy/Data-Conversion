@@ -2,7 +2,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 /// Errors surfaced by the native engine.  The Python binding maps each kind to the
-/// matching `dataconv.errors` exception.
+/// matching `vegg.errors` exception.
 #[derive(Debug)]
 pub enum Error {
     Io {

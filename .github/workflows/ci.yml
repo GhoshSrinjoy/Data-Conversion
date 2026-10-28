@@ -92,22 +92,26 @@ jobs:
       - name: Tests, pure Python only
         run: python -m pytest -q
         env:
-          DATACONV_DISABLE: all
+          VEGG_DISABLE: all
       - name: Install pyarrow and codecs
         run: python -m pip install pyarrow numpy zstandard lz4 brotli psutil openpyxl
       - name: Tests, pyarrow engine
         run: python -m pytest -q
         env:
-          DATACONV_DISABLE: dataconv_native
+          VEGG_DISABLE: native
       - uses: dtolnay/rust-toolchain@stable
         if: matrix.python != '3.8'
       - uses: Swatinem/rust-cache@v2
         if: matrix.python != '3.8'
         with:
           workspaces: native
-      - name: Build the native engine
+      - name: Build and install the wheel with the native engine
         if: matrix.python != '3.8'
-        run: python -m pip install ./native/python
+        shell: bash
+        run: |
+          python -m pip install "maturin>=1.5,<2"
+          maturin build --release --interpreter python --out wheelhouse
+          python -m pip install --force-reinstall --no-deps wheelhouse/*.whl
       - name: Tests, all engines
         if: matrix.python != '3.8'
         run: python -m pytest -q

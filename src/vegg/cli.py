@@ -1,4 +1,4 @@
-"""Command-line interface: ``dataconv <command> ...`` (also ``python -m dataconv``)."""
+"""Command-line interface: ``vegg <command> ...`` (also ``python -m vegg``)."""
 
 from __future__ import annotations
 
@@ -12,18 +12,18 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from . import __version__
 from ._util import format_count, format_size
-from .errors import DataconvError
+from .errors import VeggError
 
 EPILOG = """examples:
-  dataconv convert data.csv data.parquet              lossless types, parallel, auto-tuned
-  dataconv convert data.csv --to parquet --profile max
-  dataconv convert exports/ --to parquet -o lake/     a whole directory tree, in parallel
-  dataconv compress huge.csv                          huge.csv.dcz, restores byte-exact
-  dataconv split big.csv parts/ --size 100MB --to parquet
-  dataconv info data.parquet                          schema, row groups, codecs, stats
-  dataconv head data.csv -n 20
-  dataconv bench data.csv                             which format/codec suits this data
-  dataconv doctor                                     what this machine can do
+  vegg convert data.csv data.parquet              lossless types, parallel, auto-tuned
+  vegg convert data.csv --to parquet --profile max
+  vegg convert exports/ --to parquet -o lake/     a whole directory tree, in parallel
+  vegg compress huge.csv                          huge.csv.dcz, restores byte-exact
+  vegg split big.csv parts/ --size 100MB --to parquet
+  vegg info data.parquet                          schema, row groups, codecs, stats
+  vegg head data.csv -n 20
+  vegg bench data.csv                             which format/codec suits this data
+  vegg doctor                                     what this machine can do
 """
 
 
@@ -164,7 +164,7 @@ def cmd_split(args: argparse.Namespace) -> int:
     from .api import split
 
     if args.rows is None and args.size is None:
-        raise DataconvError("give --rows N or --size SIZE")
+        raise VeggError("give --rows N or --size SIZE")
     opts = _opts(args, *READ_OPTS, "profile", "compression", "level", "overwrite")
     report = split(args.src, args.out_dir, rows=args.rows, size=args.size, to=args.to, pattern=args.pattern,
                    extension=args.extension, progress=args.progress, **opts)
@@ -320,6 +320,7 @@ def cmd_bench(args: argparse.Namespace) -> int:
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
+    from . import _native
     from .api import plan, system_info
 
     info = system_info()
@@ -327,7 +328,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         info["plan_10GB"] = plan(10 << 30)
         _print_json(info)
         return 0
-    print(f"dataconv {__version__}  (native engine: {info.get('native_version') or 'not installed'})")
+    print(f"vegg {__version__}  (native engine: {info.get('native_version') or 'not installed'})")
     print(f"python   {info['python']} {info['implementation']} {info['bits']}-bit"
           f"{'' if info['gil'] else ' free-threaded'} on {info['os']} {info['os_release']} ({info['arch']})")
     limit = f", container limit {format_size(info['mem_limit'])}" if info.get("mem_limit") else ""
@@ -346,9 +347,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
           f"{format_size(p['chunk_size'])} chunks")
     tips = []
     if "native" not in info["engines"]:
-        tips.append('install the native engine for 5-50x faster conversions: pip install "dataconv[native]"')
+        tips.append(f"{_native.MISSING} (5-50x faster conversions)")
     if "arrow" not in info["engines"]:
-        tips.append('install pyarrow for ORC/Excel/JSON-array support and in-memory tables: pip install "dataconv[arrow]"')
+        tips.append('install pyarrow for ORC/Excel/JSON-array support and in-memory tables: pip install "vegg[arrow]"')
     for t in tips:
         print(f"tip      {t}")
     return 0
@@ -356,12 +357,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="dataconv",
+        prog="vegg",
         description="Fast, lossless, resource-aware data conversion and compression.",
         epilog=EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--version", action="version", version=f"dataconv {__version__}")
+    parser.add_argument("--version", action="version", version=f"vegg {__version__}")
     out = argparse.ArgumentParser(add_help=False)
     out.add_argument("--json", action="store_true", help="machine-readable output")
     out.add_argument("-q", "--quiet", action="store_true")
@@ -482,8 +483,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     except KeyboardInterrupt:
         print("\ninterrupted (no partial output was left behind)", file=sys.stderr)
         return 130
-    except (DataconvError, OSError, ValueError) as exc:
-        print(f"dataconv: error: {exc}", file=sys.stderr)
+    except (VeggError, OSError, ValueError) as exc:
+        print(f"vegg: error: {exc}", file=sys.stderr)
         return 1
 
 

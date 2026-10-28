@@ -1,8 +1,8 @@
 # Third-party licenses
 
-The native engine (`dataconv-native`) and the standalone `dataconv` binary include
-the open-source components below. Regenerate this file with
-`python native/scripts/third_party_licenses.py`.
+The native engine (`vegg._rust`, in vegg's platform wheels) and the standalone
+`vegg` binary include the open-source components below. Regenerate this file
+with `python native/scripts/third_party_licenses.py`.
 
 | component | version | license |
 |-----------|---------|---------|

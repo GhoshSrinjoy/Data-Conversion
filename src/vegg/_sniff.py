@@ -140,7 +140,7 @@ def decode_sample(raw: bytes, encoding: str, complete: bool) -> str:
     encoding = _io.python_codec(encoding)
     utf8 = codecs.lookup(encoding).name == "utf-8"
     data = raw if complete or not utf8 else trim_partial_utf8(raw)
-    errors = "dataconv-c1" if _io.text_errors(encoding) == "dataconv-c1" else "replace"
+    errors = "vegg-c1" if _io.text_errors(encoding) == "vegg-c1" else "replace"
     return data.decode(encoding, errors=errors).lstrip("﻿")
 
 

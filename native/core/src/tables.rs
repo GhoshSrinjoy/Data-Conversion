@@ -232,7 +232,7 @@ impl ParquetOptions {
             .set_coerce_types(true)
             .set_compression(codec)
             .set_writer_version(version)
-            .set_created_by(format!("dataconv {}", crate::VERSION))
+            .set_created_by(format!("vegg {}", crate::VERSION))
             .set_max_row_group_row_count(Some(rows_hint.max(1)))
             .set_statistics_enabled(if self.statistics.unwrap_or(true) {
                 EnabledStatistics::Page
@@ -1176,7 +1176,7 @@ impl JsonlSource {
         let wave = wave.max(1);
         let (tx, chunks) = std::sync::mpsc::sync_channel(wave * 2);
         std::thread::Builder::new()
-            .name("dataconv-jsonl-reader".into())
+            .name("vegg-jsonl-reader".into())
             .spawn(move || {
                 let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
                     match chunker.next_chunk() {

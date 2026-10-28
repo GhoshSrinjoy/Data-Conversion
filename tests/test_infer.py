@@ -1,7 +1,7 @@
 import pytest
 
-from dataconv import infer
-from dataconv.infer import ColumnStats, LogicalType, parse_float, parse_type
+from vegg import infer
+from vegg.infer import ColumnStats, LogicalType, parse_float, parse_type
 
 
 def decide(values, mode="infer"):
@@ -83,10 +83,10 @@ def test_days_from_civil():
     assert infer.parse_date("1969-12-31") == -1
 
 
-@pytest.mark.skipif(not __import__("dataconv")._native.available(), reason="native engine not installed")
+@pytest.mark.skipif(not __import__("vegg")._native.available(), reason="native engine not installed")
 def test_python_rules_match_native(tmp_path):
     """Differential test: both engines must assign the same type to every column."""
-    import dataconv as dc
+    import vegg
 
     columns = {
         "ints": ["1", "-2", "", "NA"],
@@ -104,7 +104,7 @@ def test_python_rules_match_native(tmp_path):
     lines = [",".join(names)] + [",".join(columns[n][i] for n in names) for i in range(4)]
     src = tmp_path / "cols.csv"
     src.write_text("\n".join(lines) + "\n")
-    native = dict(dc.convert(src, tmp_path / "n.jsonl", engine="native").schema)
+    native = dict(vegg.convert(src, tmp_path / "n.jsonl", engine="native").schema)
     for name in names:
         assert native[name] == decide(columns[name]), name
 

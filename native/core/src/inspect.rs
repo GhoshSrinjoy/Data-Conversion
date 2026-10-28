@@ -89,7 +89,7 @@ pub fn head(path: &Path, n: usize, opts: &ConvertOptions) -> Result<Preview> {
             // Convert the first rows to Arrow IPC in memory, through the regular
             // pipeline so the preview shows exactly the types a conversion would use.
             let dir = std::env::temp_dir();
-            let tmp = io::temp_sibling(&dir.join("dataconv-head.arrow"), "head");
+            let tmp = io::temp_sibling(&dir.join("vegg-head.arrow"), "head");
             let mut o = opts.clone();
             o.limit = Some(n as u64);
             o.to = Some("ipc".into());

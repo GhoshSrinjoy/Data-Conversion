@@ -45,7 +45,7 @@ def bench(src: PathLike, *, quick: bool = False, read: bool = True, keep: Option
     size_in = src.stat().st_size
     cases = [c for c in FULL if not quick or c[0] in QUICK]
     have_dcz_text = True
-    tmp = Path(keep) if keep else Path(tempfile.mkdtemp(prefix="dataconv-bench-"))
+    tmp = Path(keep) if keep else Path(tempfile.mkdtemp(prefix="vegg-bench-"))
     tmp.mkdir(parents=True, exist_ok=True)
     results: List[Dict[str, Any]] = []
     try:

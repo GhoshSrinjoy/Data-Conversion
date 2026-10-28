@@ -1,7 +1,7 @@
 """Parquet compression profiles and per-column encoding tuning (pyarrow writer).
 
 The native engine has its own tuner; this one serves the arrow engine and
-``dataconv.write``.  Profiles:
+``vegg.write``.  Profiles:
 
 * ``fast``     - zstd level 1, dictionary encoding
 * ``balanced`` - zstd level 3, dictionary encoding (widely compatible)

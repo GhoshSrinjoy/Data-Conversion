@@ -8,10 +8,10 @@ from pathlib import Path
 
 import pytest
 
-import dataconv as dc
+import vegg
 from conftest import ENGINES, needs_arrow
-from dataconv import _csvtok, _sniff
-from dataconv.engines import pure
+from vegg import _csvtok, _sniff
+from vegg.engines import pure
 
 BS = "\\"
 
@@ -86,7 +86,7 @@ def test_stray_quotes_are_malformed_rows(tmp_path, engine):
     src = tmp_path / "stray.csv"
     put(src, 'id,a,note\n1,x,ok\n10,a,"note10\n11,b,fine\n15,b,note"15\n16,d,end\n17,e,"unclosed\n18,f,last\n')
     out = tmp_path / "s.jsonl"
-    r = dc.convert(src, out, engine=engine)
+    r = vegg.convert(src, out, engine=engine)
     # S4c: a stray quote that pairs with a later quote followed by text (15) costs its
     # own line only, like one that is never closed (17); the later quote is literal
     assert [x["id"] for x in rows(out)] == [1, 11, 15, 16, 18]
@@ -95,14 +95,14 @@ def test_stray_quotes_are_malformed_rows(tmp_path, engine):
     assert any("2 malformed rows moved to" in w for w in r.warnings), r.warnings
     rejected = Path(r.quarantine).read_text(encoding="utf-8")
     assert rejected == 'id,a,note\n10,a,"note10\n17,e,"unclosed\n'
-    assert dc.count(src, engine=engine) == 7  # records: rows and malformed ones
+    assert vegg.count(src, engine=engine) == 7  # records: rows and malformed ones
     assert r.irregular_records == 2
     # a stray paired with a quote that ends a field is valid CSV: one record over the
     # lines between them (here of the wrong width)
     lines = [f"{i},name{i},{i}" for i in range(20)]
     lines[3], lines[8] = '3,"name3,3', '8,name8,8"'
     put(src, "id,name,v\n" + "\n".join(lines) + "\n")
-    r = dc.convert(src, out, engine=engine, overwrite=True)
+    r = vegg.convert(src, out, engine=engine, overwrite=True)
     assert (r.rows, r.bad_rows) == (14, 1)
     assert any("1 malformed rows (6 lines)" in w for w in r.warnings), r.warnings
 
@@ -112,7 +112,7 @@ def test_one_line_lenient_quotes_stay_values(tmp_path, engine):
     src = tmp_path / "l.csv"
     put(src, 'id,item\n1,"12" monitor\n2,x\n')
     out = tmp_path / "l.jsonl"
-    r = dc.convert(src, out, engine=engine)
+    r = vegg.convert(src, out, engine=engine)
     assert rows(out)[0]["item"] == "12 monitor"
     assert r.bad_rows == 0 and r.irregular_records == 1
 
@@ -121,7 +121,7 @@ def test_one_line_lenient_quotes_stay_values(tmp_path, engine):
 def test_a_literal_quote_does_not_change_types(tmp_path, engine):
     src = tmp_path / "tv.csv"
     put(src, 'id,size,price\n1,55" screen,499.99\n2,65 inch,799.50\n')
-    r = dc.convert(src, tmp_path / "tv.jsonl", engine=engine)
+    r = vegg.convert(src, tmp_path / "tv.jsonl", engine=engine)
     assert dict(r.schema) == {"id": "int64", "size": "string", "price": "float64"}
     assert r.warnings == []
 
@@ -132,14 +132,14 @@ def test_blank_lines(tmp_path, engine):
     one = tmp_path / "one.csv"
     put(one, 'x\na\n\n""\nb\n')
     out = tmp_path / "one.jsonl"
-    r = dc.convert(one, out, engine=engine)
+    r = vegg.convert(one, out, engine=engine)
     assert [x["x"] for x in rows(out)] == ["a", None, "", "b"]
-    assert dc.count(one, engine=engine) == r.rows == 4
+    assert vegg.count(one, engine=engine) == r.rows == 4
     wide = tmp_path / "wide.csv"
     put(wide, "a,b\n1,2\n\n3,4\r\n\r\n")
-    r = dc.convert(wide, tmp_path / "wide.jsonl", engine=engine)
+    r = vegg.convert(wide, tmp_path / "wide.jsonl", engine=engine)
     assert (r.rows, r.blank_lines) == (2, 2)
-    assert dc.count(wide, engine=engine) == 2
+    assert vegg.count(wide, engine=engine) == 2
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -147,7 +147,7 @@ def test_header_with_a_quoted_line_break(tmp_path, engine):
     src = tmp_path / "h.csv"
     put(src, '"first\nname",age\nann,3\nbob,4\n')
     out = tmp_path / "h.jsonl"
-    r = dc.convert(src, out, engine=engine)
+    r = vegg.convert(src, out, engine=engine)
     assert [n for n, _ in r.schema] == ["first\nname", "age"]
     assert rows(out) == [{"first\nname": "ann", "age": 3}, {"first\nname": "bob", "age": 4}]
 
@@ -156,7 +156,7 @@ def test_header_with_a_quoted_line_break(tmp_path, engine):
 def test_header_only_file_without_a_line_break(tmp_path, engine):
     src = tmp_path / "h.csv"
     put(src, "a,b,c")
-    r = dc.convert(src, tmp_path / "h.jsonl", engine=engine)
+    r = vegg.convert(src, tmp_path / "h.jsonl", engine=engine)
     assert r.rows == 0 and [n for n, _ in r.schema] == ["a", "b", "c"]
 
 
@@ -165,7 +165,7 @@ def test_bool_columns_with_missing_values(tmp_path, engine):
     src = tmp_path / "b.csv"
     put(src, "id,flag\n1,true\n2,\n3,NA\n4,false\n")
     out = tmp_path / "b.jsonl"
-    r = dc.convert(src, out, engine=engine)
+    r = vegg.convert(src, out, engine=engine)
     assert dict(r.schema)["flag"] == "bool"
     assert [x["flag"] for x in rows(out)] == [True, None, None, False]
 
@@ -175,7 +175,7 @@ def test_loose_integers_with_a_plus_sign(tmp_path, engine):
     src = tmp_path / "l.csv"
     put(src, "a\n+5\n007\n-3\n")
     out = tmp_path / "l.jsonl"
-    r = dc.convert(src, out, engine=engine, types="loose")
+    r = vegg.convert(src, out, engine=engine, types="loose")
     assert dict(r.schema)["a"] == "int64"
     assert [x["a"] for x in rows(out)] == [5, 7, -3]
 
@@ -185,7 +185,7 @@ def test_no_quoting_keeps_empty_fields_missing(tmp_path, engine):
     src = tmp_path / "n.csv"
     put(src, 'a,b\nx,\n,"y"\n')
     out = tmp_path / "n.jsonl"
-    dc.convert(src, out, engine=engine, quote="none")
+    vegg.convert(src, out, engine=engine, quote="none")
     assert rows(out) == [{"a": "x", "b": None}, {"a": None, "b": '"y"'}]
 
 
@@ -194,24 +194,24 @@ def test_latin1_is_iso_8859_1(tmp_path, engine):
     src = tmp_path / "l.csv"
     src.write_bytes(b"name,v\nA\x80B\xe9,1\n")
     out = tmp_path / "l.jsonl"
-    dc.convert(src, out, engine=engine, encoding="latin-1")
+    vegg.convert(src, out, engine=engine, encoding="latin-1")
     assert rows(out)[0]["name"] == "A\u0080B\u00e9"
 
 
 def test_latin1_reaches_the_native_engine_as_latin1():
     for name in ("latin-1", "latin1", "ISO-8859-1", "iso8859_1"):
-        assert dc.ConvertOptions.build(encoding=name).native_encoding() == "latin-1"
-    assert dc.ConvertOptions.build(encoding="cp1252").native_encoding() == "windows-1252"
+        assert vegg.ConvertOptions.build(encoding=name).native_encoding() == "latin-1"
+    assert vegg.ConvertOptions.build(encoding="cp1252").native_encoding() == "windows-1252"
 
 
 @needs_arrow
 def test_arrow_chunks_with_escapes_and_utf16(tmp_path):
-    from dataconv.engines import arrow
+    from vegg.engines import arrow
 
     lines = ["id,text"] + [f'{i},"he said {BS}"hi{BS}" {i}"' if i % 7 == 0 else f'{i},"multi\nline {i}"' for i in range(300)]
     src = tmp_path / "e.csv"
     put(src, "\n".join(lines) + "\n")
-    o = dc.ConvertOptions.build()
+    o = vegg.ConvertOptions.build()
     d = pure._dialect(src, "csv", o)
     assert d.escape == BS
     reader = arrow.CsvReader(src, "csv", d, o, chunk_size=64)  # many chunk boundaries
@@ -245,13 +245,13 @@ def test_sniffer_rules(tmp_path):
 
 
 def test_dialect_options_are_single_characters():
-    assert dc.ConvertOptions.build(delimiter="\\t", out_delimiter="tab", quote="none").to_dict()["delimiter"] == "\t"
-    o = dc.ConvertOptions.build(out_delimiter="\\t")
+    assert vegg.ConvertOptions.build(delimiter="\\t", out_delimiter="tab", quote="none").to_dict()["delimiter"] == "\t"
+    o = vegg.ConvertOptions.build(out_delimiter="\\t")
     assert o.out_delimiter == "\t"
-    with pytest.raises(dc.OptionsError):
-        dc.ConvertOptions.build(delimiter=";;")
-    with pytest.raises(dc.OptionsError):
-        dc.ConvertOptions.build(out_delimiter="none")
+    with pytest.raises(vegg.OptionsError):
+        vegg.ConvertOptions.build(delimiter=";;")
+    with pytest.raises(vegg.OptionsError):
+        vegg.ConvertOptions.build(out_delimiter="none")
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -259,7 +259,7 @@ def test_out_delimiter_names(tmp_path, engine):
     src = tmp_path / "c.csv"
     put(src, "a,b\n1,2\n")
     out = tmp_path / "c.txt"
-    dc.convert(src, out, engine=engine, to="csv", out_delimiter="\\t")
+    vegg.convert(src, out, engine=engine, to="csv", out_delimiter="\\t")
     assert out.read_bytes() == b"a\tb\n1\t2\n"
 
 
@@ -268,24 +268,24 @@ def test_rejected_rows_file(tmp_path, engine):
     src = tmp_path / "q.csv"
     put(src, 'a;b;c\n1;x;2\n2;"has;semi";3;extra\n3;y\n')
     out = tmp_path / "q.jsonl"
-    r = dc.convert(src, out, engine=engine)
+    r = vegg.convert(src, out, engine=engine)
     # S5: the header uses the source delimiter; rows are the records as written
     assert Path(r.quarantine).read_text() == 'a;b;c\n2;"has;semi";3;extra\n3;y\n'
     # an existing rejected-rows file is not replaced without overwrite
     out.unlink()
     with pytest.raises(FileExistsError):
-        dc.convert(src, out, engine=engine)
+        vegg.convert(src, out, engine=engine)
     assert not out.exists()
     # ...and a stale one goes away when a rerun rejects nothing
     clean = tmp_path / "clean.csv"
     put(clean, "a;b;c\n1;x;2\n")
     stale = tmp_path / "clean.jsonl.rejected.csv"
     put(stale, "old")
-    dc.convert(clean, tmp_path / "clean.jsonl", engine=engine, overwrite=True)
+    vegg.convert(clean, tmp_path / "clean.jsonl", engine=engine, overwrite=True)
     assert not stale.exists()
     # the input file is never used for rejected rows
-    with pytest.raises(dc.OptionsError):
-        dc.convert(src, tmp_path / "x.jsonl", engine=engine, quarantine=str(src), overwrite=True)
+    with pytest.raises(vegg.OptionsError):
+        vegg.convert(src, tmp_path / "x.jsonl", engine=engine, quarantine=str(src), overwrite=True)
     assert src.read_text().startswith("a;b;c")
 
 
@@ -294,7 +294,7 @@ def test_padded_rows_and_their_rejects(tmp_path, engine):
     src = tmp_path / "p.csv"
     put(src, 'a,b,c\n1,2\n3,"x,y",4,5\n6,7,8\n')
     out = tmp_path / "p.jsonl"
-    r = dc.convert(src, out, engine=engine, bad_lines="pad")
+    r = vegg.convert(src, out, engine=engine, bad_lines="pad")
     assert rows(out) == [{"a": 1, "b": 2, "c": None}, {"a": 6, "b": 7, "c": 8}]
     assert Path(r.quarantine).read_text() == 'a,b,c\n3,"x,y",4,5\n'
 
@@ -304,7 +304,7 @@ def test_columns_in_a_new_order(tmp_path, engine):
     src = tmp_path / "o.csv"
     put(src, "a,b,c\n1,x,2024-01-01\n2,y,2024-01-02\n")
     out = tmp_path / "o.jsonl"
-    r = dc.convert(src, out, engine=engine, columns=["b", "a", "c"])
+    r = vegg.convert(src, out, engine=engine, columns=["b", "a", "c"])
     assert [n for n, _ in r.schema] == ["b", "a", "c"]
     assert rows(out)[0] == {"b": "x", "a": 1, "c": "2024-01-01"}
 
@@ -418,12 +418,12 @@ def test_regular_runs_around_irregular_records(tmp_path, engine):
     src = tmp_path / "runs.csv"
     put(src, "\r\n".join(lines) + "\r\n")
     out = tmp_path / "runs.jsonl"
-    r = dc.convert(src, out, engine=engine, types="string")
+    r = vegg.convert(src, out, engine=engine, types="string")
     got = rows(out)
     assert (r.rows, r.bad_rows, r.blank_lines, r.irregular_records) == (2994, 3, 3, 5)
     assert got[0] == {"id": "0", "name": None, "note": ""} and got[1] == {"id": "1", "name": "n, 1", "note": 'l\r\nm "q"'}
     assert {"id": "5", "name": "ab", "note": "x"} in got and {"id": "7", "name": '5"7', "note": "y"} in got
-    assert dc.count(src, engine=engine) == r.rows + r.bad_rows  # records, malformed ones too
+    assert vegg.count(src, engine=engine) == r.rows + r.bad_rows  # records, malformed ones too
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -431,7 +431,7 @@ def test_line_breaks_and_empty_fields_in_regular_runs(tmp_path, engine):
     src = tmp_path / "le.csv"
     put(src, 'a,b,c\r\n1,,""\r2,"",\n3,"x\ry",z\r\n4,,\n')
     out = tmp_path / "le.jsonl"
-    dc.convert(src, out, engine=engine, types="string")
+    vegg.convert(src, out, engine=engine, types="string")
     assert rows(out) == [
         {"a": "1", "b": None, "c": ""},
         {"a": "2", "b": "", "c": None},
@@ -455,15 +455,15 @@ def test_one_column_whose_values_hold_a_delimiter(tmp_path, engine):
         src = tmp_path / f"{name}.csv"
         put(src, text)
         header = text.splitlines()[0]
-        d = dc.sniff(src, engine=engine)
+        d = vegg.sniff(src, engine=engine)
         assert (len(d["columns"]), d["skip_rows"], d["header"], d["columns"][0]) == (1, 0, True, header), name
         out = tmp_path / f"{name}.jsonl"
-        assert dc.convert(src, out, engine=engine, types="string").rows == 50
+        assert vegg.convert(src, out, engine=engine, types="string").rows == 50
         assert rows(out)[1] == {header: text.splitlines()[2]}
     # a title line above a real header is still a preamble
     src = tmp_path / "report.csv"
     put(src, "My report\nid;name\n1;a\n2;b\n3;c\n")
-    d = dc.sniff(src, engine=engine)
+    d = vegg.sniff(src, engine=engine)
     assert (d["delimiter"], d["skip_rows"], d["columns"]) == (";", 1, ["id", "name"])
 
 
@@ -479,19 +479,19 @@ def test_options_that_cannot_work_are_refused(tmp_path, engine):
     src = tmp_path / "in.csv"
     put(src, "a,b\n1,2\n")
     out = tmp_path / "out.jsonl"
-    with pytest.raises(dc.OptionsError, match="unknown encoding 'bogus-enc'"):
-        dc.convert(src, out, engine=engine, encoding="bogus-enc")
-    with pytest.raises(dc.OptionsError, match="is also the quote or escape character; they must differ"):
-        dc.convert(src, out, engine=engine, delimiter='"')
-    with pytest.raises(dc.OptionsError, match="must differ"):
-        dc.convert(src, out, engine=engine, delimiter=";", escape=";")
+    with pytest.raises(vegg.OptionsError, match="unknown encoding 'bogus-enc'"):
+        vegg.convert(src, out, engine=engine, encoding="bogus-enc")
+    with pytest.raises(vegg.OptionsError, match="is also the quote or escape character; they must differ"):
+        vegg.convert(src, out, engine=engine, delimiter='"')
+    with pytest.raises(vegg.OptionsError, match="must differ"):
+        vegg.convert(src, out, engine=engine, delimiter=";", escape=";")
     # Python spells encodings with underscores; WHATWG labels are understood too
     for label in ("utf_8", "UTF-8", "x-mac-cyrillic", "unicode-1-1-utf-8", "latin_1"):
-        assert dc.convert(src, out, engine=engine, encoding=label, overwrite=True).rows == 1, label
+        assert vegg.convert(src, out, engine=engine, encoding=label, overwrite=True).rows == 1, label
     # split parts are named by the pattern, never placed elsewhere
     for pattern, ext in (("../x-{n}", None), ("sub/x-{n}", None), ("x-{n}", "/.csv"), (BS.join("ab") + "-{n}", None)):
-        with pytest.raises(dc.OptionsError, match="must be a file name, without folders"):
-            dc.split(src, tmp_path / "parts", rows=1, pattern=pattern, extension=ext, engine=engine)
+        with pytest.raises(vegg.OptionsError, match="must be a file name, without folders"):
+            vegg.split(src, tmp_path / "parts", rows=1, pattern=pattern, extension=ext, engine=engine)
     assert not (tmp_path / "x-0.csv").exists() and not (tmp_path / "parts").exists()
 
 
@@ -502,7 +502,7 @@ def test_trailing_delimiter_at_the_very_end_after_a_quoted_field(tmp_path, engin
     src = tmp_path / "t.csv"
     put(src, 'a,b,c\n1,"x",\n2,"y",')
     out = tmp_path / "t.jsonl"
-    dc.convert(src, out, engine=engine, types="string")
+    vegg.convert(src, out, engine=engine, types="string")
     assert rows(out) == [{"a": "1", "b": "x", "c": None}, {"a": "2", "b": "y", "c": None}]
 
 
@@ -572,18 +572,18 @@ def test_stray_quotes_in_a_large_file(tmp_path, engine):
     src = tmp_path / "big.csv"
     put(src, "\n".join(lines) + "\n")
     out = tmp_path / "big.jsonl"
-    r = dc.convert(src, out, engine=engine, types="string")
+    r = vegg.convert(src, out, engine=engine, types="string")
     assert (r.rows, r.bad_rows) == (19_999, 1), r.warnings
     assert Path(r.quarantine).read_text(encoding="utf-8") == 'id,name,note\n10,name10,"note10\n'
     got = rows(out)
     assert got[14]["note"] == 'note"15' and got[249]["name"] == "Smith250, John"
-    assert dc.count(src, engine=engine) == 20_000
+    assert vegg.count(src, engine=engine) == 20_000
     # a stray quote every 1000 rows, each pairing with the next: one row each
     lines = ["id,name,note"] + [f'{i},"name{i},note{i}' if i % 1000 == 500 else f"{i},name{i},note{i}" for i in range(20_000)]
     put(src, "\n".join(lines) + "\n")
-    r = dc.convert(src, out, engine=engine, types="string", overwrite=True)
+    r = vegg.convert(src, out, engine=engine, types="string", overwrite=True)
     assert (r.rows, r.bad_rows) == (19_980, 20), r.warnings
-    assert dc.count(src, engine=engine) == 20_000
+    assert vegg.count(src, engine=engine) == 20_000
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -591,14 +591,14 @@ def test_a_byte_order_mark_is_never_data(tmp_path, engine):
     src = tmp_path / "bom.csv"
     out = tmp_path / "bom.jsonl"
     src.write_bytes("﻿1,2\n3,4\n".encode("utf-16-le"))
-    dc.convert(src, out, engine=engine, header=False)
+    vegg.convert(src, out, engine=engine, header=False)
     assert rows(out) == [{"column_1": 1, "column_2": 2}, {"column_1": 3, "column_2": 4}]
     for label in ("utf_8", "UTF-8", "utf8"):
         src.write_bytes(b"\xef\xbb\xbfa,b\n1,2\n")
-        dc.convert(src, out, engine=engine, encoding=label, header=False, overwrite=True)
+        vegg.convert(src, out, engine=engine, encoding=label, header=False, overwrite=True)
         assert rows(out)[0] == {"column_1": "a", "column_2": "b"}, label
     src.write_bytes("﻿a,b\n1,2\n".encode("utf-16-le"))
-    dc.convert(src, out, engine=engine, encoding="utf-16-le", header=False, overwrite=True)
+    vegg.convert(src, out, engine=engine, encoding="utf-16-le", header=False, overwrite=True)
     assert rows(out)[0] == {"column_1": "a", "column_2": "b"}
 
 
@@ -606,18 +606,18 @@ def test_a_byte_order_mark_is_never_data(tmp_path, engine):
 def test_rejected_rows_keep_their_own_line_ending(tmp_path, engine):
     src = tmp_path / "rej.csv"
     put(src, "a,b\r\n1,2\r\n3\n4,5\r\n")
-    r = dc.convert(src, tmp_path / "rej.jsonl", engine=engine)
+    r = vegg.convert(src, tmp_path / "rej.jsonl", engine=engine)
     assert Path(r.quarantine).read_bytes() == b"a,b\n3\n"
     # the whole record, whatever columns= keeps
     put(src, "id,name,v\n1,ann,1.5\n2,bob\n")
-    r = dc.convert(src, tmp_path / "rej2.jsonl", engine=engine, columns=["v"])
+    r = vegg.convert(src, tmp_path / "rej2.jsonl", engine=engine, columns=["v"])
     assert Path(r.quarantine).read_text(encoding="utf-8") == "id,name,v\n2,bob\n"
-    with pytest.raises(dc.DataError, match="record with 2 fields where 3 were expected: 2,bob"):
-        dc.convert(src, tmp_path / "rej3.jsonl", engine=engine, bad_lines="error")
+    with pytest.raises(vegg.DataError, match="record with 2 fields where 3 were expected: 2,bob"):
+        vegg.convert(src, tmp_path / "rej3.jsonl", engine=engine, bad_lines="error")
     # the lines of a malformed record, as the native engine counts them: its line feeds,
     # or its carriage returns when it holds no line feed
     put(src, 'a,b\r\n1,"x\ry",z\r\n2,3\r\n')
-    r = dc.convert(src, tmp_path / "rej4.jsonl", engine=engine)
+    r = vegg.convert(src, tmp_path / "rej4.jsonl", engine=engine)
     assert r.warnings == [f"1 malformed rows moved to {r.quarantine}"]
     assert [_csvtok.count_lines(raw) for raw in ('1,"x\ry",z\r\n', "x\ry\r", "x\ny", "x", "")] == [1, 2, 2, 1, 1]
 
@@ -635,11 +635,11 @@ def test_line_breaks_cannot_delimit_fields(tmp_path, engine):
         {"quote": "\n"},
         {"escape": "\r"},
     ):
-        with pytest.raises(dc.OptionsError, match="a line break cannot be the delimiter, quote or escape character"):
-            dc.convert(src, out, engine=engine, **option)
+        with pytest.raises(vegg.OptionsError, match="a line break cannot be the delimiter, quote or escape character"):
+            vegg.convert(src, out, engine=engine, **option)
     for c, shown in (('"', "'\"'"), ("\n", "'\\\\n'"), ("\\r", "'\\\\r'")):
-        with pytest.raises(dc.OptionsError, match=f"{shown} cannot be the output delimiter: the file could not be read back"):
-            dc.convert(src, out, engine=engine, out_delimiter=c)
+        with pytest.raises(vegg.OptionsError, match=f"{shown} cannot be the output delimiter: the file could not be read back"):
+            vegg.convert(src, out, engine=engine, out_delimiter=c)
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -647,9 +647,9 @@ def test_dcz_input_in_a_whatwg_encoding(tmp_path, engine):
     src = tmp_path / "in.csv"
     src.write_bytes("a,b\n1,caf\xe9\n".encode("cp1252"))
     packed = tmp_path / "in.dcz"
-    dc.compress(src, packed, engine="pure")
+    vegg.compress(src, packed, engine="pure")
     out = tmp_path / "out.jsonl"
-    dc.convert(packed, out, engine=engine, encoding="x-cp1252")
+    vegg.convert(packed, out, engine=engine, encoding="x-cp1252")
     assert rows(out) == [{"a": 1, "b": "caf\xe9"}]
 
 
@@ -664,11 +664,11 @@ def test_feather_version_1_is_read_by_the_arrow_engine(tmp_path):
         feather.write_feather(pa.table({"x": [1, 2, 3], "s": ["a", None, "c"]}), str(src), version=1)
     assert src.read_bytes()[:4] == b"FEA1"
     out = tmp_path / "old.jsonl"
-    r = dc.convert(src, out)  # auto: only the arrow engine reads it
+    r = vegg.convert(src, out)  # auto: only the arrow engine reads it
     assert r.engine == "arrow" and rows(out) == [{"x": 1, "s": "a"}, {"x": 2, "s": None}, {"x": 3, "s": "c"}]
-    assert dc.head(src, 2)["rows"] == [["1", "a"], ["2", None]]
-    assert dc.count(src) == 3
-    assert dc.load(src).to_pylist()[2] == {"x": 3, "s": "c"}
+    assert vegg.head(src, 2)["rows"] == [["1", "a"], ["2", None]]
+    assert vegg.count(src) == 3
+    assert vegg.load(src).to_pylist()[2] == {"x": 3, "s": "c"}
     renamed = tmp_path / "old.bin"  # found by its magic bytes too
     renamed.write_bytes(src.read_bytes())
-    assert dc.convert(renamed, tmp_path / "old2.jsonl").rows == 3
+    assert vegg.convert(renamed, tmp_path / "old2.jsonl").rows == 3

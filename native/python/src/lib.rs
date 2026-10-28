@@ -1,4 +1,4 @@
-//! Python bindings for dataconv-core (imported as `dataconv_native`).
+//! Python bindings for vegg-core: the `vegg._rust` extension module of the vegg package.
 //!
 //! Options and reports cross the boundary as JSON strings, which keeps the
 //! interface stable across versions.  Long-running calls release the GIL; progress
@@ -9,19 +9,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use dataconv_core::codec::Profile;
-use dataconv_core::convert::{self as engine, ConvertOptions, Hooks};
-use dataconv_core::pack::{self, Packed, Values};
-use dataconv_core::{dcz, inspect, resources, Error};
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList};
+use vegg_core::codec::Profile;
+use vegg_core::convert::{self as engine, ConvertOptions, Hooks};
+use vegg_core::pack::{self, Packed, Values};
+use vegg_core::{dcz, inspect, resources, Error};
 
 /// Bumped whenever the JSON contract with the Python package changes.
 const PROTOCOL: u32 = 1;
 
-create_exception!(dataconv_native, NativeError, PyException, "Error raised by the native engine: (kind, message).");
+create_exception!(vegg._rust, NativeError, PyException, "Error raised by the native engine: (kind, message).");
 
 fn to_py(err: Error) -> PyErr {
     if matches!(err, Error::Cancelled) {
@@ -111,7 +111,7 @@ fn json<T: serde::Serialize>(value: &T) -> PyResult<String> {
 
 #[pyfunction]
 fn version() -> &'static str {
-    dataconv_core::VERSION
+    vegg_core::VERSION
 }
 
 #[pyfunction]
@@ -306,9 +306,10 @@ fn unpack_values<'py>(py: Python<'py>, data: &[u8]) -> PyResult<Unpacked<'py>> {
 }
 
 #[pymodule]
-fn dataconv_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+#[pyo3(name = "_rust")]
+fn rust_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("NativeError", m.py().get_type::<NativeError>())?;
-    m.add("__version__", dataconv_core::VERSION)?;
+    m.add("__version__", vegg_core::VERSION)?;
     for f in [
         wrap_pyfunction!(version, m)?,
         wrap_pyfunction!(protocol, m)?,

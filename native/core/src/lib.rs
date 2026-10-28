@@ -1,4 +1,4 @@
-//! dataconv-core: the native engine behind dataconv.
+//! vegg-core: the native engine behind vegg.
 //!
 //! * [`tokenize`] / [`chunk`]: a quote-aware CSV tokenizer and record-aligned chunker.
 //! * [`types`]: lossless type inference (leading zeros, big integers and float

@@ -18,7 +18,7 @@ from collections import Counter
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from . import _compat, _csvtok, codec
-from .errors import DataconvError, FormatError, IntegrityError
+from .errors import FormatError, IntegrityError, VeggError
 
 MAGIC = b"\x89DCZ\r\n\x1a\n"
 MAGIC_END = b"\x89DCZEND\n"
@@ -53,7 +53,7 @@ def _guard(fn: Callable[..., Any]) -> Callable[..., Any]:
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         try:
             return fn(*args, **kwargs)
-        except DataconvError:
+        except VeggError:
             raise
         except _CORRUPT as exc:
             raise IntegrityError(f"DCZ data is truncated or corrupt ({type(exc).__name__})") from None
@@ -1005,7 +1005,7 @@ class DczWriter:
             self._emit(bytes(self.pending))
             self.pending.clear()
         footer = {
-            "format": "dcz", "version": VERSION, "created_by": f"dataconv {_version()} (python)",
+            "format": "dcz", "version": VERSION, "created_by": f"vegg {_version()} (python)",
             "kind": "csv" if self.csv else "raw", "profile": self.profile, "original_size": self.raw_offset,
             "original_crc32": self.crc & 0xFFFFFFFF,
             "delimiter": self.csv[0] if self.csv else None, "quote": self.csv[1] if self.csv else None,
@@ -1052,7 +1052,7 @@ def read_footer(path: os.PathLike[str] | str) -> Dict[str, Any]:
         if head[8] != VERSION:
             raise FormatError(f"unsupported DCZ version {head[8]}")
         if head[9] & FLAG_PACKED:
-            raise FormatError(f"{path} holds packed values; use dataconv.unpack()")
+            raise FormatError(f"{path} holds packed values; use vegg.unpack()")
         f.seek(0, os.SEEK_END)
         size = f.tell()
         if size < HEADER_LEN + BLOCK_HEADER_LEN + TRAILER_LEN:

@@ -10,12 +10,12 @@ use std::path::Path;
 use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::Int64Type;
 use common::TestDir;
-use dataconv_core::codec::Profile;
-use dataconv_core::convert::{convert, ConvertOptions, NoHooks};
-use dataconv_core::dcz;
-use dataconv_core::sniff::SniffOptions;
-use dataconv_core::tokenize::Dialect;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use vegg_core::codec::Profile;
+use vegg_core::convert::{convert, ConvertOptions, NoHooks};
+use vegg_core::dcz;
+use vegg_core::sniff::SniffOptions;
+use vegg_core::tokenize::Dialect;
 
 fn dir(name: &str) -> TestDir {
     TestDir::new(name)
@@ -32,7 +32,7 @@ fn opts() -> ConvertOptions {
 }
 
 fn count(path: &Path, o: &ConvertOptions) -> u64 {
-    dataconv_core::inspect::count(path, o).unwrap()
+    vegg_core::inspect::count(path, o).unwrap()
 }
 
 #[test]
@@ -266,7 +266,7 @@ fn corrupt_dcz_never_panics() {
 
 #[test]
 fn corrupt_packed_values_never_panic() {
-    use dataconv_core::pack::{pack, unpack, Packed, Values};
+    use vegg_core::pack::{pack, unpack, Packed, Values};
     let inputs = [
         Values::Int((0..500).map(|i| i * 7 - 300).collect()),
         Values::Float((0..500).map(|i| i as f64 / 8.0).collect()),
@@ -453,7 +453,7 @@ fn foreign_types_are_written_like_their_text() {
     k.append(false).unwrap();
     k.append(true).unwrap();
     // values that hold JSON
-    let marked = HashMap::from([("dataconv.json".to_string(), "value".to_string())]);
+    let marked = HashMap::from([("vegg.json".to_string(), "value".to_string())]);
     let mut j = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new())
         .with_values_field(Field::new("values", DataType::Utf8, true).with_metadata(marked));
     j.keys().append_value("v");
@@ -499,7 +499,7 @@ fn foreign_types_are_written_like_their_text() {
         )
     );
     // head shows the values as CSV output writes them, and the types by their names
-    let p = dataconv_core::inspect::head(&src, 3, &opts()).unwrap();
+    let p = vegg_core::inspect::head(&src, 3, &opts()).unwrap();
     assert_eq!(p.types, ["null", "date64", "map<string, int64>", "map<int64, string>", "map<string, string>"]);
     let some = |s: &str| Some(s.to_string());
     assert_eq!(
@@ -590,7 +590,7 @@ fn damaged_arrow_files_are_errors() {
                     src.display()
                 );
             }
-            let _ = dataconv_core::inspect::count(&flip, &opts());
+            let _ = vegg_core::inspect::count(&flip, &opts());
         }
     }
 }
@@ -642,7 +642,7 @@ fn parquet_info_names_codecs_and_logical_types() {
     let mut w = ArrowWriter::try_new(File::create(&src).unwrap(), batch.schema(), Some(props)).unwrap();
     w.write(&batch).unwrap();
     w.close().unwrap();
-    let info = dataconv_core::inspect::info(&src, false, &opts()).unwrap();
+    let info = vegg_core::inspect::info(&src, false, &opts()).unwrap();
     let columns = info["columns"].as_array().unwrap();
     let logical: Vec<&serde_json::Value> = columns.iter().map(|c| &c["logical_type"]).collect();
     assert_eq!(
@@ -879,7 +879,7 @@ fn head_of_a_file_without_rows_names_its_columns() {
     let d = dir("header-only");
     let src = d.join("h.csv");
     std::fs::write(&src, "a,b,c\n").unwrap();
-    let p = dataconv_core::inspect::head(&src, 5, &opts()).unwrap();
+    let p = vegg_core::inspect::head(&src, 5, &opts()).unwrap();
     assert_eq!(p.columns, ["a", "b", "c"]);
     assert!(p.rows.is_empty());
 }
@@ -930,7 +930,7 @@ fn options_that_cannot_work_are_refused() {
     assert!(convert(&src, &d.join("parts"), &o, &NoHooks).unwrap_err().to_string().contains("file name"));
     assert!(!d.join("x-0.csv").exists());
     // every command names a directory input as such
-    for e in [dataconv_core::inspect::count(&d, &opts()).unwrap_err(), dcz::read_footer(&d).unwrap_err()] {
+    for e in [vegg_core::inspect::count(&d, &opts()).unwrap_err(), dcz::read_footer(&d).unwrap_err()] {
         assert!(e.to_string().contains("is a directory"), "{e}");
     }
 }

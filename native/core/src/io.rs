@@ -463,7 +463,7 @@ mod tests {
 
     #[test]
     fn atomic_file_cleans_up() {
-        let dir = std::env::temp_dir().join(format!("dcv-io-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("vegg-io-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("out.bin");
         {

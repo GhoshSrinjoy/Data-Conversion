@@ -13,7 +13,7 @@
 //! * text placeholders (`NA`, `null`, `-`, ...) mean "missing" only in columns that are
 //!   otherwise typed; in text columns they are kept verbatim.
 //!
-//! The same rules are implemented by the Python engines (see `dataconv/infer.py`).
+//! The same rules are implemented by the Python engines (see `vegg/infer.py`).
 
 use serde::{Deserialize, Serialize};
 

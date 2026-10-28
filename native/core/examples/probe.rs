@@ -1,5 +1,5 @@
-use dataconv_core::chunk::scan_end;
-use dataconv_core::tokenize::Dialect;
+use vegg_core::chunk::scan_end;
+use vegg_core::tokenize::Dialect;
 
 fn main() {
     let mut data = b"1,\"x,y,\"\"z\"\"\n".to_vec();

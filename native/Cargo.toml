@@ -7,6 +7,9 @@ version = "1.0.0"
 edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
 rust-version = "1.88"
+authors = ["Srinjoy Ghosh"]
+repository = "https://github.com/GhoshSrinjoy/vegg"
+homepage = "https://github.com/GhoshSrinjoy/vegg"
 
 [workspace.dependencies]
 arrow = { version = "60", default-features = false, features = ["csv", "json", "ipc", "ipc_compression", "chrono-tz"] }
