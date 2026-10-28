@@ -206,18 +206,41 @@ fn sample_records(text: &[u8], d: Dialect, limit: usize, complete: bool) -> Samp
     let mut terms = [0usize; 4];
     let mut max_len = 0;
     let mut scratch = Vec::new();
-    t.for_each(text, |r| {
-        if r.term == Term::Eof && !complete {
-            // The last record was cut off by the sample boundary.
-            return false;
-        }
-        terms[r.term.code() as usize] += 1;
-        max_len = max_len.max(r.end - r.start);
-        let row: Vec<Vec<u8>> =
-            r.fields.iter().map(|f| unescape(&r.data[f.start..f.end], f, &d, &mut scratch).to_vec()).collect();
-        rows.push(row);
-        rows.len() < limit
-    });
+    let mut pos = 0;
+    while pos < text.len() && rows.len() < limit {
+        // In a whole file, a quote that is never closed ends with its line, as when
+        // converting (in a sample it may still close beyond the sample).
+        let mut stray = None;
+        t.for_each(&text[pos..], |r| {
+            if r.unterminated && complete {
+                let open = r.fields.last().map_or(r.start, |f| f.start.saturating_sub(1));
+                let end = memchr::memchr(b'\n', &r.data[open..]).map_or(r.data.len(), |k| open + k + 1);
+                stray = Some((r.start, end));
+                return false;
+            }
+            if r.term == Term::Eof && !complete {
+                // The last record was cut off by the sample boundary.
+                return false;
+            }
+            terms[r.term.code() as usize] += 1;
+            max_len = max_len.max(r.end - r.start);
+            let row: Vec<Vec<u8>> =
+                r.fields.iter().map(|f| unescape(&r.data[f.start..f.end], f, &d, &mut scratch).to_vec()).collect();
+            rows.push(row);
+            rows.len() < limit
+        });
+        let Some((start, end)) = stray else { break };
+        // the stray line on its own is one (malformed) record
+        Tokenizer::new(d).for_each(&text[pos + start..pos + end], |r| {
+            terms[r.term.code() as usize] += 1;
+            max_len = max_len.max(r.end - r.start);
+            rows.push(
+                r.fields.iter().map(|f| unescape(&r.data[f.start..f.end], f, &d, &mut scratch).to_vec()).collect(),
+            );
+            false
+        });
+        pos += end;
+    }
     Sampled { rows, terms, max_len }
 }
 
@@ -526,6 +549,16 @@ mod tests {
         assert_eq!(sn("user:uid:shell\nroot:0:/bin/sh\nada:1000:/bin/zsh\nbob:1001:/bin/bash\n").delimiter, ":");
         assert!(is_time_of_day(b"9:05") && is_time_of_day(b"23:59:60Z") && is_time_of_day(b"10:00:00-03:00"));
         assert!(!is_time_of_day(b"24:00") && !is_time_of_day(b"1:2") && !is_time_of_day(b"10:00:00+0300"));
+    }
+
+    #[test]
+    fn a_quote_never_closed_ends_with_its_line() {
+        // as when converting: the stray line is one record, the rest parse normally
+        let d = sn("\"a,b\n1,2\n3,4\n5,6\n");
+        assert_eq!((d.columns.len(), d.skip_rows), (2, 1));
+        let d = sn("id,name\n1,ok\n2,\"stray\n3,x\n4,y\n");
+        assert_eq!(d.columns, vec!["id", "name"]);
+        assert_eq!(d.sample_records, 5);
     }
 
     #[test]
