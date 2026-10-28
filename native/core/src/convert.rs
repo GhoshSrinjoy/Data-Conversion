@@ -1495,7 +1495,8 @@ fn table_attempt(
     report.parts = parts;
     report.rows = rows;
     report.columns = schema.fields().len();
-    report.schema = schema.fields().iter().map(|f| (f.name().clone(), f.data_type().to_string())).collect();
+    report.schema =
+        schema.fields().iter().map(|f| (f.name().clone(), crate::types::LogicalType::name_of(f.data_type()))).collect();
     report.compression = describe(target.format, target.compression, opts);
     report.warnings.extend(source.warnings());
     Ok(())

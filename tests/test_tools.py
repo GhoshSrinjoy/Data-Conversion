@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 import dataconv as dc
-from conftest import needs_arrow, needs_native
+from conftest import ENGINES, needs_arrow, needs_native
 
 
 def test_info_head_count_schema(tricky):
@@ -14,9 +14,47 @@ def test_info_head_count_schema(tricky):
     assert head["columns"][:3] == ["id", "zip", "big"]
     assert head["rows"][1][1] == "07919"
     assert dc.count(tricky) in (2001, 2002)
-    assert dict(dc.schema(tricky))["zip"].lower() in ("string", "utf8")
+    assert dict(dc.schema(tricky))["zip"] == "string"
     sniffed = dc.sniff(tricky)
     assert sniffed["delimiter"] == "," and sniffed["header"]
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_schema_and_head_alike_on_every_engine(tmp_path, engine):
+    # the same type names, and values as CSV output writes them
+    src = tmp_path / "c.csv"
+    src.write_bytes(b"i,s,f,d,ts,b\n1,x,1.5E22,2024-01-02,2024-01-02T03:04:05.5+05:30,true\n,,1e-7,,,\n")
+    names = ["int64", "string", "float64", "date", "timestamp[ms,+05:30]", "bool"]
+    assert dc.schema(src, engine=engine) == list(zip(["i", "s", "f", "d", "ts", "b"], names))
+    assert dc.head(src, 5, engine=engine)["rows"] == [
+        ["1", "x", "1.5e22", "2024-01-02", "2024-01-02T03:04:05.5+05:30", "true"],
+        [None, None, "1e-7", None, None, None],
+    ]
+
+
+@needs_arrow
+@pytest.mark.parametrize("engine", [e for e in ("native", "arrow") if e in ENGINES])
+def test_schema_and_head_of_foreign_types(tmp_path, engine):
+    import pyarrow as pa
+
+    table = pa.table(
+        {
+            "u": pa.array([1], pa.uint8()),
+            "f": pa.array([0.1], pa.float32()),
+            "l": pa.array([[1, None]], pa.list_(pa.int64())),
+            "st": pa.array([{"a": "x"}], pa.struct([("a", pa.string())])),
+            "m": pa.array([[("k", 1.5)]], pa.map_(pa.string(), pa.float64())),
+            "t": pa.array([1], pa.timestamp("ns", tz="UTC")),
+        }
+    )
+    src = tmp_path / "foreign.arrow"
+    with pa.ipc.new_file(pa.OSFile(str(src), "wb"), table.schema) as w:
+        w.write_table(table)
+    names = ["uint8", "float32", "list<int64>", "struct<a: string>", "map<string, float64>", "timestamp[ns,UTC]"]
+    assert dc.schema(src, engine=engine) == list(zip(table.column_names, names))
+    assert dc.head(src, 5, engine=engine)["rows"] == [
+        ["1", "0.1", "[1,null]", '{"a":"x"}', '{"k":1.5}', "1970-01-01T00:00:00.000000001Z"]
+    ]
 
 
 @needs_native

@@ -344,7 +344,7 @@ fn jsonl_round_trips_losslessly() {
     assert!(text.contains("\"ratio\":\"NaN\""), "{text}");
     let r = convert(&jl, &d.join("back.parquet"), &opts(), &NoHooks).unwrap();
     let types: Vec<&str> = r.schema.iter().map(|(_, t)| t.as_str()).collect();
-    assert_eq!(types, ["Decimal128(20, 0)", "Decimal128(21, 20)", "Float64", "Utf8"], "{:?}", r.schema);
+    assert_eq!(types, ["decimal(20,0)", "decimal(21,20)", "float64", "string"], "{:?}", r.schema);
     let back = d.join("back.csv");
     convert(&d.join("back.parquet"), &back, &opts(), &NoHooks).unwrap();
     let text = std::fs::read_to_string(&back).unwrap();
@@ -465,6 +465,21 @@ fn foreign_types_are_written_like_their_text() {
             ",,{},{},{}\n",
         )
     );
+    // head shows the values as CSV output writes them, and the types by their names
+    let p = dataconv_core::inspect::head(&src, 3, &opts()).unwrap();
+    assert_eq!(p.types, ["null", "date64", "map<string, int64>", "map<int64, string>", "map<string, string>"]);
+    let some = |s: &str| Some(s.to_string());
+    assert_eq!(
+        p.rows[0],
+        [
+            None,
+            some("2024-01-02"),
+            some("{\"a\":1,\"a\":null}"),
+            some("{\"1\":\"x\",\"2\":\"y\"}"),
+            some("{\"v\":[1,2]}")
+        ]
+    );
+    assert_eq!(p.rows[2], [None, None, some("{}"), some("{}"), some("{}")]);
 }
 
 #[test]
@@ -564,7 +579,7 @@ fn jsonl_types_widen_beyond_the_sample() {
     assert_eq!((r.restarts, r.rows), (1, 20_001), "{:?}", r.warnings);
     let names: Vec<&str> = r.schema.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(names, ["z", "a", "new"]);
-    assert_eq!((r.schema[0].1.as_str(), r.schema[1].1.as_str()), ("Float64", "Utf8"));
+    assert_eq!((r.schema[0].1.as_str(), r.schema[1].1.as_str()), ("float64", "string"));
     assert!(r.warnings.iter().any(|w| w.contains("'a' mixes JSON types")), "{:?}", r.warnings);
     let b = read_parquet(&pq);
     let a = b.column(1).as_string::<i32>();

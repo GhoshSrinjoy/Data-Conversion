@@ -4,8 +4,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
-use arrow::array::{Array, RecordBatch};
-use arrow::util::display::{ArrayFormatter, FormatOptions};
+use arrow::array::RecordBatch;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -28,30 +27,18 @@ fn preview_from_batches(batches: &[RecordBatch], n: usize) -> Result<Preview> {
         Some(b) => b.schema(),
         None => return Ok(Preview { columns: vec![], types: vec![], rows: vec![] }),
     };
-    let fmt = FormatOptions::default().with_null("");
+    // values as CSV output writes them
     let mut rows = Vec::new();
-    'outer: for b in batches {
-        let formatters: Vec<ArrayFormatter> = b
-            .columns()
-            .iter()
-            .map(|c| ArrayFormatter::try_new(c.as_ref(), &fmt))
-            .collect::<std::result::Result<_, _>>()?;
-        for r in 0..b.num_rows() {
-            if rows.len() >= n {
-                break 'outer;
-            }
-            rows.push(
-                b.columns()
-                    .iter()
-                    .zip(&formatters)
-                    .map(|(c, f)| if c.is_null(r) { None } else { Some(f.value(r).to_string()) })
-                    .collect(),
-            );
+    for b in batches {
+        let take = n.saturating_sub(rows.len()).min(b.num_rows());
+        rows.extend(crate::csvout::cell_texts(b, 0, take)?);
+        if rows.len() >= n {
+            break;
         }
     }
     Ok(Preview {
         columns: schema.fields().iter().map(|f| f.name().clone()).collect(),
-        types: schema.fields().iter().map(|f| f.data_type().to_string()).collect(),
+        types: schema.fields().iter().map(|f| crate::types::LogicalType::name_of(f.data_type())).collect(),
         rows,
     })
 }
@@ -258,7 +245,7 @@ pub fn info(path: &Path, exact: bool, opts: &ConvertOptions) -> Result<Value> {
             Ok(json!({
                 "format": "ipc", "layout": layout, "path": path.display().to_string(), "file_size": size,
                 "rows": rows, "record_batches": batches,
-                "columns": schema.fields().iter().map(|f| json!({"name": f.name(), "type": f.data_type().to_string(), "nullable": f.is_nullable()})).collect::<Vec<_>>(),
+                "columns": schema.fields().iter().map(|f| json!({"name": f.name(), "type": crate::types::LogicalType::name_of(f.data_type()), "nullable": f.is_nullable()})).collect::<Vec<_>>(),
             }))
         }
         Format::Dcz => {

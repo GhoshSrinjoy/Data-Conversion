@@ -137,6 +137,72 @@ impl LogicalType {
         }
     }
 
+    /// The name of an Arrow type in reports, `head`, `info` and `schema`, the same
+    /// from every engine: the labels above where a type has one (`int64`,
+    /// `timestamp[ms,+05:30]`, `decimal(12,2)`), pyarrow's names otherwise (`uint8`,
+    /// `large_string`, `list<int64>`, `struct<a: int64>`).
+    pub fn name_of(t: &arrow::datatypes::DataType) -> String {
+        use arrow::datatypes::{DataType as T, IntervalUnit, TimeUnit};
+        let unit = |u: &TimeUnit| match u {
+            TimeUnit::Second => "s",
+            TimeUnit::Millisecond => "ms",
+            TimeUnit::Microsecond => "us",
+            TimeUnit::Nanosecond => "ns",
+        };
+        let of = |f: &arrow::datatypes::FieldRef| Self::name_of(f.data_type());
+        match t {
+            T::Null => "null".into(),
+            T::Boolean => "bool".into(),
+            T::Int8 => "int8".into(),
+            T::Int16 => "int16".into(),
+            T::Int32 => "int32".into(),
+            T::Int64 => "int64".into(),
+            T::UInt8 => "uint8".into(),
+            T::UInt16 => "uint16".into(),
+            T::UInt32 => "uint32".into(),
+            T::UInt64 => "uint64".into(),
+            T::Float16 => "float16".into(),
+            T::Float32 => "float32".into(),
+            T::Float64 => "float64".into(),
+            T::Utf8 => "string".into(),
+            T::LargeUtf8 => "large_string".into(),
+            T::Utf8View => "string_view".into(),
+            T::Binary => "binary".into(),
+            T::LargeBinary => "large_binary".into(),
+            T::BinaryView => "binary_view".into(),
+            T::FixedSizeBinary(n) => format!("fixed_size_binary[{n}]"),
+            T::Date32 => "date".into(),
+            T::Date64 => "date64".into(),
+            T::Timestamp(u, None) => format!("timestamp[{}]", unit(u)),
+            T::Timestamp(u, Some(tz)) => format!("timestamp[{},{tz}]", unit(u)),
+            T::Time32(u) => format!("time32[{}]", unit(u)),
+            T::Time64(u) => format!("time64[{}]", unit(u)),
+            T::Duration(u) => format!("duration[{}]", unit(u)),
+            T::Interval(IntervalUnit::YearMonth) => "month_interval".into(),
+            T::Interval(IntervalUnit::DayTime) => "day_time_interval".into(),
+            T::Interval(IntervalUnit::MonthDayNano) => "month_day_nano_interval".into(),
+            T::Decimal32(p, s) | T::Decimal64(p, s) | T::Decimal128(p, s) | T::Decimal256(p, s) => {
+                format!("decimal({p},{s})")
+            }
+            T::List(f) => format!("list<{}>", of(f)),
+            T::LargeList(f) => format!("large_list<{}>", of(f)),
+            T::ListView(f) => format!("list_view<{}>", of(f)),
+            T::LargeListView(f) => format!("large_list_view<{}>", of(f)),
+            T::FixedSizeList(f, n) => format!("fixed_size_list<{}>[{n}]", of(f)),
+            T::Struct(fs) => {
+                let fields: Vec<String> = fs.iter().map(|f| format!("{}: {}", f.name(), of(f))).collect();
+                format!("struct<{}>", fields.join(", "))
+            }
+            T::Map(entries, _) => match entries.data_type() {
+                T::Struct(kv) if kv.len() == 2 => format!("map<{}, {}>", of(&kv[0]), of(&kv[1])),
+                other => format!("map<{}>", Self::name_of(other)),
+            },
+            T::Dictionary(k, v) => format!("dictionary<values={}, indices={}>", Self::name_of(v), Self::name_of(k)),
+            T::RunEndEncoded(r, v) => format!("run_end_encoded<run_ends={}, values={}>", of(r), of(v)),
+            T::Union(..) => "union".into(),
+        }
+    }
+
     /// Parse the override syntax: string, int64, float64, bool, date,
     /// decimal(p,s), timestamp[unit] or timestamp[unit,tz].
     pub fn parse(text: &str) -> Option<LogicalType> {
@@ -767,6 +833,51 @@ impl ColumnStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn type_names_match_the_python_engines() {
+        use arrow::datatypes::{DataType as T, Field, TimeUnit};
+        use std::sync::Arc;
+        let item = |t: T| Arc::new(Field::new("element", t, true));
+        let names: Vec<String> = [
+            T::Utf8,
+            T::Float64,
+            T::Date32,
+            T::Timestamp(TimeUnit::Millisecond, Some("+05:30".into())),
+            T::Decimal128(20, 2),
+            T::UInt8,
+            T::Float32,
+            T::LargeUtf8,
+            T::Date64,
+            T::Time64(TimeUnit::Microsecond),
+            T::FixedSizeBinary(4),
+            T::List(item(T::Int64)),
+            T::Struct(vec![Field::new("a", T::Int64, true), Field::new("b", T::Boolean, true)].into()),
+            T::Dictionary(Box::new(T::Int32), Box::new(T::Utf8)),
+        ]
+        .iter()
+        .map(LogicalType::name_of)
+        .collect();
+        assert_eq!(
+            names,
+            [
+                "string",
+                "float64",
+                "date",
+                "timestamp[ms,+05:30]",
+                "decimal(20,2)",
+                "uint8",
+                "float32",
+                "large_string",
+                "date64",
+                "time64[us]",
+                "fixed_size_binary[4]",
+                "list<int64>",
+                "struct<a: int64, b: bool>",
+                "dictionary<values=string, indices=int32>",
+            ]
+        );
+    }
 
     fn infer(values: &[&str]) -> LogicalType {
         let mut s = ColumnStats::default();

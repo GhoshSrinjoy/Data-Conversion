@@ -433,7 +433,7 @@ def merge(sources: Sequence[PathLike], dst: PathLike, *, progress: ProgressArg =
                   destination_format=dst_fmt, engine="native" if _native.available() else "arrow",
                   rows=final.num_rows, columns=final.num_columns,
                   bytes_in=sum(x.stat().st_size for x in srcs), bytes_out=dst_path.stat().st_size,
-                  seconds=time.perf_counter() - started, schema=[(f.name, str(f.type)) for f in final.schema])
+                  seconds=time.perf_counter() - started, schema=[(f.name, arrow_engine.type_name(f.type)) for f in final.schema])
 
 
 def part_name(pattern: str, n: int) -> str:
@@ -510,7 +510,7 @@ def write(data: Any, dst: PathLike, *, progress: ProgressArg = None, **options: 
     return Report(source="<memory>", destination=str(dst), source_format="arrow", destination_format=dst_fmt,
                   engine="arrow", rows=table.num_rows, columns=table.num_columns, bytes_in=table.nbytes,
                   bytes_out=dst.stat().st_size, seconds=time.perf_counter() - started,
-                  schema=[(f.name, str(f.type)) for f in table.schema])
+                  schema=[(f.name, arrow_engine.type_name(f.type)) for f in table.schema])
 
 
 def to_arrow(data: Any) -> Any:

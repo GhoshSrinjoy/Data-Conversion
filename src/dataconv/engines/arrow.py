@@ -705,6 +705,46 @@ def _nested_texts(pa: Any, arr: Any, t: Any) -> List[Any]:
     return [text("[" + ",".join(json(x) for x in items[a:b]) + "]") if ok else None for (a, b), ok in zip(bounds, _rows(arr))]
 
 
+def type_name(t: Any) -> str:
+    """The name of an Arrow type in reports, ``head``, ``info`` and ``schema``, the same
+    from every engine: the type rules' names where a type has one (``int64``,
+    ``timestamp[ms,+05:30]``, ``decimal(12,2)``), pyarrow's otherwise (``uint8``,
+    ``large_string``, ``list<int64>``, ``struct<a: int64>``)."""
+    pa = _pa()
+    types = pa.types
+    if types.is_boolean(t):
+        return "bool"
+    if types.is_floating(t):
+        return f"float{t.bit_width}"
+    if types.is_string(t):
+        return "string"
+    if types.is_date32(t):
+        return "date"
+    if types.is_date64(t):
+        return "date64"
+    if types.is_timestamp(t):
+        return f"timestamp[{t.unit}]" if t.tz is None else f"timestamp[{t.unit},{t.tz}]"
+    if types.is_decimal(t):
+        return f"decimal({t.precision},{t.scale})"
+    if types.is_fixed_size_list(t):
+        return f"fixed_size_list<{type_name(t.value_type)}>[{t.list_size}]"
+    for check, name in (("is_list", "list"), ("is_large_list", "large_list"), ("is_list_view", "list_view"),
+                        ("is_large_list_view", "large_list_view")):
+        if _is(pa, check, t):
+            return f"{name}<{type_name(t.value_type)}>"
+    if types.is_struct(t):
+        return "struct<" + ", ".join(f"{t.field(i).name}: {type_name(t.field(i).type)}" for i in range(t.num_fields)) + ">"
+    if types.is_map(t):
+        return f"map<{type_name(t.key_type)}, {type_name(t.item_type)}>"
+    if types.is_dictionary(t):
+        return f"dictionary<values={type_name(t.value_type)}, indices={type_name(t.index_type)}>"
+    if _is(pa, "is_run_end_encoded", t):
+        return f"run_end_encoded<run_ends={type_name(t.run_end_type)}, values={type_name(t.value_type)}>"
+    if types.is_union(t):
+        return "union"
+    return str(t)  # integers, binary, times, durations, intervals and null: pyarrow's names
+
+
 _SINGLE_SPECIAL = {"nan": float("nan"), "inf": float("inf"), "-inf": float("-inf")}
 
 
@@ -965,7 +1005,7 @@ def convert(src: Path, dst: Path, src_fmt: str, dst_fmt: str, dst_comp: Optional
     report.rows = rows
     report.columns = len(schema.names)
     report.schema = ([(n, t.label) for n, t in zip(schema.names, types)] if dialect is not None
-                     else [(f.name, str(f.type)) for f in schema])
+                     else [(f.name, type_name(f.type)) for f in schema])
     report.bad_rows = len(bad)
     report.blank_lines = reader.src.blank if reader is not None else 0
     report.irregular_records = reader.src.irregular if reader is not None else 0
@@ -1004,7 +1044,7 @@ def info(path: Path, fmt: str, o: ConvertOptions) -> Dict[str, Any]:
                 "format_version": md.format_version}
     schema, _ = read_batches(path, fmt, o)
     return {"format": fmt, "path": str(path), "file_size": size, "rows": None,
-            "columns": [{"name": f.name, "type": str(f.type)} for f in schema]}
+            "columns": [{"name": f.name, "type": type_name(f.type)} for f in schema]}
 
 
 def head(path: Path, n: int, fmt: str, o: ConvertOptions) -> Dict[str, Any]:
@@ -1017,7 +1057,7 @@ def head(path: Path, n: int, fmt: str, o: ConvertOptions) -> Dict[str, Any]:
                 break
         if len(rows) >= n:
             break
-    return {"columns": list(schema.names), "types": [str(f.type) for f in schema], "rows": rows}
+    return {"columns": list(schema.names), "types": [type_name(f.type) for f in schema], "rows": rows}
 
 
 def count(path: Path, fmt: str, o: ConvertOptions) -> int:

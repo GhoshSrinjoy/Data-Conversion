@@ -287,9 +287,14 @@ impl<'a> Col<'a> {
         })
     }
 
-    fn write(&mut self, out: &mut Vec<u8>, i: usize, o: &CsvWriteOptions) {
+    /// Writes the value at row `i`, quoted for CSV with `o` (as it is without).
+    fn write(&mut self, out: &mut Vec<u8>, i: usize, o: Option<&CsvWriteOptions>) {
+        let text = |out: &mut Vec<u8>, v: &[u8]| match o {
+            Some(o) => write_text(out, v, o),
+            None => out.extend_from_slice(v),
+        };
         match self {
-            Col::Str(a) => write_text(out, a.str_value(i).as_bytes(), o),
+            Col::Str(a) => text(out, a.str_value(i).as_bytes()),
             Col::Bool(a) => out.extend_from_slice(if a.value(i) { b"true" } else { b"false" }),
             Col::I8(a) => int!(out, a, i),
             Col::I16(a) => int!(out, a, i),
@@ -307,13 +312,13 @@ impl<'a> Col<'a> {
             Col::Date64(a) => write_date64(out, a.value(i)),
             Col::Ts(a, unit, offset) => write_timestamp_at(out, *a, i, *unit, *offset),
             Col::Json(e) => {
-                let mut text = Vec::new();
-                e.encode(i, &mut text);
-                write_text(out, &text, o);
+                let mut json = Vec::new();
+                e.encode(i, &mut json);
+                text(out, &json);
             }
             Col::Other(f) => {
-                let text = f.value(i).to_string();
-                write_text(out, text.as_bytes(), o);
+                let value = f.value(i).to_string();
+                text(out, value.as_bytes());
             }
         }
     }
@@ -339,9 +344,7 @@ pub fn write_header<W: Write>(w: &mut W, names: &[String], o: &CsvWriteOptions) 
 
 fn format_rows(batch: &RecordBatch, start: usize, end: usize, o: &CsvWriteOptions) -> Result<Vec<u8>> {
     let fmt = FormatOptions::default().with_null("");
-    let json = arrow::json::writer::EncoderOptions::default()
-        .with_explicit_nulls(true)
-        .with_encoder_factory(std::sync::Arc::new(crate::jsonl::FloatText));
+    let json = json_options();
     let schema = batch.schema();
     let mut cols: Vec<Col> =
         schema.fields().iter().zip(batch.columns()).map(|(f, c)| Col::new(f, c, &fmt, &json)).collect::<Result<_>>()?;
@@ -355,12 +358,45 @@ fn format_rows(batch: &RecordBatch, start: usize, end: usize, o: &CsvWriteOption
                 out.push(o.delimiter);
             }
             if !nulls[j].as_ref().is_some_and(|n| n.is_null(row)) {
-                col.write(&mut out, row, o);
+                col.write(&mut out, row, Some(o));
             }
         }
         out.extend_from_slice(&o.terminator);
     }
     Ok(out)
+}
+
+/// The text of each value of rows `start..end`, as CSV output writes it but unquoted;
+/// None for a null.
+pub fn cell_texts(batch: &RecordBatch, start: usize, end: usize) -> Result<Vec<Vec<Option<String>>>> {
+    let fmt = FormatOptions::default().with_null("");
+    let json = json_options();
+    let schema = batch.schema();
+    let mut cols: Vec<Col> =
+        schema.fields().iter().zip(batch.columns()).map(|(f, c)| Col::new(f, c, &fmt, &json)).collect::<Result<_>>()?;
+    let nulls: Vec<_> = batch.columns().iter().map(|a| a.logical_nulls()).collect();
+    let mut buf = Vec::new();
+    let mut rows = Vec::with_capacity(end.saturating_sub(start));
+    for row in start..end {
+        let mut cells = Vec::with_capacity(cols.len());
+        for (j, col) in cols.iter_mut().enumerate() {
+            if nulls[j].as_ref().is_some_and(|n| n.is_null(row)) {
+                cells.push(None);
+            } else {
+                buf.clear();
+                col.write(&mut buf, row, None);
+                cells.push(Some(String::from_utf8_lossy(&buf).into_owned()));
+            }
+        }
+        rows.push(cells);
+    }
+    Ok(rows)
+}
+
+fn json_options() -> arrow::json::writer::EncoderOptions {
+    arrow::json::writer::EncoderOptions::default()
+        .with_explicit_nulls(true)
+        .with_encoder_factory(std::sync::Arc::new(crate::jsonl::FloatText))
 }
 
 /// Format a batch (in parallel slices) and write it.
