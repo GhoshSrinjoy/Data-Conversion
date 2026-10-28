@@ -16,9 +16,9 @@ The name comes from বেগ (*beg*), Bengali for speed.
 - **Lossless by design.** Zip codes keep their leading zeros, 20-digit IDs stay
   exact, `NA` is only a missing value where the column is numeric, timestamps
   keep their UTC offset, and malformed rows are set aside instead of dropped.
-- **Fast.** A native Rust engine parses, types and writes in parallel. On a
-  2-million-row CSV it is about 8x faster than the pandas path this project used
-  to take, and it produces a smaller file.
+- **Fast.** A native Rust engine reads, types and writes in parallel. On the
+  export [below](#why-this-exists) it is 2 to 3 times faster than DuckDB,
+  pyarrow and pandas, and writes the smallest file of the five tools tested.
 - **Adaptive.** Threads, memory and chunk sizes follow the machine it runs on,
   including CPU and memory limits inside containers.
 - **Strong compression.** DCZ, a byte-exact columnar format for delimited text,
@@ -47,19 +47,35 @@ The name comes from বেগ (*beg*), Bengali for speed.
 
 ## Why this exists
 
-Converting a CSV sounds trivial until the data is real. On a 2-million-row,
-135.5 MB export (ids, timestamps, user names, prices, zip codes, country codes),
-the classic `pandas.read_csv(...).to_parquet(...)` approach and vegg give:
+Converting a CSV sounds trivial until the data is real. Here five tools convert
+the same 2-million-row, 183 MB export to Parquet, each with its default settings.
+The export holds ids, timestamps with a `+05:30` offset, user names, prices, zip
+codes, country codes, phone numbers and 20-digit account numbers.
 
-|                                            | pandas + pyarrow | vegg (native) |
-|--------------------------------------------|-----------------:|------------------:|
-| time                                       | 1.65 s           | **0.21 s**        |
-| Parquet size                               | 51.1 MB          | **33.5 MB**       |
-| zip codes that lost their leading zero     | 199,609          | **0**             |
-| `NA` (Namibia) turned into a missing value | 250,549          | **0**             |
+|                                            | **vegg**    | Polars     | DuckDB    | pyarrow   | pandas    |
+|--------------------------------------------|------------:|-----------:|----------:|----------:|----------:|
+| time                                       |      0.18 s | **0.10 s** |    0.34 s |    0.44 s |    0.53 s |
+| Parquet size                               | **12.5 MB** |    12.7 MB |   50.9 MB |   32.7 MB |   39.7 MB |
+| zip codes that lost their leading zero     |       **0** |    200,000 |     **0** |   200,000 |   200,000 |
+| `NA` (Namibia) turned into a missing value |       **0** |      **0** |     **0** |     **0** |   285,714 |
+| phone numbers that lost their `+`          |       **0** |      **0** |     **0** | 2,000,000 | 2,000,000 |
+| 20-digit account numbers changed           |       **0** |        0 * | 2,000,000 | 2,000,000 |     **0** |
+| `+05:30` offsets kept                      |     **yes** |        yes |        no |        no |       yes |
 
-Measured on a 24-thread Windows machine (sizes in MB of 2^20 bytes, as vegg
-prints them). Your timings will differ; the losses will not.
+\* exact, but stored as 128-bit integers, which pyarrow and DuckDB cannot read.
+
+Given a 1-million-row CSV with one row that has a field too many and one quote
+that is never closed:
+
+|                         | result                                                                  |
+|-------------------------|-------------------------------------------------------------------------|
+| **vegg**                | 999,998 rows written; the 2 malformed rows go to a `.rejected.csv` file |
+| Polars                  | an error, after leaving a partial file of 434,985 rows behind           |
+| DuckDB, pyarrow, pandas | an error                                                                |
+
+Measured on a 24-thread Windows machine with Polars 2.1, DuckDB 2.0, pyarrow 26
+and pandas 3.1 (sizes in MB of 2^20 bytes). Your timings will differ; the
+changed values will not. `python benchmarks/compare.py` repeats the test.
 
 Other problems it handles for you:
 
