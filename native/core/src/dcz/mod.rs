@@ -671,7 +671,8 @@ pub fn decompress_file(
     let mut out = AtomicFile::create(dst, overwrite)?;
     let mut f = File::open(src).map_err(|e| Error::io(e, src))?;
     let total = f.metadata()?.len();
-    let wave_bytes = (plan.memory_budget / 4).max(64 << 20);
+    // a wave holds at least one block, however small the budget
+    let wave_bytes = plan.memory_budget / 4;
     let mut crc = crc32fast::Hasher::new();
     let mut produced = 0u64;
     let mut i = 0;
