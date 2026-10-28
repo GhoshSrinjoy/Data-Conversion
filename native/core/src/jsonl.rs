@@ -682,6 +682,10 @@ fn canonical_number(t: &str) -> Cow<'_, str> {
     }
 }
 
+/// What `Builder::append_raw` returns for a value nested deeper than serde_json reads
+/// (128 levels): the line is valid JSON, so that is the only way its tree can fail.
+const TOO_DEEP: &str = "\u{0}too deep";
+
 /// A short description of a raw value that does not fit its column.
 fn shown_raw(raw: &str) -> String {
     match serde_json::from_str::<Value>(raw) {
@@ -757,7 +761,7 @@ impl Builder {
             },
             // mixed-type and nested values go through a parsed tree
             Builder::Text(_, TextMode::Json) | Builder::Struct(..) | Builder::List(..) => {
-                let v: Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+                let v: Value = serde_json::from_str(raw).map_err(|_| TOO_DEEP.to_string())?;
                 return self.append(Some(&v));
             }
         };
@@ -795,7 +799,13 @@ pub fn decode(layout: &Layout, schema: &SchemaRef, data: &[u8], offset: u64) -> 
         let text = std::str::from_utf8(line).map_err(|_| not_object(at))?;
         for (((name, b), p), slot) in layout.names.iter().zip(cols.iter_mut()).zip(&layout.plans).zip(&slots) {
             b.append_raw(slot.map(|(s, l)| &text[s..s + l])).map_err(|value| {
-                Error::Replan(format!("column '{name}': value {value} does not fit {}", p.data_type()))
+                if value == TOO_DEEP {
+                    Error::Data(format!(
+                        "column '{name}': the value in the line at byte {at} is nested deeper than 128 levels"
+                    ))
+                } else {
+                    Error::Replan(format!("column '{name}': value {value} does not fit {}", p.data_type()))
+                }
             })?;
         }
         rows += 1;

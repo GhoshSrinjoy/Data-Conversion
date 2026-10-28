@@ -787,6 +787,37 @@ fn arrow_ipc_streams_are_read() {
 }
 
 #[test]
+fn a_stray_quote_in_the_first_record_does_not_hide_the_types() {
+    let d = dir("stray-first");
+    let src = d.join("in.csv");
+    std::fs::write(&src, "a,b\n1,\"open\n2,x\n3,y\n").unwrap();
+    let out = d.join("out.jsonl");
+    let r = convert(&src, &out, &opts(), &NoHooks).unwrap();
+    assert_eq!(r.bad_rows, 1);
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "{\"a\":2,\"b\":\"x\"}\n{\"a\":3,\"b\":\"y\"}\n");
+}
+
+#[test]
+fn head_of_a_file_without_rows_names_its_columns() {
+    let d = dir("header-only");
+    let src = d.join("h.csv");
+    std::fs::write(&src, "a,b,c\n").unwrap();
+    let p = dataconv_core::inspect::head(&src, 5, &opts()).unwrap();
+    assert_eq!(p.columns, ["a", "b", "c"]);
+    assert!(p.rows.is_empty());
+}
+
+#[test]
+fn json_nested_too_deep_is_named_as_such() {
+    let d = dir("too-deep");
+    let src = d.join("deep.jsonl");
+    std::fs::write(&src, format!("{{\"a\":{}{}}}\n", "[".repeat(200), "]".repeat(200))).unwrap();
+    let e = convert(&src, &d.join("deep.csv"), &opts(), &NoHooks).unwrap_err().to_string();
+    assert!(e.contains("nested deeper than 128 levels"), "{e}");
+    assert!(!d.join("deep.csv").exists());
+}
+
+#[test]
 fn options_that_cannot_work_are_refused() {
     let d = dir("refused");
     let src = d.join("in.csv");
@@ -797,6 +828,23 @@ fn options_that_cannot_work_are_refused() {
     assert!(err(&sniff(SniffOptions { encoding: Some("bogus-enc".into()), ..Default::default() }))
         .contains("unknown encoding"));
     assert!(err(&sniff(SniffOptions { delimiter: Some("\"".into()), ..Default::default() })).contains("must differ"));
+    // a line break cannot separate fields or quote them
+    for (delimiter, quote) in [(Some("\\n"), None), (Some("\r"), None), (None, Some("\n"))] {
+        let o = sniff(SniffOptions {
+            delimiter: delimiter.map(Into::into),
+            quote: quote.map(Into::into),
+            ..Default::default()
+        });
+        assert!(err(&o).contains("line break"), "{delimiter:?} {quote:?}");
+    }
+    // nor can output fields be separated by what quotes or ends them
+    let csv = d.join("out.csv");
+    for c in ["\"", "\\n", "\r"] {
+        let o = ConvertOptions { out_delimiter: Some(c.into()), ..opts() };
+        let e = convert(&src, &csv, &o, &NoHooks).unwrap_err().to_string();
+        assert!(e.contains("cannot be the output delimiter"), "{c:?}: {e}");
+        assert!(!csv.exists());
+    }
     // Python spells encodings with underscores; they are understood
     let o = sniff(SniffOptions { encoding: Some("utf_8".into()), ..Default::default() });
     assert_eq!(convert(&src, &out, &o, &NoHooks).unwrap().rows, 1);

@@ -480,12 +480,16 @@ fn sample_stats(
 ) -> Result<Vec<ColumnStats>> {
     let ncols = plan.projection.len();
     let mut stats = vec![ColumnStats::default(); ncols];
-    let t = Instant::now();
     let (mut chunker, _, _) = open_records(path, encoding, plan, sample_bytes)?;
-    let head = chunker.next_chunk()?;
-    trace("  read head sample", t);
-    let t = Instant::now();
-    if let Some(head) = head {
+    // The head sample is one chunk, unless a stray quote cut that chunk short at its line:
+    // then the chunks after it fill the sample.
+    let mut sampled = 0;
+    while sampled < sample_bytes {
+        let t = Instant::now();
+        let Some(head) = chunker.next_chunk()? else { break };
+        sampled += head.data.len().max(1);
+        trace("  read head sample", t);
+        let t = Instant::now();
         // Split the head sample at record boundaries and observe the parts in parallel.
         let pieces = rayon::current_num_threads().max(1);
         let parts = crate::chunk::split_records(&head.data, &plan.dialect, plan.split, pieces);
@@ -728,6 +732,12 @@ fn build_sink(
 fn csv_write_options(opts: &ConvertOptions) -> Result<CsvWriteOptions> {
     let mut o = CsvWriteOptions::default();
     if let Some(d) = opts.out_delimiter.as_deref().map(sniff::parse_char_option).transpose()?.flatten() {
+        if matches!(d, b'\n' | b'\r' | b'"') {
+            return Err(Error::Invalid(format!(
+                "{:?} cannot be the output delimiter: the file could not be read back",
+                d as char
+            )));
+        }
         o.delimiter = d;
     }
     o.header = opts.out_header.unwrap_or(true);

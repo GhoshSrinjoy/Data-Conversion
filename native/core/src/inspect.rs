@@ -5,6 +5,8 @@ use std::io::BufReader;
 use std::path::Path;
 
 use arrow::array::RecordBatch;
+use arrow::datatypes::Schema;
+use arrow::record_batch::RecordBatchReader;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -22,11 +24,8 @@ pub struct Preview {
     pub rows: Vec<Vec<Option<String>>>,
 }
 
-fn preview_from_batches(batches: &[RecordBatch], n: usize) -> Result<Preview> {
-    let schema = match batches.first() {
-        Some(b) => b.schema(),
-        None => return Ok(Preview { columns: vec![], types: vec![], rows: vec![] }),
-    };
+/// The columns of `schema` (a file with no rows still has them) and the first `n` rows.
+fn preview_from_batches(schema: &Schema, batches: &[RecordBatch], n: usize) -> Result<Preview> {
     // values as CSV output writes them
     let mut rows = Vec::new();
     for b in batches {
@@ -54,11 +53,13 @@ pub fn head(path: &Path, n: usize, opts: &ConvertOptions) -> Result<Preview> {
                 .with_batch_size(n.max(1))
                 .with_limit(n)
                 .build()?;
+            let schema = reader.schema();
             let batches: Vec<RecordBatch> = reader.take(1).collect::<std::result::Result<_, _>>()?;
-            preview_from_batches(&batches, n)
+            preview_from_batches(&schema, &batches, n)
         }
         Format::Ipc => {
             let reader = crate::tables::IpcBatches::open(path)?;
+            let schema = reader.schema.clone();
             let mut batches = Vec::new();
             let mut rows = 0;
             for b in reader {
@@ -69,7 +70,7 @@ pub fn head(path: &Path, n: usize, opts: &ConvertOptions) -> Result<Preview> {
                     break;
                 }
             }
-            preview_from_batches(&batches, n)
+            preview_from_batches(&schema, &batches, n)
         }
         Format::Jsonl => {
             let input = io::open_input(path)?;
@@ -78,8 +79,11 @@ pub fn head(path: &Path, n: usize, opts: &ConvertOptions) -> Result<Preview> {
             let lines: Vec<&[u8]> =
                 head.split(|&b| b == b'\n').filter(|l| l.iter().any(|b| !b.is_ascii_whitespace())).take(n).collect();
             let text = lines.join(&b'\n');
-            let batches: Vec<RecordBatch> = crate::jsonl::read_text(&text)?.into_iter().collect();
-            preview_from_batches(&batches, n)
+            // no records, no keys: nothing names a column
+            match crate::jsonl::read_text(&text)? {
+                Some(b) => preview_from_batches(&b.schema(), &[b], n),
+                None => Ok(Preview { columns: vec![], types: vec![], rows: vec![] }),
+            }
         }
         Format::Csv | Format::Dcz => {
             // Convert the first rows to Arrow IPC in memory, through the regular
@@ -95,8 +99,9 @@ pub fn head(path: &Path, n: usize, opts: &ConvertOptions) -> Result<Preview> {
             let result = convert::convert(path, &tmp, &o, &convert::NoHooks).and_then(|_| {
                 let file = File::open(&tmp).map_err(|e| Error::io(e, &tmp))?;
                 let reader = arrow::ipc::reader::FileReader::try_new(BufReader::new(file), None)?;
+                let schema = reader.schema();
                 let batches: Vec<RecordBatch> = reader.collect::<std::result::Result<_, _>>()?;
-                preview_from_batches(&batches, n)
+                preview_from_batches(&schema, &batches, n)
             });
             let _ = std::fs::remove_file(&tmp);
             result

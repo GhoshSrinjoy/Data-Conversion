@@ -200,6 +200,15 @@ struct Sampled {
     max_len: usize,
 }
 
+/// A field's value as the converters read it: text after a closing quote stays with it.
+fn value(data: &[u8], f: &crate::tokenize::Field, d: &Dialect, scratch: &mut Vec<u8>) -> Vec<u8> {
+    if f.malformed {
+        crate::tokenize::malformed_value(data, f, d)
+    } else {
+        unescape(&data[f.start..f.end], f, d, scratch).to_vec()
+    }
+}
+
 fn sample_records(text: &[u8], d: Dialect, limit: usize, complete: bool) -> Sampled {
     let mut t = Tokenizer::new(d);
     let mut rows = Vec::new();
@@ -224,9 +233,7 @@ fn sample_records(text: &[u8], d: Dialect, limit: usize, complete: bool) -> Samp
             }
             terms[r.term.code() as usize] += 1;
             max_len = max_len.max(r.end - r.start);
-            let row: Vec<Vec<u8>> =
-                r.fields.iter().map(|f| unescape(&r.data[f.start..f.end], f, &d, &mut scratch).to_vec()).collect();
-            rows.push(row);
+            rows.push(r.fields.iter().map(|f| value(r.data, f, &d, &mut scratch)).collect());
             rows.len() < limit
         });
         let Some((start, end)) = stray else { break };
@@ -234,9 +241,7 @@ fn sample_records(text: &[u8], d: Dialect, limit: usize, complete: bool) -> Samp
         Tokenizer::new(d).for_each(&text[pos + start..pos + end], |r| {
             terms[r.term.code() as usize] += 1;
             max_len = max_len.max(r.end - r.start);
-            rows.push(
-                r.fields.iter().map(|f| unescape(&r.data[f.start..f.end], f, &d, &mut scratch).to_vec()).collect(),
-            );
+            rows.push(r.fields.iter().map(|f| value(r.data, f, &d, &mut scratch)).collect());
             false
         });
         pos += end;
@@ -420,6 +425,9 @@ pub fn sniff(raw: &[u8], complete: bool, opts: &SniffOptions) -> Result<CsvDiale
     let mut delimiter = delimiter;
     if delimiter == b':' && opts.delimiter.is_none() && temporal_column(&text, base, LIMIT, complete) {
         delimiter = lone().unwrap_or(b',');
+    }
+    if [Some(delimiter), quote, escape].iter().any(|c| matches!(c, Some(b'\n' | b'\r'))) {
+        return Err(Error::Invalid("a line break cannot be the delimiter, quote or escape character".into()));
     }
     if quote == Some(delimiter) || escape == Some(delimiter) {
         return Err(Error::Invalid(format!(
@@ -632,6 +640,8 @@ mod tests {
     fn header_names_are_kept_exactly() {
         assert_eq!(sn(" id,name ,,id\n1,a,b,c\n2,d,e,f\n").columns, vec![" id", "name ", "column_3", "id"]);
         assert_eq!(unique_names(&["a".into(), "a".into(), "  ".into()], 3), vec!["a", "a_2", "column_3"]);
+        // text after a closing quote stays with the field, as when converting
+        assert_eq!(sn("\"a\"x,b\n1,2\n").columns, vec!["ax", "b"]);
     }
 
     #[test]
