@@ -57,6 +57,21 @@ def test_schema_and_head_of_foreign_types(tmp_path, engine):
     ]
 
 
+@needs_arrow
+@pytest.mark.parametrize("engine", [e for e in ("native", "arrow") if e in ENGINES])
+def test_parquet_info_alike(tmp_path, engine):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    table = pa.table({"s": ["x"], "u": pa.array([1], pa.uint32()), "t": pa.array([1], pa.timestamp("ms", tz="UTC")), "i": [1]})
+    src = tmp_path / "t.parquet"
+    pq.write_table(table, src, compression="zstd", compression_level=9)
+    info = dc.info(src, engine=engine)
+    assert [c["logical_type"] for c in info["columns"]] == ["string", "uint32", "timestamp[ms,utc]", None]
+    assert info["columns"][0]["compression"] == ["zstd"]  # files do not store levels
+    assert info["format_version"] == 2 and info["metadata_keys"] == ["ARROW:schema"]
+
+
 @needs_native
 def test_split_byte_exact(tmp_path):
     src = tmp_path / "in.csv"

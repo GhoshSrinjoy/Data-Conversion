@@ -164,6 +164,19 @@ pub fn parquet_compression(name: &str, level: Option<i32>) -> Result<PqCompressi
     })
 }
 
+/// The codec of a column chunk read from a file: Parquet does not store levels.
+pub fn codec_name(c: &PqCompression) -> &'static str {
+    match c {
+        PqCompression::UNCOMPRESSED => "none",
+        PqCompression::SNAPPY => "snappy",
+        PqCompression::LZ4_RAW | PqCompression::LZ4 => "lz4",
+        PqCompression::GZIP(_) => "gzip",
+        PqCompression::BROTLI(_) => "brotli",
+        PqCompression::ZSTD(_) => "zstd",
+        PqCompression::LZO => "lzo",
+    }
+}
+
 pub fn describe_codec(c: &PqCompression) -> String {
     match c {
         PqCompression::UNCOMPRESSED => "none".into(),

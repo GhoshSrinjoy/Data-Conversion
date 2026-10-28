@@ -37,7 +37,8 @@ A rewrite of the three original scripts into one package, `dataconv`.
 - **The same text from every engine**, whatever the column type: floats in their
   shortest exact digits (float32 and float16 in their own precision), dates and
   timestamps at any unit, nested values and maps as JSON, and nulls as empty
-  fields.
+  fields. `schema`, `head`, `info` and reports name types the same way too
+  (`string`, `float64`, `timestamp[ms,+05:30]`, `list<int64>`).
 - **Hardened decoders.** Corrupt DCZ and packed data fail with an integrity
   error: every length is checked against the block index and the file size,
   and decompressed sizes and allocations are bounded.

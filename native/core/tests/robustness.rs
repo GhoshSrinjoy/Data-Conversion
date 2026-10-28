@@ -509,6 +509,38 @@ fn half_floats_read_back_exactly() {
 }
 
 #[test]
+fn parquet_info_names_codecs_and_logical_types() {
+    use arrow::array::{ArrayRef, Int64Array, StringArray, TimestampMillisecondArray, UInt32Array};
+    use parquet::arrow::ArrowWriter;
+    use parquet::basic::{Compression, ZstdLevel};
+    use parquet::file::properties::WriterProperties;
+    use std::sync::Arc;
+
+    let d = dir("parquet-info");
+    let cols: Vec<(&str, ArrayRef)> = vec![
+        ("s", Arc::new(StringArray::from(vec!["x"]))),
+        ("u", Arc::new(UInt32Array::from(vec![1]))),
+        ("t", Arc::new(TimestampMillisecondArray::from(vec![1]).with_timezone("UTC"))),
+        ("i", Arc::new(Int64Array::from(vec![1]))),
+    ];
+    let batch = RecordBatch::try_from_iter(cols).unwrap();
+    let src = d.join("t.parquet");
+    let props = WriterProperties::builder().set_compression(Compression::ZSTD(ZstdLevel::try_new(9).unwrap())).build();
+    let mut w = ArrowWriter::try_new(File::create(&src).unwrap(), batch.schema(), Some(props)).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+    let info = dataconv_core::inspect::info(&src, false, &opts()).unwrap();
+    let columns = info["columns"].as_array().unwrap();
+    let logical: Vec<&serde_json::Value> = columns.iter().map(|c| &c["logical_type"]).collect();
+    assert_eq!(
+        logical,
+        [&serde_json::json!("string"), &"uint32".into(), &"timestamp[ms,utc]".into(), &serde_json::Value::Null]
+    );
+    // a file does not store the level it was compressed at
+    assert_eq!(columns[0]["compression"], serde_json::json!(["zstd"]));
+}
+
+#[test]
 fn stored_time_zones_survive_a_coarser_parquet_unit() {
     use arrow::array::{ArrayRef, StructArray, TimestampMillisecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};

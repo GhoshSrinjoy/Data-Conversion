@@ -11,6 +11,7 @@ Python tokenizer.
 from __future__ import annotations
 
 import io
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -679,13 +680,13 @@ def _nested_texts(pa: Any, arr: Any, t: Any) -> List[Any]:
     of its children, which are formatted like columns of their own.  Maps are objects,
     entries in order, repeated keys included."""
     text = pure.JsonText
-    json = pure.json_text
+    of = pure.json_text
     if pa.types.is_struct(t):
         fields = [t.field(i) for i in range(t.num_fields)]
         children = [py_values(arr.field(i), f) for i, f in enumerate(fields)]
         names = pure.json_keys([f.name for f in fields])
         return [
-            text("{" + ",".join(k + json(c[r]) for k, c in zip(names, children)) + "}") if ok else None
+            text("{" + ",".join(k + of(c[r]) for k, c in zip(names, children)) + "}") if ok else None
             for r, ok in enumerate(_rows(arr))
         ]
     if len(arr) == 0:
@@ -698,11 +699,11 @@ def _nested_texts(pa: Any, arr: Any, t: Any) -> List[Any]:
         keys = [_key_text(k) for k in py_values(arr.keys.slice(start, end - start), t.key_field)]
         items = py_values(arr.items.slice(start, end - start), t.item_field)
         return [
-            text("{" + ",".join(keys[i] + ":" + json(items[i]) for i in range(a, b)) + "}") if ok else None
+            text("{" + ",".join(keys[i] + ":" + of(items[i]) for i in range(a, b)) + "}") if ok else None
             for (a, b), ok in zip(bounds, _rows(arr))
         ]
     items = py_values(arr.values.slice(start, end - start), t.value_field)
-    return [text("[" + ",".join(json(x) for x in items[a:b]) + "]") if ok else None for (a, b), ok in zip(bounds, _rows(arr))]
+    return [text("[" + ",".join(of(x) for x in items[a:b]) + "]") if ok else None for (a, b), ok in zip(bounds, _rows(arr))]
 
 
 def type_name(t: Any) -> str:
@@ -1018,6 +1019,26 @@ def convert(src: Path, dst: Path, src_fmt: str, dst_fmt: str, dst_comp: Optional
     return report
 
 
+_PQ_UNITS = {"milliseconds": "ms", "microseconds": "us", "nanoseconds": "ns"}
+
+
+def _logical_name(lt: Any) -> Optional[str]:
+    """A Parquet logical type as every engine names it: ``string``, ``int8``, ``uint32``,
+    ``decimal(10,2)``, ``date``, ``time[us]``, ``timestamp[ms,utc]``, ``unknown``,
+    ``json``; None for none."""
+    d = json.loads(lt.to_json())
+    kind = d.get("Type", "None")
+    if kind == "None":
+        return None
+    if kind == "Int":
+        return ("" if d["isSigned"] else "u") + f"int{d['bitWidth']}"
+    if kind == "Decimal":
+        return f"decimal({d['precision']},{d['scale']})"
+    if kind in ("Time", "Timestamp"):
+        return f"{kind.lower()}[{_PQ_UNITS.get(d['timeUnit'], d['timeUnit'])}{',utc' if d['isAdjustedToUTC'] else ''}]"
+    return "unknown" if kind == "Null" else str(kind).lower()
+
+
 def info(path: Path, fmt: str, o: ConvertOptions) -> Dict[str, Any]:
     size = path.stat().st_size
     if fmt == "parquet":
@@ -1025,23 +1046,29 @@ def info(path: Path, fmt: str, o: ConvertOptions) -> Dict[str, Any]:
         md = pq.ParquetFile(path).metadata
         cols = []
         for j in range(md.num_columns):
-            comp = enc = None
+            codecs: Set[str] = set()
+            encodings: Set[str] = set()
             csize = usize = 0
             nulls: Optional[int] = 0
             for i in range(md.num_row_groups):
                 c = md.row_group(i).column(j)
-                comp, enc = c.compression, c.encodings
+                # codec names as the native engine gives them (files do not store levels)
+                codecs.add({"UNCOMPRESSED": "none", "LZ4_RAW": "lz4"}.get(c.compression, c.compression.lower()))
+                encodings.update(c.encodings)
                 csize += c.total_compressed_size
                 usize += c.total_uncompressed_size
                 st = c.statistics
                 nulls = None if st is None or nulls is None or not st.has_null_count else nulls + st.null_count
             col = md.schema.column(j)
-            cols.append({"name": col.path, "physical_type": col.physical_type, "logical_type": str(col.logical_type),
-                         "compression": [comp], "encodings": list(enc or ()), "compressed_bytes": csize,
+            cols.append({"name": col.path, "physical_type": col.physical_type, "logical_type": _logical_name(col.logical_type),
+                         "compression": sorted(codecs), "encodings": sorted(encodings), "compressed_bytes": csize,
                          "uncompressed_bytes": usize, "null_count": nulls})
+        keys = [k.decode("utf-8", "replace") for k in md.metadata] if md.metadata else None
         return {"format": "parquet", "path": str(path), "file_size": size, "rows": md.num_rows,
                 "row_groups": md.num_row_groups, "columns": cols, "created_by": md.created_by,
-                "format_version": md.format_version}
+                "format_version": int(str(md.format_version).split(".")[0]),
+                "uncompressed_bytes": sum(md.row_group(i).total_byte_size for i in range(md.num_row_groups)),
+                "metadata_keys": keys}
     schema, _ = read_batches(path, fmt, o)
     return {"format": fmt, "path": str(path), "file_size": size, "rows": None,
             "columns": [{"name": f.name, "type": type_name(f.type)} for f in schema]}

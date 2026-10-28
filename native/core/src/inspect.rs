@@ -158,7 +158,7 @@ fn parquet_info(path: &Path) -> Result<Value> {
             let c = rg.column(i);
             compressed += c.compressed_size();
             uncompressed += c.uncompressed_size();
-            codecs.insert(crate::tables::describe_codec(&c.compression()));
+            codecs.insert(crate::tables::codec_name(&c.compression()));
             for e in c.encodings() {
                 encodings.insert(format!("{e:?}"));
             }
@@ -179,7 +179,7 @@ fn parquet_info(path: &Path) -> Result<Value> {
         columns.push(json!({
             "name": col.path().string(),
             "physical_type": format!("{}", col.physical_type()),
-            "logical_type": col.logical_type_ref().map(|t| format!("{t:?}")),
+            "logical_type": col.logical_type_ref().map(logical_name),
             "compression": codecs.into_iter().collect::<Vec<_>>(),
             "encodings": encodings.into_iter().collect::<Vec<_>>(),
             "compressed_bytes": compressed,
@@ -203,6 +203,28 @@ fn parquet_info(path: &Path) -> Result<Value> {
         "uncompressed_bytes": uncompressed,
         "metadata_keys": fm.key_value_metadata().map(|kv| kv.iter().map(|k| k.key.clone()).collect::<Vec<_>>()),
     }))
+}
+
+/// A Parquet logical type as every engine names it: `string`, `int8`, `uint32`,
+/// `decimal(10,2)`, `date`, `time[us]`, `timestamp[ms,utc]`, `unknown`, `json`.
+fn logical_name(t: &parquet::basic::LogicalType) -> String {
+    use parquet::basic::{LogicalType as L, TimeUnit as U};
+    let unit = |u: &U| match u {
+        U::MILLIS => "ms",
+        U::MICROS => "us",
+        U::NANOS => "ns",
+    };
+    let utc = |adjusted: bool| if adjusted { ",utc" } else { "" };
+    match t {
+        L::Integer(i) => format!("{}int{}", if i.is_signed { "" } else { "u" }, i.bit_width),
+        L::Decimal(d) => format!("decimal({},{})", d.precision, d.scale),
+        L::Time(x) => format!("time[{}{}]", unit(&x.unit), utc(x.is_adjusted_to_u_t_c)),
+        L::Timestamp(x) => format!("timestamp[{}{}]", unit(&x.unit), utc(x.is_adjusted_to_u_t_c)),
+        other => {
+            let debug = format!("{other:?}");
+            debug.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').next().unwrap_or_default().to_lowercase()
+        }
+    }
 }
 
 fn stat_text(s: &parquet::file::statistics::Statistics, min: bool) -> Option<String> {
