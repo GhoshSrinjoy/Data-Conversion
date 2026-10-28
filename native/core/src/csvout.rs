@@ -37,21 +37,25 @@ impl Default for CsvWriteOptions {
 #[inline]
 fn needs_quotes(v: &[u8], o: &CsvWriteOptions) -> bool {
     v.is_empty()
-        || v.iter().any(|&b| b == o.delimiter || b == o.quote || b == b'\n' || b == b'\r')
         || v[0] == b' '
         || v[v.len() - 1] == b' '
+        || memchr::memchr3(o.delimiter, o.quote, b'\n', v).is_some()
+        || memchr::memchr(b'\r', v).is_some()
 }
 
 #[inline]
 pub fn write_text(out: &mut Vec<u8>, v: &[u8], o: &CsvWriteOptions) {
     if needs_quotes(v, o) {
+        out.reserve(v.len() + 2);
         out.push(o.quote);
-        for &b in v {
-            if b == o.quote {
-                out.push(o.quote);
-            }
-            out.push(b);
+        // a quote inside the value is written twice
+        let mut rest = v;
+        while let Some(k) = memchr::memchr(o.quote, rest) {
+            out.extend_from_slice(&rest[..=k]);
+            out.push(o.quote);
+            rest = &rest[k + 1..];
         }
+        out.extend_from_slice(rest);
         out.push(o.quote);
     } else {
         out.extend_from_slice(v);

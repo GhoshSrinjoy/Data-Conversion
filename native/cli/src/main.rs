@@ -181,6 +181,26 @@ impl Hooks for Bar {
     }
 }
 
+/// The entries of a `--schema` list: split at the commas between them, not at those
+/// inside a type such as `decimal(12,2)` or `timestamp[us,UTC]`.
+fn schema_entries(spec: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0i32, 0usize);
+    for (i, c) in spec.char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ',' if depth <= 0 => {
+                out.push(&spec[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&spec[start..]);
+    out
+}
+
 fn options(a: &Args) -> Result<ConvertOptions, String> {
     let mut o = ConvertOptions { overwrite: a.has("overwrite") || a.has("f"), ..Default::default() };
     o.to = a.get("to").map(str::to_string);
@@ -195,7 +215,7 @@ fn options(a: &Args) -> Result<ConvertOptions, String> {
         Some(other) => return Err(format!("--types must be infer, string or loose, not '{other}'")),
     };
     if let Some(spec) = a.get("schema") {
-        for part in spec.split(',').filter(|p| !p.trim().is_empty()) {
+        for part in schema_entries(spec).into_iter().filter(|p| !p.trim().is_empty()) {
             let (k, v) = part.split_once('=').ok_or_else(|| format!("invalid --schema entry '{part}'"))?;
             o.schema.insert(k.trim().to_string(), v.trim().to_string());
         }
@@ -396,5 +416,16 @@ fn main() -> ExitCode {
             eprintln!("dataconv: error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn schema_entries_keep_type_arguments() {
+        assert_eq!(
+            super::schema_entries("zip=string,amount=decimal(12,2), ts=timestamp[us,UTC]"),
+            vec!["zip=string", "amount=decimal(12,2)", " ts=timestamp[us,UTC]"]
+        );
     }
 }

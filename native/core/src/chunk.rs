@@ -24,7 +24,10 @@ use crate::tokenize::{Dialect, Tokenizer};
 
 /// A quoted field still open this many bytes after its record started is taken to
 /// be a stray quote.
-pub const MAX_QUOTED: usize = 128 << 20;
+pub const MAX_QUOTED: usize = 1 << 30;
+
+/// Records without any line break are read whole up to this size (or eight chunks).
+const MAX_LINE: usize = 128 << 20;
 
 #[inline]
 fn at_field_start(buf: &[u8], j: usize, d: &Dialect) -> bool {
@@ -109,16 +112,21 @@ const RECENT: usize = 256;
 /// of a quoted field still open at the end of `buf`.
 pub fn scan_end(buf: &[u8], d: &Dialect, term: u8) -> (Option<usize>, Option<usize>) {
     let Some(q) = d.quote else { return (last_term(buf, 0, buf.len(), term), None) };
+    let mut from = 0;
     if term == b'\n' && d.double_quote && d.escape.is_none_or(|e| e == q) {
-        if let Some(found) = scan_regular(buf, q, d.delimiter) {
-            return found;
+        match scan_regular(buf, q, d.delimiter) {
+            Ok(found) => return found,
+            // regular up to `from`, a record boundary: only the rest needs the exact scan
+            Err(resume) => from = resume,
         }
     }
-    match d.escape.filter(|&e| e != q) {
-        Some(e) => scan_quotes(buf, d, term, memchr::memchr2_iter(q, e, buf)),
-        None => scan_quotes(buf, d, term, memchr::memchr_iter(q, buf)),
+    let rest = &buf[from..];
+    let (last, open) = match d.escape.filter(|&e| e != q) {
+        Some(e) => scan_quotes(rest, d, term, memchr::memchr2_iter(q, e, rest)),
+        None => scan_quotes(rest, d, term, memchr::memchr_iter(q, rest)),
     }
-    .unwrap_or_else(|| scan_end_full(buf, d, term))
+    .unwrap_or_else(|| scan_end_full(rest, d, term));
+    (last.map(|t| t + from).or((from > 0).then_some(from)), open.map(|j| j + from))
 }
 
 /// Quotes, structural bytes (delimiter or line break) and line feeds of 64 bytes as
@@ -189,8 +197,9 @@ fn masks(block: &[u8; 64], q: u8, delimiter: u8) -> (u64, u64, u64) {
 /// equals the tokenizer's state as long as every quote is regular: one that opens a
 /// field sits at the start of a field (or is the second of a doubled pair), and one
 /// that closes a field is followed by a delimiter, a line break, another quote or the
-/// end.  None as soon as a quote is not, and the exact scan decides.
-fn scan_regular(buf: &[u8], q: u8, delimiter: u8) -> Option<(Option<usize>, Option<usize>)> {
+/// end.  As soon as a quote is not, the exact scan takes over from the last record
+/// boundary before it, which is returned as the error (0 when there is none).
+fn scan_regular(buf: &[u8], q: u8, delimiter: u8) -> std::result::Result<(Option<usize>, Option<usize>), usize> {
     let n = buf.len();
     let (mut inside, mut prev_sq, mut prev_s) = (0u64, 1u64, 1u64);
     let (mut last, mut open) = (None, None);
@@ -226,7 +235,7 @@ fn scan_regular(buf: &[u8], q: u8, delimiter: u8) -> Option<(Option<usize>, Opti
         let before_sq = (sq << 1) | prev_sq;
         let after_sq = (sq >> 1) | (next_sq << (width - 1));
         if quotes & ((!before & !before_sq) | (before & !after_sq)) & valid != 0 {
-            return None;
+            return Err(last.unwrap_or(0));
         }
         let ends = lf & !after & valid;
         if ends != 0 {
@@ -241,7 +250,7 @@ fn scan_regular(buf: &[u8], q: u8, delimiter: u8) -> Option<(Option<usize>, Opti
         prev_s = (structural >> (width - 1)) & 1;
         start += width;
     }
-    Some((last, if inside != 0 { open } else { None }))
+    Ok((last, if inside != 0 { open } else { None }))
 }
 
 /// One pass over the quote (and escape) positions, the same rules as [`outside`]:
@@ -343,6 +352,9 @@ pub struct Chunk {
     /// Offset of `data[0]` within the (decoded) stream.
     pub offset: u64,
     pub index: usize,
+    /// The chunk ends at a quote taken to be a stray only because its field was still
+    /// open [`MAX_QUOTED`] bytes later (a genuine field that large would be split).
+    pub forced: bool,
 }
 
 /// Splits a byte stream into record-aligned chunks of roughly `chunk_size` bytes.
@@ -374,7 +386,7 @@ impl<R: Read> Chunker<R> {
             offset: 0,
             index: 0,
             eof: false,
-            max_record: (chunk_size.max(1) * 8).max(MAX_QUOTED),
+            max_record: (chunk_size.max(1) * 8).max(MAX_LINE),
             cut_anywhere: false,
         }
     }
@@ -427,37 +439,46 @@ impl<R: Read> Chunker<R> {
         Ok(())
     }
 
-    /// Where the next chunk ends, or None to read more.
-    fn cut(&self, target: usize) -> Result<Option<usize>> {
+    /// Where the next chunk ends (and whether at a stray quote found by size alone),
+    /// or None to read more.
+    fn cut(&self, target: usize) -> Result<Option<(usize, bool)>> {
         let len = self.carry.len();
         let all_read = self.eof && len < target;
         if self.cut_anywhere && len >= self.max_record {
-            return Ok(Some(last_record_end(&self.carry, &self.dialect, self.term).unwrap_or(len)));
+            return Ok(Some((last_record_end(&self.carry, &self.dialect, self.term).unwrap_or(len), false)));
         }
-        let (last, open) = scan_end(&self.carry, &self.dialect, self.term);
+        // While more input may follow, trailing quotes are ambiguous (a closing quote, or
+        // the first of a doubled pair), so the scan stops before them.
+        let mut scanned = len;
+        if !self.eof {
+            while scanned > 0 && Some(self.carry[scanned - 1]) == self.dialect.quote {
+                scanned -= 1;
+            }
+        }
+        let (last, open) = scan_end(&self.carry[..scanned], &self.dialect, self.term);
         if let Some(j) = open {
             let record = last.unwrap_or(0);
             if self.eof || len - record >= MAX_QUOTED {
                 // A stray quote: the chunk ends with the line that holds it.
                 if last.is_some() && !all_read && len - record < MAX_QUOTED {
-                    return Ok(last);
+                    return Ok(last.map(|c| (c, false)));
                 }
                 let line_end = memchr::memchr_iter(self.term, &self.carry[j..])
                     .map(|k| j + k)
                     .find(|&t| is_cut(&self.carry, t, self.term))
                     .map_or(len, |t| t + 1);
-                return Ok(Some(line_end));
+                return Ok(Some((line_end, !self.eof)));
             }
-            return Ok(last);
+            return Ok(last.map(|c| (c, false)));
         }
         if all_read {
-            return Ok(Some(len));
+            return Ok(Some((len, false)));
         }
         if last.is_some() {
-            return Ok(last);
+            return Ok(last.map(|c| (c, false)));
         }
         if self.eof {
-            return Ok(Some(len));
+            return Ok(Some((len, false)));
         }
         if len >= self.max_record {
             return Err(Error::Data(format!(
@@ -475,10 +496,10 @@ impl<R: Read> Chunker<R> {
             if self.carry.is_empty() {
                 return Ok(None);
             }
-            if let Some(cut) = self.cut(target)? {
+            if let Some((cut, forced)) = self.cut(target)? {
                 let rest = self.carry.split_off(cut);
                 let data = std::mem::replace(&mut self.carry, rest);
-                let chunk = Chunk { data, offset: self.offset, index: self.index };
+                let chunk = Chunk { data, offset: self.offset, index: self.index, forced };
                 self.offset += cut as u64;
                 self.index += 1;
                 return Ok(Some(chunk));
@@ -583,6 +604,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_trailing_quote_is_not_taken_for_a_closing_one() {
+        // the data read so far ends on the first quote of a doubled pair, inside a field
+        let buf = b"1,\"x,y,\"\"z\"\"\nx,y,\"".to_vec();
+        let mut chunker = Chunker::new(std::io::empty(), 4, Some(b'"'), b'\n').with_dialect(csv()).with_prefix(buf);
+        chunker.max_record = 8;
+        // more input may follow: the record is still open, so read on (no error)
+        assert_eq!(chunker.cut(64).unwrap(), None);
+        // at the end of the input the quote does close the field
+        chunker.eof = true;
+        assert_eq!(chunker.cut(64).unwrap(), Some((18, false)));
     }
 
     #[test]

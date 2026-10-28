@@ -141,7 +141,7 @@ pub fn to_utf8(sample: &[u8], encoding: &str) -> Vec<u8> {
         crate::io::latin1_to_utf8(sample, &mut out);
         return out;
     }
-    match encoding_rs::Encoding::for_label(encoding.as_bytes()) {
+    match crate::io::encoding_for(encoding) {
         Some(enc) if enc != encoding_rs::UTF_8 => {
             let (text, _, _) = enc.decode(sample);
             text.into_owned().into_bytes()
@@ -318,10 +318,57 @@ fn temporal_column(text: &[u8], base: Dialect, limit: usize, complete: bool) -> 
     !values.is_empty() && temporal * 10 >= values.len() * 9
 }
 
+/// The sampled records of a dialect, their dominant field count and the preamble
+/// rows before the data (`skip_rows` when given).
+fn layout(text: &[u8], d: Dialect, skip_rows: Option<usize>, complete: bool) -> (Sampled, usize, usize) {
+    let sampled = sample_records(text, d, 2000, complete);
+    let rows = &sampled.rows;
+    // Dominant field count from the body of the sample (so preamble lines cannot
+    // outvote the data); small samples use every row.
+    let body = if rows.len() >= 20 { &rows[rows.len() / 4..] } else { &rows[..] };
+    let (_, ncols) = field_count_score(body);
+    let skip_rows = skip_rows.unwrap_or_else(|| {
+        let mut k = 0;
+        while k < rows.len() && k < 50 {
+            let n = rows[k].len();
+            let blank = n == 1 && rows[k][0].is_empty();
+            if n == ncols && !blank {
+                break;
+            }
+            if !(blank || (ncols >= 2 && n <= ncols / 2)) {
+                k = 0;
+                break;
+            }
+            k += 1;
+        }
+        if k >= rows.len() {
+            0
+        } else {
+            k
+        }
+    });
+    (sampled, ncols, skip_rows)
+}
+
+/// Whether the first of `rows` is a header with evidence: a text name over a column
+/// whose values are all numbers, dates, timestamps or booleans.  (All-text data is
+/// read as having a header when undecided; this asks for more.)
+fn header_evidence(rows: &[Vec<Vec<u8>>]) -> bool {
+    let Some(first) = rows.first() else { return false };
+    let rest = &rows[1..rows.len().min(101)];
+    first.iter().enumerate().any(|(j, name)| {
+        let col: Vec<&Vec<u8>> = rest.iter().filter_map(|r| r.get(j)).filter(|v| !v.is_empty()).collect();
+        kind(name) == Kind::Text && !col.is_empty() && col.iter().all(|v| kind(v) != Kind::Text)
+    })
+}
+
 /// Detect the dialect of a CSV sample (raw bytes from the start of the file).
 pub fn sniff(raw: &[u8], complete: bool, opts: &SniffOptions) -> Result<CsvDialect> {
     let (detected, bom) = detect_encoding(raw, complete);
     let encoding = opts.encoding.clone().unwrap_or_else(|| detected.to_string());
+    if !crate::io::is_latin1(&encoding) && crate::io::encoding_for(&encoding).is_none() {
+        return Err(Error::Invalid(format!("unknown encoding '{encoding}'")));
+    }
     let text = to_utf8(if complete { raw } else { trim_partial_utf8(raw) }, &encoding);
     let quote = match &opts.quote {
         Some(q) => parse_char_option(q)?,
@@ -360,14 +407,45 @@ pub fn sniff(raw: &[u8], complete: bool, opts: &SniffOptions) -> Result<CsvDiale
             }
         }
     };
-    // Timestamps and times contain ':', so a single column of them is not ':'-delimited.
-    let delimiter = if delimiter == b':' && opts.delimiter.is_none() && temporal_column(&text, base, LIMIT, complete) {
-        b','
-    } else {
-        delimiter
+    // A character that never occurs in the sample, for reading it as one column.
+    let lone = || {
+        let free = |c: &u8| memchr::memchr(*c, &text).is_none();
+        if complete {
+            [b',', b'\t', b';', b'|', 0x1f].into_iter().find(free)
+        } else {
+            Some(0x1f).filter(free)
+        }
     };
-    let d = Dialect { delimiter, ..base };
-    let sampled = sample_records(&text, d, LIMIT.max(2000), complete);
+    // Timestamps and times contain ':', so a single column of them is not ':'-delimited.
+    let mut delimiter = delimiter;
+    if delimiter == b':' && opts.delimiter.is_none() && temporal_column(&text, base, LIMIT, complete) {
+        delimiter = lone().unwrap_or(b',');
+    }
+    if quote == Some(delimiter) || escape == Some(delimiter) {
+        return Err(Error::Invalid(format!(
+            "the delimiter {:?} is also the quote or escape character; they must differ",
+            delimiter as char
+        )));
+    }
+    let mut d = Dialect { delimiter, ..base };
+    let (mut sampled, mut ncols, mut skip_rows) = layout(&text, d, opts.skip_rows, complete);
+    // A first row without the delimiter, taken for a one-line preamble before data that
+    // has no header, is far more often the header of a single column whose values
+    // contain that character (MAC addresses, URLs with ports, key:value pairs).  Unless
+    // the rows below show a real header (a name over typed values), read one column:
+    // every line is kept whole either way.
+    if opts.delimiter.is_none()
+        && opts.skip_rows.is_none()
+        && skip_rows == 1
+        && sampled.rows.first().is_some_and(|r| r.len() == 1 && !r[0].is_empty() && !r[0].contains(&delimiter))
+        && !header_evidence(&sampled.rows[1..])
+    {
+        if let Some(c) = lone() {
+            delimiter = c;
+            d = Dialect { delimiter, ..base };
+            (sampled, ncols, skip_rows) = layout(&text, d, None, complete);
+        }
+    }
     let rows = &sampled.rows;
 
     let terminator = {
@@ -378,35 +456,6 @@ pub fn sniff(raw: &[u8], complete: bool, opts: &SniffOptions) -> Result<CsvDiale
             "\r"
         } else {
             "\n"
-        }
-    };
-
-    // Dominant field count from the body of the sample (so preamble lines cannot
-    // outvote the data); small samples use every row.
-    let body = if rows.len() >= 20 { &rows[rows.len() / 4..] } else { &rows[..] };
-    let (_, ncols) = field_count_score(body);
-
-    let skip_rows = match opts.skip_rows {
-        Some(n) => n,
-        None => {
-            let mut k = 0;
-            while k < rows.len() && k < 50 {
-                let n = rows[k].len();
-                let blank = n == 1 && rows[k][0].is_empty();
-                if n == ncols && !blank {
-                    break;
-                }
-                if !(blank || (ncols >= 2 && n <= ncols / 2)) {
-                    k = 0;
-                    break;
-                }
-                k += 1;
-            }
-            if k >= rows.len() {
-                0
-            } else {
-                k
-            }
         }
     };
 
@@ -476,7 +525,7 @@ fn looks_like_header(rows: &[&Vec<Vec<u8>>]) -> bool {
     score >= 0
 }
 
-/// Non-empty, unique, whitespace-trimmed column names.
+/// Unique column names, kept as written (a blank one becomes `column_N`).
 pub fn unique_names(raw: &[String], width: usize) -> Vec<String> {
     let mut out = Vec::with_capacity(width);
     let mut seen = std::collections::HashSet::new();
@@ -547,6 +596,24 @@ mod tests {
         }
         // genuinely ':'-separated data still is
         assert_eq!(sn("user:uid:shell\nroot:0:/bin/sh\nada:1000:/bin/zsh\nbob:1001:/bin/bash\n").delimiter, ":");
+        // one column whose values hold a delimiter: MAC addresses, URLs, odd times, pairs
+        let mut macs = String::from("mac\n");
+        let mut urls = String::from("url\n");
+        let mut odd = String::from("t\n");
+        let mut pairs = String::from("pair\n");
+        for i in 0..50 {
+            macs.push_str(&format!("0a:1b:2c:3d:4e:{i:02x}\n"));
+            urls.push_str(&format!("https://h{i}.example.com:8080/p\n"));
+            odd.push_str(&format!("2024-01-02T03:04:{:02}Z\n", if i == 7 { 60 } else { i % 60 }));
+            pairs.push_str(&format!("key{i}:value{i}\n"));
+        }
+        for text in [&macs, &urls, &odd, &pairs] {
+            let d = sn(text);
+            assert_eq!((d.columns.len(), d.skip_rows, d.header), (1, 0, true), "{text:.30}");
+        }
+        // a title line above a real header is still a preamble
+        let d = sn("My report\nid;name\n1;a\n2;b\n3;c\n");
+        assert_eq!((d.delimiter.as_str(), d.skip_rows, d.columns.len()), (";", 1, 2));
         assert!(is_time_of_day(b"9:05") && is_time_of_day(b"23:59:60Z") && is_time_of_day(b"10:00:00-03:00"));
         assert!(!is_time_of_day(b"24:00") && !is_time_of_day(b"1:2") && !is_time_of_day(b"10:00:00+0300"));
     }

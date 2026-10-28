@@ -72,6 +72,9 @@ pub fn detect_compression(path: &Path, head: &[u8]) -> Compression {
 }
 
 pub fn read_head(path: &Path, n: usize) -> Result<Vec<u8>> {
+    if path.is_dir() {
+        return Err(Error::Invalid(format!("{} is a directory, not a file", path.display())));
+    }
     let mut file = File::open(path).map_err(|e| Error::io(e, path))?;
     let mut buf = vec![0u8; n];
     let mut filled = 0;
@@ -254,6 +257,14 @@ pub fn is_latin1(label: &str) -> bool {
     )
 }
 
+/// The encoding a label names (WHATWG labels, also with `_` for `-` as Python spells
+/// them); ISO-8859-1 itself is handled apart, see [`is_latin1`].
+pub fn encoding_for(label: &str) -> Option<&'static encoding_rs::Encoding> {
+    let label = label.trim();
+    encoding_rs::Encoding::for_label(label.as_bytes())
+        .or_else(|| encoding_rs::Encoding::for_label(label.replace('_', "-").as_bytes()))
+}
+
 /// Append ISO-8859-1 bytes to `out` as UTF-8.
 pub fn latin1_to_utf8(bytes: &[u8], out: &mut Vec<u8>) {
     for &b in bytes {
@@ -362,7 +373,8 @@ impl AtomicFile {
     pub fn create(target: &Path, overwrite: bool) -> Result<Self> {
         ensure_writable(target, overwrite)?;
         let tmp = temp_sibling(target, "tmp");
-        let file = File::create(&tmp).map_err(|e| Error::io(e, &tmp))?;
+        // name the destination in errors: the temporary file is an implementation detail
+        let file = File::create(&tmp).map_err(|e| Error::io(e, target))?;
         Ok(AtomicFile { tmp, target: target.to_path_buf(), writer: Some(BufWriter::with_capacity(1 << 20, file)) })
     }
 

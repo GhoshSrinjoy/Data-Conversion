@@ -366,6 +366,9 @@ impl crate::tables::FinishWrite for DczWriter {
 
 /// Read the footer of a DCZ file and check that its block index describes the file.
 pub fn read_footer(path: &Path) -> Result<Footer> {
+    if path.is_dir() {
+        return Err(Error::Invalid(format!("{} is a directory, not a file", path.display())));
+    }
     let mut f = File::open(path).map_err(|e| Error::io(e, path))?;
     let len = f.metadata()?.len();
     if len < (HEADER_LEN + TRAILER_LEN) as u64 {

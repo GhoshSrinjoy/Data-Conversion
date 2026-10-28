@@ -517,3 +517,27 @@ fn arrow_ipc_streams_are_read() {
     assert_eq!(convert(&src, &out, &opts(), &NoHooks).unwrap().rows, 6);
     assert_eq!(std::fs::read_to_string(&out).unwrap(), "x\n1\n2\n3\n1\n2\n3\n");
 }
+
+#[test]
+fn options_that_cannot_work_are_refused() {
+    let d = dir("refused");
+    let src = d.join("in.csv");
+    std::fs::write(&src, "a,b\n1,2\n").unwrap();
+    let out = d.join("out.parquet");
+    let sniff = |s: SniffOptions| ConvertOptions { sniff: s, ..opts() };
+    let err = |o: &ConvertOptions| convert(&src, &out, o, &NoHooks).unwrap_err().to_string();
+    assert!(err(&sniff(SniffOptions { encoding: Some("bogus-enc".into()), ..Default::default() }))
+        .contains("unknown encoding"));
+    assert!(err(&sniff(SniffOptions { delimiter: Some("\"".into()), ..Default::default() })).contains("must differ"));
+    // Python spells encodings with underscores; they are understood
+    let o = sniff(SniffOptions { encoding: Some("utf_8".into()), ..Default::default() });
+    assert_eq!(convert(&src, &out, &o, &NoHooks).unwrap().rows, 1);
+    // split parts are named by the pattern, never placed elsewhere
+    let o = ConvertOptions { split_rows: Some(1), split_pattern: Some("../x-{n}".into()), ..opts() };
+    assert!(convert(&src, &d.join("parts"), &o, &NoHooks).unwrap_err().to_string().contains("file name"));
+    assert!(!d.join("x-0.csv").exists());
+    // every command names a directory input as such
+    for e in [dataconv_core::inspect::count(&d, &opts()).unwrap_err(), dcz::read_footer(&d).unwrap_err()] {
+        assert!(e.to_string().contains("is a directory"), "{e}");
+    }
+}

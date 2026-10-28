@@ -238,7 +238,7 @@ fn open_csv_stream(path: &Path, encoding: &str) -> Result<Counted<Box<dyn Read +
             let input = io::open_input(path)?;
             (input.reader, input.consumed, input.file_size)
         };
-    let reader: Box<dyn Read + Send> = match encoding_rs::Encoding::for_label(encoding.as_bytes()) {
+    let reader: Box<dyn Read + Send> = match io::encoding_for(encoding) {
         _ if io::is_latin1(encoding) => Box::new(io::Latin1Reader::new(raw)),
         Some(enc) if enc != encoding_rs::UTF_8 => Box::new(io::Utf8Reader::new(raw, enc)),
         _ => Box::new(io::SkipBom::new(raw)),
@@ -508,7 +508,7 @@ fn sample_stats(
     // Spread samples across uncompressed UTF-8 files catch type changes late in the file.
     let plain = io::detect_compression(path, &io::read_head(path, 16)?) == Compression::None
         && detect_format(path, None)?.0 != Format::Dcz
-        && encoding_rs::Encoding::for_label(encoding.as_bytes()) == Some(encoding_rs::UTF_8);
+        && io::encoding_for(encoding) == Some(encoding_rs::UTF_8);
     if plain && file_size > (sample_bytes as u64) * 2 {
         use std::io::{Seek, SeekFrom};
         const WINDOWS: u64 = 16;
@@ -1001,6 +1001,12 @@ fn split(
     });
     let dst_comp = Compression::from_extension(Path::new(&format!("x{extension}")));
     let pattern = opts.split_pattern.clone().unwrap_or_else(|| "part-{n:05}".to_string());
+    // parts are named, not placed: a path in the pattern would put them elsewhere
+    if pattern.contains(['/', '\\']) || extension.contains(['/', '\\']) || pattern.contains("..") {
+        return Err(Error::Invalid(format!(
+            "the part name pattern '{pattern}{extension}' must be a file name, without folders"
+        )));
+    }
     let plan = resources::plan(Some(bytes_in), opts.threads, opts.memory, opts.chunk_size);
     let mut report = Report {
         source: src.display().to_string(),
@@ -1239,6 +1245,8 @@ fn csv_attempt(
     // Rejected rows go to a temporary file too, published only if the job succeeds.
     let mut quarantine: Option<(PathBuf, AtomicFile)> = None;
     let (mut rows, mut bad, mut bad_lines, mut blank, mut irregular) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    // where a quote was taken to be a stray only because its field ran on too long
+    let mut forced_at: Option<u64> = None;
     let limit = opts.limit.unwrap_or(u64::MAX);
     // Ordered streaming pipeline: chunks are decoded on worker threads as soon as
     // they are read, and written in file order as they complete, so reading,
@@ -1253,6 +1261,9 @@ fn csv_attempt(
         while !input_done && in_flight < depth {
             match rx.recv() {
                 Ok(Ok(chunk)) => {
+                    if chunk.forced && forced_at.is_none() {
+                        forced_at = Some(chunk.offset + chunk.data.len() as u64);
+                    }
                     let (tx, p, s, idx) = (res_tx.clone(), shared.clone(), schema.clone(), spawned);
                     pool.spawn(move || {
                         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_chunk(&p, &s, &chunk)))
@@ -1342,6 +1353,13 @@ fn csv_attempt(
     report.bad_rows = bad;
     report.blank_lines = blank;
     report.irregular_records = irregular;
+    if let Some(at) = forced_at {
+        report.warnings.push(format!(
+            "a quote before byte {at} was still open {} MiB later and was read as a stray quote; \
+             if the file really holds a quoted field that large, the rows after it need checking",
+            crate::chunk::MAX_QUOTED >> 20
+        ));
+    }
     report.compression = describe(target.format, target.compression, opts);
     if bad > 0 {
         // a malformed record can span lines (a quote that pairs up with a later one)
