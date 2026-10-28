@@ -963,7 +963,10 @@ impl Source for IpcSource {
 /// JSON Lines: split on newlines (raw newlines cannot occur inside NDJSON values) and
 /// decode chunks in parallel against one inferred layout (see [`crate::jsonl`]).
 pub struct JsonlSource {
-    chunker: Chunker<Box<dyn std::io::Read + Send>>,
+    /// Chunks from the reader thread, which keeps reading while waves decode.
+    chunks: std::sync::mpsc::Receiver<Result<crate::chunk::Chunk>>,
+    /// The wave being decoded in the background while the caller writes the last one.
+    decoding: Option<std::sync::mpsc::Receiver<Result<Vec<Option<RecordBatch>>>>>,
     layout: Arc<crate::jsonl::Layout>,
     schema: SchemaRef,
     warnings: Vec<String>,
@@ -971,7 +974,6 @@ pub struct JsonlSource {
     consumed: Arc<std::sync::atomic::AtomicU64>,
     total: u64,
     pool: Arc<rayon::ThreadPool>,
-    done: bool,
 }
 
 impl JsonlSource {
@@ -988,18 +990,67 @@ impl JsonlSource {
         let schema = layout.schema();
         let input = crate::io::open_input(path)?;
         let reader: Box<dyn std::io::Read + Send> = Box::new(crate::io::SkipBom::new(input.reader));
-        let chunker = Chunker::new(reader, chunk_size, None, b'\n');
+        let mut chunker = Chunker::new(reader, chunk_size, None, b'\n');
+        let wave = wave.max(1);
+        let (tx, chunks) = std::sync::mpsc::sync_channel(wave * 2);
+        std::thread::Builder::new()
+            .name("dataconv-jsonl-reader".into())
+            .spawn(move || {
+                let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
+                    match chunker.next_chunk() {
+                        Ok(Some(c)) => {
+                            if tx.send(Ok(c)).is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) => return,
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
+                            return;
+                        }
+                    }
+                }));
+                if read.is_err() {
+                    let _ = tx.send(Err(Error::Data("internal error while reading the input".into())));
+                }
+            })
+            .map_err(Error::from)?;
         Ok(JsonlSource {
-            chunker,
+            chunks,
+            decoding: None,
             layout: Arc::new(layout),
             schema,
             warnings,
-            wave: wave.max(1),
+            wave,
             consumed: input.consumed,
             total: input.file_size,
             pool,
-            done: false,
         })
+    }
+
+    /// Start decoding the next wave of chunks in the background; false at the end.
+    fn start_wave(&mut self) -> Result<bool> {
+        let mut wave = Vec::with_capacity(self.wave);
+        while wave.len() < self.wave {
+            match self.chunks.recv() {
+                Ok(chunk) => wave.push(chunk?),
+                Err(_) => break,
+            }
+        }
+        if wave.is_empty() {
+            return Ok(false);
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let (layout, schema) = (self.layout.clone(), self.schema.clone());
+        self.pool.spawn(move || {
+            let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                wave.par_iter().map(|c| crate::jsonl::decode(&layout, &schema, &c.data, c.offset)).collect()
+            }))
+            .unwrap_or_else(|_| Err(Error::Data("internal error while decoding JSON".into())));
+            let _ = tx.send(decoded);
+        });
+        self.decoding = Some(rx);
+        Ok(true)
     }
 }
 
@@ -1009,26 +1060,13 @@ impl Source for JsonlSource {
     }
 
     fn next_wave(&mut self) -> Result<Option<Vec<RecordBatch>>> {
-        if self.done {
+        if self.decoding.is_none() && !self.start_wave()? {
             return Ok(None);
         }
-        let mut chunks = Vec::new();
-        while chunks.len() < self.wave {
-            match self.chunker.next_chunk()? {
-                Some(c) => chunks.push(c),
-                None => {
-                    self.done = true;
-                    break;
-                }
-            }
-        }
-        if chunks.is_empty() {
-            return Ok(None);
-        }
-        let (layout, schema) = (self.layout.clone(), self.schema.clone());
-        let parts: Vec<Option<RecordBatch>> = self.pool.install(|| {
-            chunks.par_iter().map(|c| crate::jsonl::decode(&layout, &schema, &c.data, c.offset)).collect::<Result<_>>()
-        })?;
+        let decoded = self.decoding.take().expect("a wave is decoding");
+        let parts = decoded.recv().map_err(|_| Error::Data("a JSON decoding worker stopped".into()))??;
+        // the next wave decodes while the caller writes this one
+        self.start_wave()?;
         Ok(Some(parts.into_iter().flatten().collect()))
     }
 

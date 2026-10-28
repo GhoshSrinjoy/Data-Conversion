@@ -352,6 +352,19 @@ fn jsonl_round_trips_losslessly() {
 }
 
 #[test]
+fn json_output_writes_times_like_csv() {
+    let d = dir("json-times");
+    let src = d.join("t.csv");
+    std::fs::write(&src, "t,u,d\n2024-01-02T03:04:05.5+05:30,2024-01-02 03:04:05,2024-01-02\n").unwrap();
+    let out = d.join("t.jsonl");
+    convert(&src, &out, &opts(), &NoHooks).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "{\"t\":\"2024-01-02T03:04:05.5+05:30\",\"u\":\"2024-01-02T03:04:05\",\"d\":\"2024-01-02\"}\n"
+    );
+}
+
+#[test]
 fn jsonl_types_widen_beyond_the_sample() {
     let d = dir("jsonl-replan");
     let src = d.join("late.jsonl");

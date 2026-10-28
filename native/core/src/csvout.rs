@@ -71,7 +71,7 @@ pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-fn write_date(out: &mut Vec<u8>, days: i64) {
+pub(crate) fn write_date(out: &mut Vec<u8>, days: i64) {
     let (y, m, d) = civil_from_days(days);
     if (0..=9999).contains(&y) {
         let _ = write!(out, "{y:04}-{m:02}-{d:02}");
@@ -128,6 +128,23 @@ fn write_timestamp(out: &mut Vec<u8>, value: i64, unit: TimeUnit, offset: Option
         }
         None => {}
     }
+}
+
+/// The UTC offset a timestamp column is printed in: its own fixed offset, UTC for
+/// named zones (whose rules are not at hand), none without a time zone.
+pub(crate) fn timestamp_offset(tz: Option<&str>) -> Option<i32> {
+    tz.map(|tz| tz_offset_minutes(tz).unwrap_or(0))
+}
+
+/// A timestamp column's value at `i`, as CSV and JSON output write it.
+pub(crate) fn write_timestamp_at(out: &mut Vec<u8>, a: &dyn Array, i: usize, unit: TimeUnit, offset: Option<i32>) {
+    let v = match unit {
+        TimeUnit::Second => a.as_any().downcast_ref::<TimestampSecondArray>().unwrap().value(i),
+        TimeUnit::Millisecond => a.as_any().downcast_ref::<TimestampMillisecondArray>().unwrap().value(i),
+        TimeUnit::Microsecond => a.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().value(i),
+        TimeUnit::Nanosecond => a.as_any().downcast_ref::<TimestampNanosecondArray>().unwrap().value(i),
+    };
+    write_timestamp(out, v, unit, offset);
 }
 
 pub fn write_decimal(out: &mut Vec<u8>, v: i128, scale: i8) {
@@ -230,17 +247,7 @@ impl<'a> Col<'a> {
             DataType::Float64 => Col::F64(array.as_primitive()),
             DataType::Decimal128(_, s) => Col::Dec(array.as_primitive(), *s),
             DataType::Date32 => Col::Date(array.as_primitive()),
-            DataType::Timestamp(unit, tz) => {
-                let offset = match tz {
-                    None => None,
-                    Some(tz) => match tz_offset_minutes(tz) {
-                        Some(m) => Some(m),
-                        // Named zones (e.g. Europe/Paris): print UTC instants.
-                        None => Some(0),
-                    },
-                };
-                Col::Ts(array.as_ref(), *unit, offset)
-            }
+            DataType::Timestamp(unit, tz) => Col::Ts(array.as_ref(), *unit, timestamp_offset(tz.as_deref())),
             DataType::Struct(_)
             | DataType::List(_)
             | DataType::LargeList(_)
@@ -276,15 +283,7 @@ impl<'a> Col<'a> {
             Col::F64(a) => float_text(out, a.value(i)),
             Col::Dec(a, s) => write_decimal(out, a.value(i), *s),
             Col::Date(a) => write_date(out, a.value(i) as i64),
-            Col::Ts(a, unit, offset) => {
-                let v = match unit {
-                    TimeUnit::Second => a.as_any().downcast_ref::<TimestampSecondArray>().unwrap().value(i),
-                    TimeUnit::Millisecond => a.as_any().downcast_ref::<TimestampMillisecondArray>().unwrap().value(i),
-                    TimeUnit::Microsecond => a.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap().value(i),
-                    TimeUnit::Nanosecond => a.as_any().downcast_ref::<TimestampNanosecondArray>().unwrap().value(i),
-                };
-                write_timestamp(out, v, *unit, *offset);
-            }
+            Col::Ts(a, unit, offset) => write_timestamp_at(out, *a, i, *unit, *offset),
             Col::Json(e) => {
                 let mut text = Vec::new();
                 e.encode(i, &mut text);

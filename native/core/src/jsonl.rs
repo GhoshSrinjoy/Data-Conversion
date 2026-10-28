@@ -18,8 +18,10 @@
 //! [`Error::Replan`]; the caller infers again from the whole file and starts over.
 //!
 //! Writing goes through arrow-json, except that non-finite floats are written as the
-//! strings above (JSON has no NaN), so they read back as floats.
+//! strings above (JSON has no NaN), so they read back as floats, and dates and
+//! timestamps are written exactly as in CSV output.
 
+use std::borrow::Cow;
 use std::io::Read;
 use std::sync::Arc;
 
@@ -29,10 +31,12 @@ use arrow::array::{
     RecordBatch, RecordBatchOptions, StringBuilder, StructArray,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
-use arrow::datatypes::{DataType, Field, FieldRef, Fields, Float32Type, Float64Type, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Date32Type, Field, FieldRef, Fields, Float32Type, Float64Type, Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::json::writer::{Encoder, EncoderFactory, EncoderOptions, NullableEncoder};
 use rayon::prelude::*;
+use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
+use serde_json::value::RawValue;
 use serde_json::Value;
 
 use crate::chunk::Chunker;
@@ -129,6 +133,27 @@ impl Keys {
         match self.index.get(key) {
             Some(&i) => absorb(&mut self.kinds[i], v),
             None => self.push(key.to_owned(), observe(v)),
+        }
+    }
+
+    /// Fold in a value given as raw JSON text (scalars need no parsed tree).
+    fn absorb_raw(&mut self, key: &str, raw: &str) {
+        let kind = match raw.as_bytes().first() {
+            Some(b'{' | b'[') => match serde_json::from_str::<Value>(raw) {
+                Ok(v) => return self.absorb(key, &v),
+                Err(_) => Kind::Mixed,
+            },
+            Some(b'"') => match string_text(raw) {
+                Some(s) if nan_text(&s).is_some() => Kind::NanText,
+                _ => Kind::Str,
+            },
+            Some(b't' | b'f') => Kind::Bool,
+            Some(b'n') => Kind::Null,
+            _ => Kind::Num(Num::of(raw)),
+        };
+        match self.index.get(key) {
+            Some(&i) => merge(&mut self.kinds[i], kind),
+            None => self.push(key.to_owned(), kind),
         }
     }
 
@@ -254,20 +279,19 @@ fn absorb_lines(data: &[u8], offset: u64) -> Result<Keys> {
         if line.iter().all(|b| b.is_ascii_whitespace()) {
             continue;
         }
-        match parse_line(line, at)? {
-            Value::Object(m) => {
-                for (k, x) in &m {
-                    keys.absorb(k, x);
-                }
-            }
-            _ => return Err(not_object(at)),
+        let record: RawRecord = serde_json::from_slice(line).map_err(|e| invalid_line(e, at))?;
+        for (key, raw) in &record.0 {
+            keys.absorb_raw(&key.0, raw.get());
         }
     }
     Ok(keys)
 }
 
-fn parse_line(line: &[u8], at: u64) -> Result<Value> {
-    serde_json::from_slice(line).map_err(|e| Error::Data(format!("invalid JSON in the line at byte {at}: {e}")))
+fn invalid_line(e: serde_json::Error, at: u64) -> Error {
+    match e.classify() {
+        serde_json::error::Category::Data => not_object(at),
+        _ => Error::Data(format!("invalid JSON in the line at byte {at}: {e}")),
+    }
 }
 
 fn not_object(at: u64) -> Error {
@@ -568,9 +592,173 @@ impl Builder {
     }
 }
 
+/// A key, borrowed from the line unless it holds escapes.
+struct Key<'de>(Cow<'de, str>);
+
+impl<'de> Deserialize<'de> for Key<'de> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct KeyVisitor;
+        impl<'de> Visitor<'de> for KeyVisitor {
+            type Value = Key<'de>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a key")
+            }
+            fn visit_borrowed_str<E>(self, v: &'de str) -> std::result::Result<Key<'de>, E> {
+                Ok(Key(Cow::Borrowed(v)))
+            }
+            fn visit_str<E>(self, v: &str) -> std::result::Result<Key<'de>, E> {
+                Ok(Key(Cow::Owned(v.to_owned())))
+            }
+        }
+        d.deserialize_str(KeyVisitor)
+    }
+}
+
+/// The fields of one record in file order, each value as its raw JSON text: the
+/// parser only checks the syntax and finds where values end, and the columns read
+/// the text themselves (exactly, and without building a tree per value).
+struct RawRecord<'de>(Vec<(Key<'de>, &'de RawValue)>);
+
+impl<'de> Deserialize<'de> for RawRecord<'de> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct RecordVisitor;
+        impl<'de> Visitor<'de> for RecordVisitor {
+            type Value = RawRecord<'de>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<RawRecord<'de>, A::Error> {
+                let mut fields = Vec::with_capacity(map.size_hint().unwrap_or(16));
+                while let Some(key) = map.next_key::<Key<'de>>()? {
+                    fields.push((key, map.next_value::<&'de RawValue>()?));
+                }
+                Ok(RawRecord(fields))
+            }
+        }
+        d.deserialize_map(RecordVisitor)
+    }
+}
+
+/// The text of a JSON number value, or None for other values.
+fn number_text(raw: &str) -> Option<&str> {
+    raw.as_bytes().first().is_some_and(|&b| b == b'-' || b.is_ascii_digit()).then_some(raw)
+}
+
+/// The content of a JSON string value (unescaped), or None for other values.
+fn string_text(raw: &str) -> Option<Cow<'_, str>> {
+    let inner = raw.strip_prefix('"')?.strip_suffix('"')?;
+    if inner.contains('\\') {
+        serde_json::from_str::<String>(raw).ok().map(Cow::Owned)
+    } else {
+        Some(Cow::Borrowed(inner))
+    }
+}
+
+/// A number's text as numbers kept as text are written (see the module notes): an
+/// exponent with a lower-case `e` and an explicit sign.
+fn canonical_number(t: &str) -> Cow<'_, str> {
+    match t.find(['e', 'E']) {
+        None => Cow::Borrowed(t),
+        Some(i) => {
+            let (mantissa, rest) = (&t[..i], &t[i + 1..]);
+            let sign = if rest.starts_with(['+', '-']) { "" } else { "+" };
+            Cow::Owned(format!("{mantissa}e{sign}{rest}"))
+        }
+    }
+}
+
+/// A short description of a raw value that does not fit its column.
+fn shown_raw(raw: &str) -> String {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(v) => shown(&v),
+        Err(_) => raw.chars().take(60).collect(),
+    }
+}
+
+impl Builder {
+    /// Append a value given as raw JSON text (None: the key is absent).
+    fn append_raw(&mut self, raw: Option<&str>) -> std::result::Result<(), String> {
+        let Some(raw) = raw.filter(|r| *r != "null") else {
+            self.append_null();
+            return Ok(());
+        };
+        let fits = match self {
+            Builder::Int(b) => match number_text(raw).map(|t| (t, t.parse::<i64>())) {
+                Some((t, Ok(x))) if t != "-0" => {
+                    b.append_value(x);
+                    true
+                }
+                _ => false,
+            },
+            Builder::Float(b) => match number_text(raw) {
+                Some(t) => match parse_float(t.as_bytes(), false) {
+                    Some(f) if f.lossless => {
+                        b.append_value(f.value);
+                        true
+                    }
+                    _ => false,
+                },
+                None => match string_text(raw).as_deref().and_then(nan_text) {
+                    Some(x) => {
+                        b.append_value(x);
+                        true
+                    }
+                    None => false,
+                },
+            },
+            Builder::Decimal(b, p, s) => match number_text(raw).and_then(|t| parse_decimal(t.as_bytes(), *s as u8)) {
+                Some(x) if x.unsigned_abs() < 10u128.pow(*p as u32) => {
+                    b.append_value(x);
+                    true
+                }
+                _ => false,
+            },
+            Builder::Text(b, TextMode::Text) => match string_text(raw) {
+                Some(s) => {
+                    b.append_value(&*s);
+                    true
+                }
+                None => false,
+            },
+            Builder::Text(b, TextMode::NumText) => match number_text(raw) {
+                Some(t) => {
+                    b.append_value(&*canonical_number(t));
+                    true
+                }
+                None => match string_text(raw) {
+                    Some(s) if nan_text(&s).is_some() => {
+                        b.append_value(&*s);
+                        true
+                    }
+                    _ => false,
+                },
+            },
+            Builder::Bool(b) => match raw {
+                "true" | "false" => {
+                    b.append_value(raw == "true");
+                    true
+                }
+                _ => false,
+            },
+            // mixed-type and nested values go through a parsed tree
+            Builder::Text(_, TextMode::Json) | Builder::Struct(..) | Builder::List(..) => {
+                let v: Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
+                return self.append(Some(&v));
+            }
+        };
+        if fits {
+            Ok(())
+        } else {
+            Err(shown_raw(raw))
+        }
+    }
+}
+
 /// Decode whole lines of JSON into one batch (None when there are no records).
 pub fn decode(layout: &Layout, schema: &SchemaRef, data: &[u8], offset: u64) -> Result<Option<RecordBatch>> {
     let mut cols: Vec<Builder> = layout.plans.iter().map(Builder::new).collect();
+    // where each column's value sits in the current line (the last of duplicate keys)
+    let mut slots: Vec<Option<(usize, usize)>> = vec![None; cols.len()];
     let mut rows = 0usize;
     let mut pos = 0usize;
     for line in data.split(|&b| b == b'\n') {
@@ -579,12 +767,19 @@ pub fn decode(layout: &Layout, schema: &SchemaRef, data: &[u8], offset: u64) -> 
         if line.iter().all(|b| b.is_ascii_whitespace()) {
             continue;
         }
-        let Value::Object(m) = parse_line(line, at)? else { return Err(not_object(at)) };
-        if let Some(key) = m.keys().find(|k| !layout.index.contains_key(k.as_str())) {
-            return Err(Error::Replan(format!("key '{key}' first appears beyond the inference sample")));
+        let record: RawRecord = serde_json::from_slice(line).map_err(|e| invalid_line(e, at))?;
+        slots.fill(None);
+        for (key, raw) in &record.0 {
+            let Some(&i) = layout.index.get(key.0.as_ref()) else {
+                return Err(Error::Replan(format!("key '{}' first appears beyond the inference sample", key.0)));
+            };
+            let text = raw.get();
+            slots[i] = Some((text.as_ptr() as usize - line.as_ptr() as usize, text.len()));
         }
-        for ((name, b), p) in layout.names.iter().zip(cols.iter_mut()).zip(&layout.plans) {
-            b.append(m.get(name)).map_err(|value| {
+        // the line is valid JSON, hence UTF-8, and every slot holds a whole value
+        let text = std::str::from_utf8(line).map_err(|_| not_object(at))?;
+        for (((name, b), p), slot) in layout.names.iter().zip(cols.iter_mut()).zip(&layout.plans).zip(&slots) {
+            b.append_raw(slot.map(|(s, l)| &text[s..s + l])).map_err(|value| {
                 Error::Replan(format!("column '{name}': value {value} does not fit {}", p.data_type()))
             })?;
         }
@@ -611,9 +806,30 @@ pub fn read_text(text: &[u8]) -> Result<Option<RecordBatch>> {
 // ---------------------------------------------------------------------------------
 
 /// Writes non-finite floats as "NaN", "Infinity" and "-Infinity" (JSON has no such
-/// numbers and arrow-json would write null).
+/// numbers and arrow-json would write null), and dates and timestamps as CSV output
+/// writes them.
 #[derive(Debug)]
 pub struct FloatText;
+
+/// Dates and timestamps as JSON strings in the CSV output's format.
+struct TemporalEncoder<'a>(&'a dyn Array);
+
+impl Encoder for TemporalEncoder<'_> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        out.push(b'"');
+        match self.0.data_type() {
+            DataType::Timestamp(unit, tz) => crate::csvout::write_timestamp_at(
+                out,
+                self.0,
+                idx,
+                *unit,
+                crate::csvout::timestamp_offset(tz.as_deref()),
+            ),
+            _ => crate::csvout::write_date(out, self.0.as_primitive::<Date32Type>().value(idx) as i64),
+        }
+        out.push(b'"');
+    }
+}
 
 struct FloatEncoder<'a>(&'a dyn Array);
 
@@ -647,6 +863,9 @@ impl EncoderFactory for FloatText {
         Ok(match array.data_type() {
             DataType::Float32 | DataType::Float64 => {
                 Some(NullableEncoder::new(Box::new(FloatEncoder(array)), array.nulls().cloned()))
+            }
+            DataType::Timestamp(..) | DataType::Date32 => {
+                Some(NullableEncoder::new(Box::new(TemporalEncoder(array)), array.nulls().cloned()))
             }
             _ => None,
         })

@@ -1422,7 +1422,10 @@ fn table_attempt(
         Format::Ipc => Box::new(tables::IpcSource::open(src, plan.threads * 2, opts.columns.as_deref())?),
         Format::Jsonl => {
             let sample = (!full_scan).then(|| opts.sample_bytes.unwrap_or(64 << 20).max(64 << 10) as u64);
-            Box::new(tables::JsonlSource::open(src, plan.chunk_size, plan.wave_chunks, pool.clone(), sample)?)
+            // waves of one modest chunk per thread, so that reading, decoding and
+            // writing overlap (a whole-file wave would leave nothing to overlap)
+            let chunk = plan.chunk_size.min(8 << 20);
+            Box::new(tables::JsonlSource::open(src, chunk, plan.threads.max(1), pool.clone(), sample)?)
         }
         _ => unreachable!(),
     };
