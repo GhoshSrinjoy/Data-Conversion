@@ -552,6 +552,33 @@ fn nulls_among_dictionary_values_stay_null() {
 }
 
 #[test]
+fn damaged_arrow_files_are_errors() {
+    use arrow::array::{ArrayRef, StringArray};
+    use std::sync::Arc;
+
+    let d = dir("damaged-ipc");
+    let names: Vec<String> = (0..50).map(|i| format!("name-{i}")).collect();
+    let col: ArrayRef = Arc::new(StringArray::from(names));
+    let batch = RecordBatch::try_from_iter([("s", col)]).unwrap();
+    let src = d.join("f.arrow");
+    let mut w = arrow::ipc::writer::FileWriter::try_new(File::create(&src).unwrap(), &batch.schema()).unwrap();
+    w.write(&batch).unwrap();
+    w.finish().unwrap();
+    drop(w);
+    let good = std::fs::read(&src).unwrap();
+    let flip = d.join("flip.arrow");
+    let out = d.join("flip.csv");
+    for i in 0..good.len() {
+        let mut bad = good.clone();
+        bad[i] ^= 0x80;
+        std::fs::write(&flip, &bad).unwrap();
+        // an error or a result, never a panic
+        let _ = convert(&flip, &out, &ConvertOptions { overwrite: true, ..opts() }, &NoHooks);
+        let _ = dataconv_core::inspect::count(&flip, &opts());
+    }
+}
+
+#[test]
 fn half_floats_read_back_exactly() {
     use arrow::array::Float32Array;
     use arrow::datatypes::DataType;

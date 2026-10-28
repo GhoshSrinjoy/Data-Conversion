@@ -932,9 +932,38 @@ enum IpcLayout {
 /// starts with `ARROW1` and has an index) or the stream format.
 pub struct IpcBatches {
     layout: IpcLayout,
+    path: PathBuf,
+    /// Set after an error: a reader that failed on damaged data is not asked again.
+    failed: bool,
     pub schema: SchemaRef,
     /// Batches in the file; the stream format has no index.
     pub batches: Option<usize>,
+}
+
+thread_local! {
+    /// Set while decoding data that may be damaged: a panic there is the data's fault,
+    /// caught and reported as an error, so the panic hook stays quiet about it.
+    static DAMAGE_EXPECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` on Arrow IPC data that may be damaged.  arrow-rs can panic on such data (a
+/// buffer sliced past its end) instead of returning an error: the panic becomes an
+/// error naming the file.
+fn decoding<T>(path: &Path, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    static QUIET_HOOK: std::sync::Once = std::sync::Once::new();
+    QUIET_HOOK.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !DAMAGE_EXPECTED.with(|d| d.get()) {
+                default(info)
+            }
+        }));
+    });
+    DAMAGE_EXPECTED.with(|d| d.set(true));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    DAMAGE_EXPECTED.with(|d| d.set(false));
+    result
+        .unwrap_or_else(|_| Err(Error::Format(format!("{} is damaged: it is not a valid Arrow file", path.display()))))
 }
 
 impl IpcBatches {
@@ -947,14 +976,20 @@ impl IpcBatches {
             )));
         }
         let file = BufReader::new(File::open(path).map_err(|e| Error::io(e, path))?);
-        if head == b"ARROW1" {
-            let r = arrow::ipc::reader::FileReader::try_new(file, None)?;
-            let (schema, batches) = (r.schema(), Some(r.num_batches()));
-            Ok(IpcBatches { layout: IpcLayout::File(r), schema, batches })
-        } else {
-            let r = arrow::ipc::reader::StreamReader::try_new(file, None)?;
-            Ok(IpcBatches { schema: r.schema(), layout: IpcLayout::Stream(r), batches: None })
-        }
+        let (layout, batches) = decoding(path, || {
+            Ok(if head == b"ARROW1" {
+                let r = arrow::ipc::reader::FileReader::try_new(file, None)?;
+                let batches = Some(r.num_batches());
+                (IpcLayout::File(r), batches)
+            } else {
+                (IpcLayout::Stream(arrow::ipc::reader::StreamReader::try_new(file, None)?), None)
+            })
+        })?;
+        let schema = match &layout {
+            IpcLayout::File(r) => r.schema(),
+            IpcLayout::Stream(r) => r.schema(),
+        };
+        Ok(IpcBatches { layout, path: path.to_path_buf(), failed: false, schema, batches })
     }
 }
 
@@ -962,11 +997,22 @@ impl Iterator for IpcBatches {
     type Item = Result<RecordBatch>;
 
     fn next(&mut self) -> Option<Result<RecordBatch>> {
-        let next = match &mut self.layout {
-            IpcLayout::File(r) => r.next(),
-            IpcLayout::Stream(r) => r.next(),
+        if self.failed {
+            return None;
+        }
+        let IpcBatches { layout, path, .. } = self;
+        let next = decoding(path, || {
+            Ok(match layout {
+                IpcLayout::File(r) => r.next(),
+                IpcLayout::Stream(r) => r.next(),
+            })
+        });
+        let next = match next {
+            Ok(n) => n.map(|b| b.map_err(Error::from)),
+            Err(e) => Some(Err(e)),
         };
-        next.map(|b| b.map_err(Error::from))
+        self.failed = matches!(next, Some(Err(_)));
+        next
     }
 }
 
