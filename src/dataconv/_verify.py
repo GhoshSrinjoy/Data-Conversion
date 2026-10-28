@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import _compat, formats
 from ._util import PathLike
@@ -20,6 +20,41 @@ def _bytes_equal(a: Path, b: Path) -> bool:
                 return False
             if not x:
                 return True
+
+
+def _same(pa: Any, x: Any, y: Any) -> Any:
+    """Element-wise equality where null equals null and NaN equals NaN."""
+    pc = pa.compute
+    same = pc.or_kleene(pc.equal(x, y), pc.and_(pc.is_null(x), pc.is_null(y)))
+    if pa.types.is_floating(x.type) and pa.types.is_floating(y.type):
+        same = pc.or_kleene(same, pc.and_(pc.is_nan(x), pc.is_nan(y)))
+    return pc.fill_null(same, False)
+
+
+def _lossless_cast(pa: Any, col: Any, ty: Any) -> Any:
+    """``col`` cast to ``ty`` when that keeps every value (casting back gives the same
+    column), else None: "007" -> 7 is a cast that would make different data equal."""
+    try:
+        cast = col.cast(ty)
+        back = cast.cast(col.type)
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError, OverflowError, ValueError):
+        return None
+    return cast if pa.compute.all(_same(pa, back, col)).as_py() is not False else None
+
+
+def _common(pa: Any, ca: Any, cb: Any) -> Tuple[Any, Any]:
+    """Both columns in one type, reached without losing anything; text when no type
+    holds both sides losslessly (so values that differ never compare equal)."""
+    cast_b = _lossless_cast(pa, cb, ca.type)
+    if cast_b is not None:
+        return ca, cast_b
+    cast_a = _lossless_cast(pa, ca, cb.type)
+    if cast_a is not None:
+        return cast_a, cb
+    try:
+        return ca.cast(pa.string()), cb.cast(pa.string())
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError):
+        return ca, cb
 
 
 def digest(path: PathLike) -> str:
@@ -82,19 +117,10 @@ def verify(a: PathLike, b: PathLike, *, max_differences: int = 10, **options: An
         n = min(len(ca), len(cb))
         ca, cb = ca.slice(0, n), cb.slice(0, n)
         if ca.type != cb.type:
-            try:
-                cb = cb.cast(ca.type)
-            except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
-                try:
-                    ca = ca.cast(cb.type)
-                except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
-                    ca, cb = ca.cast(pa.string()), cb.cast(pa.string())
+            ca, cb = _common(pa, ca, cb)
         if ca.equals(cb):
             continue
-        same = pc.or_kleene(pc.equal(ca, cb), pc.and_(pc.is_null(ca), pc.is_null(cb)))
-        if pa.types.is_floating(ca.type):
-            same = pc.or_kleene(same, pc.and_(pc.is_nan(ca), pc.is_nan(cb)))
-        bad = pc.invert(pc.fill_null(same, False))
+        bad = pc.invert(_same(pa, ca, cb))
         idx = pc.indices_nonzero(bad) if hasattr(pc, "indices_nonzero") else None
         rows = idx.to_pylist()[:max_differences] if idx is not None else []
         if not rows and not pc.any(bad).as_py():

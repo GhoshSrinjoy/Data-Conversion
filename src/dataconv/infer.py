@@ -16,11 +16,10 @@ engine converts it.
 
 from __future__ import annotations
 
-import datetime as _dt
 import math
 import re
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Context, Decimal
 from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 NULL_TOKENS = frozenset(["", "NA", "N/A", "n/a", "na", "NULL", "null", "Null", "None", "none", "nil", "NIL", "#N/A", "-"])
@@ -39,7 +38,8 @@ _TS = re.compile(
     r"(Z|[+-][0-9]{2}(?::?[0-9]{2})?)?"
 )
 INT64_MIN, INT64_MAX = -(1 << 63), (1 << 63) - 1
-_EPOCH = _dt.date(1970, 1, 1).toordinal()
+#: Exact arithmetic for decimal(38, s) values (the default context keeps 28 digits).
+DECIMAL_CONTEXT = Context(prec=100)
 
 
 def is_null(v: str, extra: Sequence[str] = ()) -> bool:
@@ -98,9 +98,7 @@ def parse_float(v: str, loose: bool = False) -> Optional[FloatInfo]:
     sig = stripped.rstrip("0")
     if loose or not sig:
         lossless = math.isfinite(value) or loose
-    elif not math.isfinite(value) or value == 0.0:
-        lossless = False
-    elif len(sig) >= 18:
+    elif not math.isfinite(value) or value == 0.0 or len(sig) >= 18:
         lossless = False
     elif len(sig) <= 15 and abs(value) >= 2.2250738585072014e-308:
         lossless = True
@@ -124,7 +122,7 @@ def _days_in_month(y: int, m: int) -> int:
 
 def days_from_civil(y: int, m: int, d: int) -> int:
     y = y - 1 if m <= 2 else y
-    era = (y if y >= 0 else y - 399) // 400
+    era = y // 400  # floor division (the C original adjusts truncating division for y < 0)
     yoe = y - era * 400
     mp = (m + 9) % 12
     doy = (153 * mp + 2) // 5 + d - 1
@@ -194,6 +192,85 @@ def tz_name(offset: int) -> str:
 
 def unit_for(frac_digits: int) -> str:
     return "s" if frac_digits == 0 else "ms" if frac_digits <= 3 else "us" if frac_digits <= 6 else "ns"
+
+
+# ---------------------------------------------------------------------------------
+# Output formatting (identical to the native writers)
+# ---------------------------------------------------------------------------------
+
+TICKS = {"s": 1, "ms": 1000, "us": 1_000_000, "ns": 1_000_000_000}
+_FRAC_WIDTH = {"s": 0, "ms": 3, "us": 6, "ns": 9}
+
+
+def civil_from_days(z: int) -> Tuple[int, int, int]:
+    """Days since 1970-01-01 -> (year, month, day), for any year."""
+    z += 719468
+    era = z // 146097
+    doe = z - era * 146097
+    yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
+    doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
+    mp = (5 * doy + 2) // 153
+    d = doy - (153 * mp + 2) // 5 + 1
+    m = mp + 3 if mp < 10 else mp - 9
+    y = yoe + era * 400
+    return (y + 1 if m <= 2 else y), m, d
+
+
+def format_date(days: int) -> str:
+    y, m, d = civil_from_days(days)
+    return f"{y:04d}-{m:02d}-{d:02d}" if 0 <= y <= 9999 else f"{y}-{m:02d}-{d:02d}"
+
+
+def tz_offset_minutes(tz: Optional[str]) -> Optional[int]:
+    """UTC offset of a time zone name; named zones (e.g. Europe/Paris) print as UTC."""
+    if tz is None:
+        return None
+    if tz.lower() in ("utc", "z", "+00:00", "-00:00"):
+        return 0
+    if len(tz) == 6 and tz[0] in "+-" and tz[3] == ":" and tz[1:3].isdigit() and tz[4:6].isdigit():
+        minutes = int(tz[1:3]) * 60 + int(tz[4:6])
+        return -minutes if tz[0] == "-" else minutes
+    return 0
+
+
+def format_timestamp(value: int, unit: str, offset: Optional[int]) -> str:
+    """ISO 8601 text of ``value`` ticks of ``unit`` since the epoch (UTC), shown in the
+    column's offset: fraction digits down to the unit (trailing zeros dropped), and
+    ``Z`` for UTC."""
+    secs, frac = divmod(value, TICKS[unit])
+    if offset is not None:
+        secs += offset * 60
+    days, tod = divmod(secs, 86400)
+    out = f"{format_date(days)}T{tod // 3600:02d}:{tod // 60 % 60:02d}:{tod % 60:02d}"
+    if frac:
+        out += "." + f"{frac:0{_FRAC_WIDTH[unit]}d}".rstrip("0")
+    if offset == 0:
+        return out + "Z"
+    if offset is not None:
+        return out + f"{'-' if offset < 0 else '+'}{abs(offset) // 60:02d}:{abs(offset) % 60:02d}"
+    return out
+
+
+def format_time(value: int, unit: str) -> str:
+    """Time of day of ``value`` ticks since midnight (fraction in 3, 6 or 9 digits)."""
+    secs, frac = divmod(value, TICKS[unit])
+    nanos = frac * (1_000_000_000 // TICKS[unit])
+    out = f"{secs // 3600:02d}:{secs // 60 % 60:02d}:{secs % 60:02d}"
+    if nanos:
+        out += f".{nanos // 1_000_000:03d}" if nanos % 1_000_000 == 0 else f".{nanos // 1000:06d}" if nanos % 1000 == 0 else f".{nanos:09d}"
+    return out
+
+
+def format_duration(value: int, unit: str) -> str:
+    """ISO 8601 duration (``PT1.5S``; ``P0D`` for zero)."""
+    sign = "-" if value < 0 else ""
+    secs, frac = divmod(abs(value), TICKS[unit])
+    if not secs and not frac:
+        return "P0D"
+    out = f"{sign}PT{secs}"
+    if frac:
+        out += "." + f"{frac:0{_FRAC_WIDTH[unit]}d}".rstrip("0")
+    return out + "S"
 
 
 # ---------------------------------------------------------------------------------
@@ -443,15 +520,6 @@ class Violation(ValueError):
         self.value = value
 
 
-def _tzinfo(tz: Optional[str]) -> Optional[_dt.tzinfo]:
-    if tz is None:
-        return None
-    if tz == "UTC":
-        return _dt.timezone.utc
-    sign = -1 if tz[0] == "-" else 1
-    return _dt.timezone(sign * _dt.timedelta(hours=int(tz[1:3]), minutes=int(tz[4:6])))
-
-
 def converter(ty: LogicalType, mode: str = "infer", extra_nulls: Sequence[str] = ()):
     """A function text -> Python value for `ty` (raises Violation-style ValueError)."""
     loose = mode == "loose"
@@ -498,21 +566,23 @@ def converter(ty: LogicalType, mode: str = "infer", extra_nulls: Sequence[str] =
             frac = v.partition(".")[2]
             if len(frac) > ty.scale:
                 raise ValueError(v)
-            d = Decimal(v).quantize(quant)
-            if abs(d.scaleb(ty.scale)) >= limit or (v.startswith("-") and d == 0):
+            # 38 digits do not fit the default 28-digit context: compute exactly
+            d = Decimal(v).quantize(quant, context=DECIMAL_CONTEXT)
+            if d.scaleb(ty.scale, context=DECIMAL_CONTEXT).copy_abs() >= limit or (v.startswith("-") and d == 0):
                 raise ValueError(v)
             return d
     elif kind == "date":
+        # dates and timestamps become their canonical text (what every writer prints),
+        # so years 0000-9999 and nanoseconds survive (datetime cannot hold either)
         def conv(v, missing=False):
             if missing or nullish(v):
                 return None
             days = parse_date(v)
             if days is None:
                 raise ValueError(v)
-            return _dt.date.fromordinal(days + _EPOCH)
+            return format_date(days)
     else:
-        tzinfo = _tzinfo(ty.tz)
-        expect = None if ty.tz is None else (0 if ty.tz == "UTC" else int(tzinfo.utcoffset(None).total_seconds() // 60))  # type: ignore[union-attr]
+        expect = tz_offset_minutes(ty.tz)
         max_frac = {"s": 0, "ms": 3, "us": 6, "ns": 9}[ty.unit]
 
         def conv(v, missing=False):
@@ -521,7 +591,9 @@ def converter(ty: LogicalType, mode: str = "infer", extra_nulls: Sequence[str] =
             ts = parse_timestamp(v)
             if ts is None or ts.offset != expect or ts.frac_digits > max_frac:
                 raise ValueError(v)
-            base = _dt.datetime(1970, 1, 1) + _dt.timedelta(seconds=ts.local_seconds, microseconds=ts.nanos // 1000)
-            return base.replace(tzinfo=tzinfo) if tzinfo else base
+            ticks = ts.to_unit(ty.unit)
+            if not INT64_MIN <= ticks <= INT64_MAX:  # e.g. nanoseconds before 1677
+                raise ValueError(v)
+            return format_timestamp(ticks, ty.unit, expect)
 
     return conv

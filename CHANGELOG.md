@@ -18,10 +18,29 @@ A rewrite of the three original scripts into one package, `dataconv`.
   int64 or float64 precision, timestamps with unit and UTC offset, and
   missing-value markers only in typed columns.
 - **Recovery** instead of failure:
-  - re-planning when a value late in the file does not fit the inferred type;
+  - re-planning when a value late in the file does not fit the inferred type,
+    for CSV and JSON Lines alike;
   - Windows-1252 fallback for invalid UTF-8;
-  - quarantine of malformed rows (`--bad-lines`);
-  - atomic outputs.
+  - quarantine of malformed rows (`--bad-lines`), which never replaces the input
+    or an existing file without `--force`;
+  - a quote that is never closed costs only its own line, and quotes inside
+    fields are literal characters;
+  - atomic outputs, including splits (parts are published together) and Ctrl-C
+    in the standalone binary.
+- **Exact chunking.** Chunk boundaries follow the tokenizer's quote rules,
+  escape characters included, so a record is never cut in two whatever the
+  chunk size.
+- **Lossless JSON.** Integers beyond int64 and numbers with more digits than a
+  double holds become decimals; keys keep their order; mixed-type fields keep
+  their JSON text and are written back as JSON, so JSON → Parquet → JSON returns
+  the same values; NaN and Infinity survive a round trip.
+- **The same text from every engine**, whatever the column type: floats in their
+  shortest exact digits (float32 and float16 in their own precision), dates and
+  timestamps at any unit, nested values and maps as JSON, and nulls as empty
+  fields.
+- **Hardened decoders.** Corrupt DCZ and packed data fail with an integrity
+  error: every length is checked against the block index and the file size,
+  and decompressed sizes and allocations are bounded.
 - **DCZ**, a byte-exact, block-parallel columnar compressor for delimited text,
   with a pure-Python reader and writer
   ([format specification](docs/FORMAT.md)), and `pack`/`unpack` for lists and
@@ -32,8 +51,10 @@ A rewrite of the three original scripts into one package, `dataconv`.
   rows or measured target size, byte-exact for CSV), `merge` (schema
   unification), `info`, `head`, `count`, `schema`, `sniff`, `stats`, `verify`,
   `bench`, `compress`, `decompress` and `doctor`, each with `--json` output.
-- **Formats:** JSON arrays, ORC, Excel (read), and compressed inputs and outputs
-  (`.gz`, `.zst`, `.xz`, `.bz2`, `.lz4`, `.br`, `.zip`).
+- **Formats:** JSON arrays, ORC, Excel (read), Arrow IPC files and streams, and
+  compressed inputs and outputs (`.gz`, `.zst`, `.xz`, `.bz2`, `.lz4`, `.br`,
+  `.zip`). `compress` archives any file byte for byte, an already compressed one
+  included.
 - **Engines:** native, pyarrow and pure Python, chosen automatically. The pure
   engine runs on Python 3.8+ with no dependencies.
 

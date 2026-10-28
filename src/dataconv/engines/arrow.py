@@ -2,18 +2,21 @@
 
 CSV input is read as text in record-aligned chunks, and every column is cast with
 the same lossless guards as the native engine (vectorised with pyarrow.compute).
+Records are split by the quote rules every engine shares (see
+:mod:`dataconv._csvtok`): pyarrow parses the runs of records those rules leave
+regular, and the few records with stray, irregular or escaped quotes go through the
+Python tokenizer.
 """
 
 from __future__ import annotations
 
 import io
-import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import IO, Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
-from .. import _compat, _io, dcz, infer
+from .. import _compat, _csvtok, _io, dcz, infer
 from .._sniff import Dialect
 from .._util import atomic_output, prefetch
 from ..errors import DataError, FormatError
@@ -24,14 +27,17 @@ from . import pure
 
 Progress = Optional[Callable[[int, int], Any]]
 
-_INT_RE = r"^-?(0|[1-9][0-9]*)$"
+_INT_RE = r"^(0|-?[1-9][0-9]*)$"  # -0 is not an integer: only a float keeps its sign
 _INT_LOOSE_RE = r"^[+-]?[0-9]+$"
 _FLOAT_RE = r"^-?((0|[1-9][0-9]*)(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$|^-?([iI][nN][fF]([iI][nN][iI][tT][yY])?|[nN][aA][nN])$"
 _FLOAT_LOOSE_RE = r"^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$|^-?([iI][nN][fF]([iI][nN][iI][tT][yY])?|[nN][aA][nN])$"
-_PLAIN_DEC_RE = r"^-?[0-9]*(\.[0-9]*)?$"
+_PLAIN_DEC_RE = r"^-?(0|[1-9][0-9]*)?(\.[0-9]*)?$"  # canonical: leading zeros would be lost
+_NEG_ZERO_RE = r"^-0*\.?0*$"
 _DATE_RE = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
 _TS_RE = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9]{2}:[0-9]{2}(:[0-9]{2}(\.[0-9]{1,9})?)?(Z|[+-][0-9]{2}(:?[0-9]{2})?)?$"
 _BOOLS = ["true", "True", "TRUE", "false", "False", "FALSE"]
+_BOM = b"\xef\xbb\xbf"
+_ARROW_RUN = 1 << 12  # bytes of regular records worth a pyarrow call of their own (one costs ~0.1 ms)
 
 
 def _pa() -> Any:
@@ -45,6 +51,15 @@ def _pa() -> Any:
 class Violation(Exception):
     def __init__(self, column: int, value: str) -> None:
         super().__init__(value)
+        self.column = column
+        self.value = value
+
+
+class _Replan(Exception):
+    """A value later in a JSON or Excel file does not fit the planned column type."""
+
+    def __init__(self, column: str, value: str) -> None:
+        super().__init__(column)
         self.column = column
         self.value = value
 
@@ -66,29 +81,38 @@ def cast_column(arr: Any, ty: infer.LogicalType, mode: str, nulls: Sequence[str]
     arr = pc.if_else(pc.is_in(arr, value_set=pa.array(tokens, pa.string())), pa.scalar(None, pa.string()), arr)
 
     def require(ok: Any) -> None:
-        if not pc.all(pc.fill_null(ok, True)).as_py():
+        # an empty chunk has nothing to violate (pc.all of nothing is null)
+        if len(ok) and not pc.all(pc.fill_null(ok, True)).as_py():
             raise Violation(index, _first_bad(arr, ok))
 
     try:
         if ty.kind == "bool":
-            require(pc.is_in(arr, value_set=pa.array(_BOOLS)))
+            # is_in is False (not null) for a null: missing values must not fail the check
+            require(pc.or_(pc.is_null(arr), pc.is_in(arr, value_set=pa.array(_BOOLS))))
             truthy = pc.is_in(arr, value_set=pa.array(_BOOLS[:3]))
             return pc.if_else(pc.is_null(arr), pa.scalar(None, pa.bool_()), truthy)
         if ty.kind == "int64":
             require(pc.match_substring_regex(arr, _INT_LOOSE_RE if loose else _INT_RE))
+            if loose:  # '+5' is 5 in loose mode, as in the other engines
+                arr = pc.replace_substring_regex(arr, r"^\+", "")
             return pc.cast(arr, pa.int64())
         if ty.kind == "float64":
             require(pc.match_substring_regex(arr, _FLOAT_LOOSE_RE if loose else _FLOAT_RE))
             if not loose:
-                long = pc.greater_equal(pc.utf8_length(arr), 16)
-                if pc.any(pc.fill_null(long, False)).as_py():
-                    for v in pc.filter(arr, pc.fill_null(long, False)).to_pylist():
+                # the exact check of infer.parse_float for every value that could lose
+                # something: many digits, or an exponent (overflow to inf, underflow to 0)
+                risky = pc.fill_null(pc.or_(pc.greater_equal(pc.utf8_length(arr), 16), pc.match_substring_regex(arr, "[eE]")), False)
+                if pc.any(risky).as_py():
+                    for v in pc.unique(pc.filter(arr, risky)).to_pylist():
                         info = infer.parse_float(v)
                         if info is None or not info.lossless:
                             raise Violation(index, v)
             return pc.cast(arr, pa.float64())
         if ty.kind == "decimal":
             require(pc.match_substring_regex(arr, _PLAIN_DEC_RE))
+            negzero = pc.fill_null(pc.match_substring_regex(arr, _NEG_ZERO_RE), False)
+            if pc.any(negzero).as_py():  # a decimal cannot keep the sign of -0
+                raise Violation(index, str(pc.filter(arr, negzero)[0].as_py()))
             return pc.cast(arr, pa.decimal128(ty.precision, ty.scale))
         if ty.kind == "date":
             require(pc.match_substring_regex(arr, _DATE_RE))
@@ -98,7 +122,7 @@ def cast_column(arr: Any, ty: infer.LogicalType, mode: str, nulls: Sequence[str]
             # offsets and precision are checked per distinct value (timestamps repeat little,
             # but this stays exact); the cast itself then runs vectorised
             values = [v for v in pc.unique(arr).to_pylist() if v is not None]
-            expect = None if ty.tz is None else (0 if ty.tz == "UTC" else (1 if ty.tz[0] == "+" else -1) * (int(ty.tz[1:3]) * 60 + int(ty.tz[4:6])))
+            expect = infer.tz_offset_minutes(ty.tz)
             limit = {"s": 0, "ms": 3, "us": 6, "ns": 9}[ty.unit]
             for v in values:
                 ts = infer.parse_timestamp(v)
@@ -119,45 +143,64 @@ def cast_column(arr: Any, ty: infer.LogicalType, mode: str, nulls: Sequence[str]
 # ---------------------------------------------------------------------------------
 
 
-def _chunks(stream: Any, size: int, quote: Optional[str]) -> Iterator[bytes]:
-    carry = b""
-    while True:
-        data = stream.read(size)
-        if not data:
-            if carry:
-                yield carry
-            return
-        buf = carry + data
-        cut = dcz._record_boundary(buf, quote)
-        if cut == 0:
-            if len(buf) < size * 8:
-                carry = buf
-                continue
-            cut = buf.rfind(b"\n") + 1 or len(buf)
-        yield buf[:cut]
-        carry = buf[cut:]
+class _Utf8(io.RawIOBase):
+    """The UTF-8 bytes of a text stream in another encoding: decoding first keeps
+    record cuts on character boundaries (a UTF-16 line break is two bytes)."""
+
+    def __init__(self, text: IO[str]) -> None:
+        super().__init__()
+        self.text = text
+        self.pending = b""
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b: Any) -> int:
+        while not self.pending:
+            t = self.text.read(1 << 18)
+            if not t:
+                return 0
+            self.pending = t.encode("utf-8")
+        n = min(len(b), len(self.pending))
+        b[:n] = self.pending[:n]
+        self.pending = self.pending[n:]
+        return n
+
+    def close(self) -> None:
+        if not self.closed:
+            self.text.close()
+        super().close()
 
 
 class CsvReader:
-    """Record-aligned text chunks parsed by pyarrow, every column as strings."""
+    """Record-aligned text chunks, every column as strings."""
 
     def __init__(self, path: Path, fmt: str, dialect: Dialect, o: ConvertOptions, chunk_size: int) -> None:
         self.path, self.fmt, self.dialect, self.o = path, fmt, dialect, o
         self.chunk_size = chunk_size
-        self.bad: List[str] = []
-        self.blank = 0
         self.consumed = 0
-        cols = dialect.columns
-        if o.columns:
-            missing = [c for c in o.columns if c not in cols]
-            if missing:
-                raise FormatError(f"no column named {missing[0]!r}")
-        self.names = list(o.columns or cols)
+        # the record policy (blank lines, malformed rows, padding) of the pure engine
+        self.src = pure.CsvSource(path, fmt, dialect, o, text_output=True)
+        self.names = list(self.src.names)
+        self.utf8 = dialect.encoding.lower() in ("utf-8", "utf8", "utf-8-sig")
+        self.forced_at: Optional[int] = None  # a quote read as a stray only by its size
+        self._cuts: Dict[int, Any] = {}  # chunks already cut, reused by the next pass (see Chunker)
 
-    def _open(self) -> Any:
-        if self.fmt == "dcz":
-            return dcz.DczReader(self.path)
-        return _io.open_binary(self.path)
+    @property
+    def bad(self) -> List[str]:
+        return self.src.bad
+
+    def reset(self) -> None:
+        self.src.bad = []
+        self.src.blank = self.src.irregular = 0
+
+    def _open(self) -> IO[bytes]:
+        d = self.dialect
+        if self.utf8:
+            if self.fmt == "dcz":
+                return io.BufferedReader(dcz.DczReader(self.path), 1 << 20)
+            return _io.open_binary(self.path)
+        return io.BufferedReader(_Utf8(pure._open_csv_text(self.path, self.fmt, d.encoding)), 1 << 20)
 
     def tables(self) -> Iterator[Any]:
         if self.o.bad_lines == "pad":
@@ -165,40 +208,48 @@ class CsvReader:
             return
         yield from self._arrow_tables()
 
+    def _table(self, columns: List[List[Optional[str]]]) -> Any:
+        pa = _pa()
+        return pa.table({n: pa.array(c, pa.string()) for n, c in zip(self.names, columns)})
+
     def _padded_tables(self) -> Iterator[Any]:
         """Python parsing for bad_lines='pad' (pyarrow can only skip short rows)."""
-        pa = _pa()
-        src = pure.CsvSource(self.path, self.fmt, self.dialect, self.o, text_output=True)
         batch: List[List[Optional[str]]] = []
         yielded = False
-        for row in src.raw_rows():
-            fields = src._fields(row)
-            if fields is None:
-                continue
+        for fields in self.src.raw_rows():
             batch.append(fields)
             if len(batch) >= 65536:
-                yield pa.table({n: pa.array([r[j] for r in batch], pa.string()) for j, n in enumerate(self.names)})
+                yield self._table([list(c) for c in zip(*batch)])
                 yielded = True
                 batch = []
-        self.bad.extend(",".join(x or "" for x in r) for r in src.bad)
         if batch or not yielded:  # always at least one (possibly empty) table
-            yield pa.table({n: pa.array([r[j] for r in batch], pa.string()) for j, n in enumerate(self.names)})
+            yield self._table([list(c) for c in zip(*batch)] if batch else [[] for _ in self.names])
+
+    def _python_rows(self, data: bytes, tok: _csvtok.Dialect, pos: int = 0, stop: Optional[int] = None) -> Tuple[List[List[Optional[str]]], int]:
+        """(rows, end): the records of ``data`` from ``pos``, through the shared
+        tokenizer, up to the first one that ends at or after ``stop`` (all of them
+        without it)."""
+        rows = []
+        end = pos
+        for values, start, end, _, flags in _csvtok.tokenize(data, tok, pos):
+            # invalid UTF-8 restarts the job as windows-1252
+            text = data[start:end].decode("utf-8")
+            vals = [None if v is None else v.decode("utf-8") for v in values]
+            fields = self.src._fields(vals, flags, text, 0, len(text))
+            if fields is not None:
+                rows.append(fields)
+            if stop is not None and end >= stop:
+                break
+        return rows, end
+
+    def _rows_table(self, rows: List[List[Optional[str]]]) -> Any:
+        return self._table([list(c) for c in zip(*rows)] if rows else [[] for _ in self.names])
 
     def _arrow_tables(self) -> Iterator[Any]:
         pa = _pa()
         pacsv = pa.csv
         d = self.dialect
-        enc = d.encoding.lower()
-        utf8 = enc in ("utf-8", "utf8", "utf-8-sig")
-        parse = pacsv.ParseOptions(
-            delimiter=d.delimiter,
-            quote_char=d.quote or False,
-            double_quote=d.double_quote,
-            escape_char=d.escape or False,
-            newlines_in_values=d.has_quotes,
-            ignore_empty_lines=True,
-            invalid_row_handler=self._invalid,
-        )
+        quote = d.quote.encode() if d.quote else None
         convert = pacsv.ConvertOptions(
             column_types={c: pa.string() for c in d.columns},
             strings_can_be_null=True,
@@ -206,33 +257,103 @@ class CsvReader:
             quoted_strings_can_be_null=False,
             include_columns=self.names,
         )
-        with self._open() as f:
-            first = True
-            for chunk in _chunks(f, self.chunk_size, d.quote):
-                self.consumed += len(chunk)
-                if first and chunk.startswith(b"\xef\xbb\xbf"):
-                    chunk = chunk[3:]
-                if not utf8:
-                    chunk = chunk.decode(d.encoding, errors=_io.text_errors(d.encoding)).encode("utf-8")
-                read = pacsv.ReadOptions(
-                    column_names=d.columns,
-                    skip_rows=d.leading_records if first else 0,
-                    block_size=max(1 << 20, min(len(chunk) + 1, 64 << 20)),
-                )
-                first = False
-                try:
-                    table = pacsv.read_csv(pa.py_buffer(chunk), read_options=read, parse_options=parse, convert_options=convert)
-                except pa.ArrowInvalid as exc:
-                    if "UTF8" in str(exc) or "utf8" in str(exc).lower():
-                        raise UnicodeDecodeError("utf-8", b"", 0, 1, str(exc)) from None
-                    raise DataError(str(exc)) from None
-                yield table
+        btok = _csvtok.Dialect.of(d, text=False)
+        python_only = d.escape is not None  # pyarrow reads escapes outside quotes too
+        terminator = d.terminator
+        single = len(d.columns) == 1
 
-    def _invalid(self, row: Any) -> str:
-        if self.o.bad_lines == "error":
-            return "error"
-        self.bad.append(row.text)
-        return "skip"
+        def read_run(data: bytes, a: int, b: int, records: Optional[int]) -> Any:
+            """pyarrow's table of the regular records ``data[a:b]`` (``records`` of them
+            when known, else counted when blank lines may have to be)."""
+            rejected = [0]
+
+            def invalid(row: Any, src: pure.CsvSource = self.src, rejected: List[int] = rejected) -> str:
+                if self.o.bad_lines == "error":
+                    return "error"
+                src.bad.append(row.text + terminator)
+                rejected[0] += 1
+                return "skip"
+
+            parse = pacsv.ParseOptions(
+                delimiter=d.delimiter,
+                quote_char=d.quote or False,
+                double_quote=d.double_quote,
+                escape_char=False,
+                newlines_in_values=quote is not None and data.find(quote, a, b) >= 0,
+                ignore_empty_lines=not single,  # in a one-column file a blank line is a missing value
+                invalid_row_handler=invalid,
+            )
+            read = pacsv.ReadOptions(column_names=d.columns, block_size=max(1 << 20, b - a + 2))
+            if b == len(data) and b > a and data[b - 1 :] not in (b"\n", b"\r"):
+                # a last record without a line break: pyarrow would read an empty field
+                # after a trailing delimiter there as quoted ("") when a quoted one precedes it
+                source = pa.py_buffer(data[a:b] + b"\n")
+            else:
+                source = pa.py_buffer(data)
+                if a or b != len(data):
+                    source = source.slice(a, b - a)
+            try:
+                table = pacsv.read_csv(source, read_options=read, parse_options=parse, convert_options=convert)
+            except pa.ArrowInvalid as exc:
+                if "UTF8" in str(exc) or "utf8" in str(exc).lower():
+                    raise UnicodeDecodeError("utf-8", b"", 0, 1, str(exc)) from None
+                raise DataError(str(exc)) from None
+            if not single and _csvtok.may_hold_blank(data, btok, a, b):  # records pyarrow skipped as empty lines
+                if records is None:
+                    records = _csvtok.count_records(data[a:b], btok)
+                self.src.blank += records - table.num_rows - rejected[0]
+            return table
+
+        with self._open() as f:
+            head = f.read(3)
+            chunker = _csvtok.Chunker(f, self.chunk_size, btok, prefix=head[3:] if head.startswith(_BOM) else head,
+                                      known=self._cuts)
+            skip = d.leading_records
+            for chunk in chunker:
+                self.consumed = chunker.offset
+                if chunker.forced and self.forced_at is None:
+                    self.forced_at = chunker.offset
+                pos = 0
+                if skip:
+                    # the header and any preamble are records too: a quoted line break
+                    # inside them must not be taken for the end of a row
+                    pos, skipped = _csvtok.skip_records(chunk, btok, skip)
+                    skip -= skipped
+                    if pos >= len(chunk):
+                        continue
+                if python_only:
+                    yield self._rows_table(self._python_rows(chunk, btok, pos)[0])
+                elif not chunker.irregular:
+                    yield read_run(chunk, pos, len(chunk), None)
+                else:
+                    yield self._mixed_table(chunk, btok, pos, read_run)
+
+    def _mixed_table(self, chunk: bytes, btok: _csvtok.Dialect, pos: int, read_run: Callable[..., Any]) -> Any:
+        """A chunk with stray or irregular quotes: its runs of regular records through
+        pyarrow, the other records through the shared tokenizer (which reads on further
+        each time, so that dense irregular records do not each cost a fast-path check)."""
+        pa = _pa()
+        tables = []
+        rows: List[List[Optional[str]]] = []
+        n = len(chunk)
+        ahead = 0
+        while pos < n:
+            r, breaks = _csvtok.regular_run(chunk, btok, pos, 1 << 10 if ahead else _csvtok.CUT_WINDOW, count=True)
+            if r - pos >= _ARROW_RUN:
+                if rows:
+                    tables.append(self._rows_table(rows))
+                    rows = []
+                end_rec = r == n and chunk[-1:] not in (b"\n", b"\r")  # a last record without a terminator
+                tables.append(read_run(chunk, pos, r, breaks + (1 if end_rec else 0)))
+                pos = r
+                ahead = 0
+                continue
+            more, pos = self._python_rows(chunk, btok, pos, r + 1 + ahead)
+            rows += more
+            ahead = min(max(ahead * 2, 1 << 10), 1 << 16)
+        if rows or not tables:
+            tables.append(self._rows_table(rows))
+        return tables[0] if len(tables) == 1 else pa.concat_tables(tables)
 
 
 def _infer(reader: CsvReader, o: ConvertOptions, mode: str, full: bool) -> Tuple[List[infer.LogicalType], List[str]]:
@@ -245,7 +366,7 @@ def _infer(reader: CsvReader, o: ConvertOptions, mode: str, full: bool) -> Tuple
         seen += table.num_rows
         if not full and seen >= pure.SAMPLE_ROWS:
             break
-    reader.bad.clear()
+    reader.reset()
     types, notes = [], []
     for name, s in zip(reader.names, stats):
         if name in o.schema:
@@ -263,10 +384,213 @@ def _infer(reader: CsvReader, o: ConvertOptions, mode: str, full: bool) -> Tuple
 # ---------------------------------------------------------------------------------
 
 
-def read_batches(path: Path, fmt: str, o: ConvertOptions, batch_rows: int = 65536) -> Tuple[Any, Iterator[Any]]:
+def _plain_json(v: Any) -> Any:
+    """A nested JSON value with its number literals as Python numbers, for pyarrow."""
+    if isinstance(v, pure.JsonNumber):
+        return float(v)
+    if isinstance(v, dict):
+        return {k: _plain_json(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_plain_json(x) for x in v]
+    return v
+
+
+def _has_empty_struct(pa: Any, t: Any) -> bool:
+    if pa.types.is_struct(t):
+        return t.num_fields == 0 or any(_has_empty_struct(pa, t.field(i).type) for i in range(t.num_fields))
+    if pa.types.is_list(t) or pa.types.is_large_list(t) or pa.types.is_fixed_size_list(t):
+        return _has_empty_struct(pa, t.value_type)
+    return False
+
+
+def _unify(pa: Any, a: Any, b: Any) -> Any:
+    """The type that holds both (None when there is none)."""
+    if a is None or a == b:
+        return b
+    try:
+        if _compat.pyarrow_version() >= (14, 0, 0):
+            s = pa.unify_schemas([pa.schema([pa.field("v", a)]), pa.schema([pa.field("v", b)])], promote_options="permissive")
+        else:  # pragma: no cover - old pyarrow
+            s = pa.unify_schemas([pa.schema([pa.field("v", a)]), pa.schema([pa.field("v", b)])])
+        return s.field("v").type
+    except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError):
+        return None
+
+
+class _NestedTypes:
+    """Arrow types of nested JSON fields, unified over every value seen."""
+
+    def __init__(self, pa: Any) -> None:
+        self.pa = pa
+        self.types: Dict[str, Any] = {}
+        self.failed: Set[str] = set()
+        self.buf: Dict[str, List[Any]] = {}
+
+    def observe(self, name: str, value: Any) -> None:
+        if name in self.failed:
+            return
+        buf = self.buf.setdefault(name, [])
+        buf.append(_plain_json(value))
+        if len(buf) >= 65536:
+            self._flush(name)
+
+    def _flush(self, name: str) -> None:
+        pa = self.pa
+        values = self.buf.pop(name, [])
+        if not values or name in self.failed:
+            return
+        try:
+            t = pa.array(values).type
+        except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError, OverflowError, TypeError, ValueError):
+            self.failed.add(name)
+            return
+        unified = _unify(pa, self.types.get(name), t)
+        if unified is None:
+            self.failed.add(name)
+        else:
+            self.types[name] = unified
+
+    def type_of(self, name: str) -> Any:
+        for n in list(self.buf):
+            self._flush(n)
+        t = self.types.get(name)
+        if name in self.failed or t is None or _has_empty_struct(self.pa, t):
+            return None
+        return t
+
+
+def _json_batches(path: Path, fmt: str, o: ConvertOptions, batch_rows: int, full: bool,
+                  text_columns: Set[str], notes: List[str]) -> Tuple[Any, Iterator[Any]]:
+    """JSON and JSON Lines by the lossless JSON rules of the pure engine, as Arrow."""
+    pa = _pa()
+    nested = _NestedTypes(pa)
+    src = pure.JsonSource(path, fmt, o, full=full, nested=nested.observe)
+    notes.extend(src.warnings)
+    hows = list(src.hows)
+    fields = []
+    for j, (name, ty, how) in enumerate(zip(src.names, src.types, src.hows)):
+        if how == "json":
+            t = None if name in text_columns else nested.type_of(name)
+            if t is None:
+                hows[j] = "json_text"
+                notes.append(f"column '{name}' mixes JSON types; values are stored as JSON text")
+                t = pa.string()
+        elif how in ("string", "number_text", "json_text"):
+            t = pa.string()
+        else:
+            t = ty.arrow()
+        # text that holds JSON is marked so, and JSON output writes it as that JSON again
+        mark = {"number_text": "number", "json_text": "value"}.get(hows[j])
+        fields.append(pa.field(name, t, metadata={pure.JSON_TEXT_KEY: mark} if mark else None))
+    schema = pa.schema(fields)
+    # JSON text for a nested column pyarrow cannot type: the source converts it so
+    src.hows = hows
+
+    def column(j: int, values: List[Any]) -> Any:
+        f = schema.field(j)
+        if hows[j] != "json":
+            return pa.array(values, f.type)
+        plain = [_plain_json(v) for v in values]
+        try:
+            fits = _unify(pa, f.type, pa.array(plain).type) == f.type
+            arr = pa.array(plain, f.type) if fits else None
+        except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError, OverflowError, TypeError, ValueError):
+            arr = None
+        if arr is None:
+            # nested values the planned type would drop or mangle: widen the plan
+            bad = next((v for v in values if v is not None), None)
+            raise _Replan(f.name, pure.json_text(bad)[:80])
+        return arr
+
+    def batches() -> Iterator[Any]:
+        rows = src.rows()
+        while True:
+            buf = []
+            for r in rows:
+                buf.append(r)
+                if len(buf) >= batch_rows:
+                    break
+            if not buf:
+                return
+            cols = list(zip(*buf))
+            yield pa.RecordBatch.from_arrays([column(j, list(c)) for j, c in enumerate(cols)], schema=schema)
+            if len(buf) < batch_rows:
+                return
+
+    return schema, batches()
+
+
+def _xlsx_batches(path: Path, o: ConvertOptions, batch_rows: int, full: bool, text_columns: Set[str]) -> Tuple[Any, Iterator[Any]]:
+    """Excel rows; a column mixing kinds of values (text and numbers) is text."""
+    pa = _pa()
+    names, rows = _xlsx_rows(path)
+    cols = o.columns
+    if cols:
+        missing = [c for c in cols if c not in names]
+        if missing:
+            raise FormatError(f"no column named {missing[0]!r}")
+        idx = [names.index(c) for c in cols]
+        names = list(cols)
+        rows = ([r[i] for i in idx] for r in rows)
+    first: List[List[Any]] = []
+    for r in rows:
+        first.append(r)
+        if not full and len(first) >= batch_rows:
+            break
+    fields = []
+    for j, n in enumerate(names):
+        values = [r[j] for r in first]
+        t = None
+        if n not in text_columns:
+            try:
+                t = pa.array(values).type if values else pa.string()
+            except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError, OverflowError, TypeError, ValueError):
+                t = None
+            if t is not None and pa.types.is_null(t):
+                t = pa.string()
+        fields.append(pa.field(n, t if t is not None else pa.string()))
+        if t is None:
+            text_columns.add(n)
+    schema = pa.schema(fields)
+
+    def batch(buf: List[List[Any]]) -> Any:
+        columns = list(zip(*buf)) if buf else [() for _ in names]
+        arrays = []
+        for c, f in zip(columns, schema):
+            if f.name in text_columns:
+                arrays.append(pa.array([pure.csv_text(v) for v in c], pa.string()))
+                continue
+            try:
+                arrays.append(pa.array(list(c), f.type))
+            except (pa.ArrowInvalid, pa.ArrowTypeError, OverflowError, TypeError, ValueError):
+                bad = next((v for v in c if v is not None), None)
+                raise _Replan(f.name, str(bad)[:80]) from None
+        return pa.RecordBatch.from_arrays(arrays, schema=schema)
+
+    def more() -> Iterator[Any]:
+        for k in range(0, len(first), batch_rows):
+            yield batch(first[k : k + batch_rows])
+        if not first:
+            yield batch([])
+        buf: List[List[Any]] = []
+        for r in rows:
+            buf.append(r)
+            if len(buf) >= batch_rows:
+                yield batch(buf)
+                buf = []
+        if buf:
+            yield batch(buf)
+
+    return schema, more()
+
+
+def read_batches(path: Path, fmt: str, o: ConvertOptions, batch_rows: int = 65536, full: bool = False,
+                 text_columns: Optional[Set[str]] = None, notes: Optional[List[str]] = None) -> Tuple[Any, Iterator[Any]]:
     """(schema, iterator of RecordBatches) for typed formats."""
     pa = _pa()
     cols = o.columns
+    text_columns = set() if text_columns is None else text_columns
+    notes = [] if notes is None else notes
     if fmt == "parquet":
         pq = _compat.require("pyarrow.parquet", "reading Parquet", "arrow")
         pf = pq.ParquetFile(path)
@@ -296,79 +620,11 @@ def read_batches(path: Path, fmt: str, o: ConvertOptions, batch_rows: int = 6553
                 yield from (stripe.to_batches() if hasattr(stripe, "to_batches") else [stripe])
 
         return schema, stripes()
-    if fmt == "jsonl":
-        pj = _compat.require("pyarrow.json", "reading JSON Lines", "arrow")
-        with _io.open_binary(path) as f:
-            table = pj.read_json(io.BytesIO(f.read()))
-        if cols:
-            table = table.select(cols)
-        return table.schema, iter(table.to_batches(batch_rows))
-    if fmt in ("json", "xlsx"):
-        rows: Iterator[List[Any]]
-        if fmt == "json":
-            src = pure.JsonSource(path, fmt, o)
-            names, rows, types = src.names, src.rows(), src.types
-        else:
-            names, rows = _xlsx_rows(path)
-            if cols:
-                idx = [names.index(c) for c in cols]
-                names = list(cols)
-                rows = ([r[i] for i in idx] for r in rows)
-            types = []
-        first: List[List[Any]] = []
-        for r in rows:
-            first.append(r)
-            if len(first) >= batch_rows:
-                break
-        if not types:
-            sample = pa.Table.from_pylist([dict(zip(names, r)) for r in first]) if first else None
-            fields = [pa.field(n, sample.schema.field(n).type if sample is not None else pa.string()) for n in names]
-        else:
-            fields = [pa.field(n, _json_arrow_type(pa, t, [r[j] for r in first])) for j, (n, t) in enumerate(zip(names, types))]
-        schema = pa.schema(fields)
-
-        def batch(buf: List[List[Any]]) -> Any:
-            columns = list(zip(*buf)) if buf else [() for _ in names]
-            try:
-                arrays = [_json_array(pa, list(c), f.type) for c, f in zip(columns, schema)]
-            except (pa.ArrowInvalid, pa.ArrowTypeError, OverflowError, TypeError, ValueError) as exc:
-                raise DataError(f"{path}: a value later in the file does not fit the inferred schema ({exc}); "
-                                "retry with infer='full'") from None
-            return pa.RecordBatch.from_arrays(arrays, schema=schema)
-
-        def more() -> Iterator[Any]:
-            if first:
-                yield batch(first)
-            buf: List[List[Any]] = []
-            for r in rows:
-                buf.append(r)
-                if len(buf) >= batch_rows:
-                    yield batch(buf)
-                    buf = []
-            if buf:
-                yield batch(buf)
-
-        return schema, more()
+    if fmt in ("json", "jsonl"):
+        return _json_batches(path, fmt, o, batch_rows, full, text_columns, notes)
+    if fmt == "xlsx":
+        return _xlsx_batches(path, o, batch_rows, full, text_columns)
     raise FormatError(f"the arrow engine cannot read {fmt}")
-
-
-def _json_arrow_type(pa: Any, ty: infer.LogicalType, sample: Sequence[Any]) -> Any:
-    if ty.kind == "json":
-        try:
-            return pa.array(list(sample)).type if sample else pa.string()
-        except (pa.ArrowInvalid, pa.ArrowTypeError, OverflowError):
-            return pa.string()
-    return ty.arrow()
-
-
-def _json_array(pa: Any, values: List[Any], typ: Any) -> Any:
-    from decimal import Decimal
-
-    if pa.types.is_decimal(typ):
-        return pa.array([None if v is None else Decimal(v) for v in values], typ)
-    if pa.types.is_string(typ):
-        return pa.array([None if v is None else v if isinstance(v, str) else json.dumps(v, ensure_ascii=False) for v in values], typ)
-    return pa.array(values, typ)
 
 
 def _xlsx_rows(path: Path) -> Tuple[List[str], Iterator[List[Any]]]:
@@ -394,6 +650,122 @@ def _xlsx_rows(path: Path) -> Tuple[List[str], Iterator[List[Any]]]:
 # ---------------------------------------------------------------------------------
 # Writers
 # ---------------------------------------------------------------------------------
+
+
+def _ticks(pa: Any, arr: Any) -> List[Optional[int]]:
+    return arr.cast(pa.int64()).to_pylist()  # type: ignore[no-any-return]
+
+
+def _is(pa: Any, check: str, t: Any) -> bool:
+    """``pa.types.<check>(t)``, false where this pyarrow lacks the type (view types)."""
+    f = getattr(pa.types, check, None)
+    return f is not None and bool(f(t))
+
+
+def _rows(arr: Any) -> List[bool]:
+    """Whether each row of ``arr`` holds a value."""
+    return [True] * len(arr) if arr.null_count == 0 else arr.is_valid().to_pylist()  # type: ignore[no-any-return]
+
+
+def _key_text(k: Any) -> str:
+    """A map key as a JSON object key: its JSON, made a string when it is not one (``1``
+    becomes ``"1"``), as the native writers do."""
+    text = pure.json_text(k)
+    return text if text[:1] == '"' else pure._encode_str(text)  # type: ignore[no-any-return]
+
+
+def _nested_texts(pa: Any, arr: Any, t: Any) -> List[Any]:
+    """The JSON text of each struct, list or map (None for a null), built from the values
+    of its children, which are formatted like columns of their own.  Maps are objects,
+    entries in order, repeated keys included."""
+    text = pure.JsonText
+    json = pure.json_text
+    if pa.types.is_struct(t):
+        fields = [t.field(i) for i in range(t.num_fields)]
+        children = [py_values(arr.field(i), f) for i, f in enumerate(fields)]
+        names = pure.json_keys([f.name for f in fields])
+        return [
+            text("{" + ",".join(k + json(c[r]) for k, c in zip(names, children)) + "}") if ok else None
+            for r, ok in enumerate(_rows(arr))
+        ]
+    if len(arr) == 0:
+        return []
+    # offsets follow the slice of ``arr``; values, keys and items are the whole child
+    offsets = arr.offsets.to_pylist()
+    start, end = offsets[0], offsets[-1]
+    bounds = [(offsets[r] - start, offsets[r + 1] - start) for r in range(len(arr))]
+    if pa.types.is_map(t):
+        keys = [_key_text(k) for k in py_values(arr.keys.slice(start, end - start), t.key_field)]
+        items = py_values(arr.items.slice(start, end - start), t.item_field)
+        return [
+            text("{" + ",".join(keys[i] + ":" + json(items[i]) for i in range(a, b)) + "}") if ok else None
+            for (a, b), ok in zip(bounds, _rows(arr))
+        ]
+    items = py_values(arr.values.slice(start, end - start), t.value_field)
+    return [text("[" + ",".join(json(x) for x in items[a:b]) + "]") if ok else None for (a, b), ok in zip(bounds, _rows(arr))]
+
+
+_SINGLE_SPECIAL = {"nan": float("nan"), "inf": float("inf"), "-inf": float("-inf")}
+
+
+def py_values(arr: Any, field: Any = None) -> List[Any]:
+    """Python values of an Arrow column for the text writers, formatted exactly like the
+    native writers: temporal values from their ticks (any year, down to nanoseconds,
+    without a time zone database), float32 with its own shortest digits, binary values
+    as hex, text marked as JSON (``field``'s metadata) as the JSON it holds, and
+    structs, lists and maps as their JSON text."""
+    pa = _pa()
+    t = arr.type
+    if pa.types.is_dictionary(t):
+        arr = arr.cast(t.value_type)
+        t = arr.type
+    if pa.types.is_string(t) or pa.types.is_large_string(t) or _is(pa, "is_string_view", t):
+        values = arr.to_pylist()
+        kind = (field.metadata or {}).get(pure.JSON_TEXT_KEY.encode()) if field is not None else None
+        if kind == b"number":  # the NaN / Infinity texts stay strings: JSON has no such numbers
+            return [v if v is None or v in pure._SPECIAL_FLOATS else pure.JsonText(v) for v in values]
+        if kind == b"value":
+            return [v if v is None else pure.JsonText(v) for v in values]
+        return values  # type: ignore[no-any-return]
+    if pa.types.is_fixed_size_list(t) or _is(pa, "is_list_view", t):
+        arr = arr.cast(pa.list_(t.value_field))
+        t = arr.type
+    elif _is(pa, "is_large_list_view", t):
+        arr = arr.cast(pa.large_list(t.value_field))
+        t = arr.type
+    if pa.types.is_struct(t) or pa.types.is_map(t) or pa.types.is_list(t) or pa.types.is_large_list(t):
+        return _nested_texts(pa, arr, t)
+    if pa.types.is_timestamp(t):
+        offset = infer.tz_offset_minutes(t.tz)
+        return [None if v is None else infer.format_timestamp(v, t.unit, offset) for v in _ticks(pa, arr)]
+    if pa.types.is_date32(t):
+        return [None if v is None else infer.format_date(v) for v in arr.cast(pa.int32()).to_pylist()]
+    if pa.types.is_date64(t):  # a value that is not a whole day keeps its time
+        return [
+            None if v is None else infer.format_date(v // 86_400_000) if v % 86_400_000 == 0 else infer.format_timestamp(v, "ms", None)
+            for v in _ticks(pa, arr)
+        ]
+    if pa.types.is_time32(t) or pa.types.is_time64(t):
+        ticks = arr.cast(pa.int32() if pa.types.is_time32(t) else pa.int64()).to_pylist()
+        return [None if v is None else infer.format_time(v, t.unit) for v in ticks]
+    if pa.types.is_duration(t):
+        return [None if v is None else infer.format_duration(v, t.unit) for v in _ticks(pa, arr)]
+    if pa.types.is_binary(t) or pa.types.is_large_binary(t) or pa.types.is_fixed_size_binary(t) or _is(pa, "is_binary_view", t):
+        return [None if v is None else v.hex() for v in arr.to_pylist()]
+    try:
+        if pa.types.is_float16(t):  # written as the float32 it widens to
+            arr = arr.cast(pa.float32())
+            t = arr.type
+        if pa.types.is_float32(t):
+            # pyarrow writes each value with its own shortest digits; JsonText keeps the
+            # text as it is in CSV and JSON alike
+            return [
+                None if s is None else _SINGLE_SPECIAL[s] if s in _SINGLE_SPECIAL else pure.JsonText(pure.single_repr(s))
+                for s in arr.cast(pa.string()).to_pylist()
+            ]
+        return arr.to_pylist()  # type: ignore[no-any-return]
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, ValueError) as exc:
+        raise DataError(f"cannot write a {t} column as text: {exc}") from None
 
 
 class Writer:
@@ -426,7 +798,8 @@ class Writer:
 
     def write(self, batch: Any) -> None:
         if self._text is not None:
-            for row in zip(*(col.to_pylist() for col in batch.columns)):
+            schema = batch.schema
+            for row in zip(*(py_values(col, schema.field(j)) for j, col in enumerate(batch.columns))):
                 self._text.write(row)
         elif self.fmt == "parquet":
             self._inner.write_batch(batch, row_group_size=self.row_group)
@@ -468,6 +841,8 @@ def _cast_batches(reader: CsvReader, names: List[str], types: List[infer.Logical
     """Text tables from `reader`, every column cast in parallel (pyarrow releases the GIL)."""
     pa = _pa()
     for table in prefetch(reader.tables(), 1):
+        if table.num_rows == 0:
+            continue
         cols = list(pool.map(
             lambda j, t=table: cast_column(t.column(names[j]).combine_chunks(), types[j], mode, nulls, j),
             range(len(names)),
@@ -486,18 +861,21 @@ def convert(src: Path, dst: Path, src_fmt: str, dst_fmt: str, dst_comp: Optional
                     engine="arrow", bytes_in=bytes_in, threads=plan.threads, memory_budget=plan.memory_budget,
                     chunk_size=plan.chunk_size)
     if src_fmt in ("csv", "tsv", "psv") and dst_fmt == "dcz" and not o.columns and not o.limit:
-        return pure.compress(src, dst, o.profile, o.overwrite, progress)
+        return pure.compress(src, dst, o.profile, o.overwrite, progress, transparent=True)
     warnings: List[str] = []
     restarts = 0
-    is_csv = src_fmt in ("csv", "tsv", "psv", "dcz")
+    is_csv = src_fmt in pure.DELIMITED
+    quarantine = pure.Quarantine(src, dst, o, is_csv)
     dialect = _dialect(src, src_fmt, o) if is_csv else None
     text_out = dst_fmt in ("csv", "tsv", "psv", "dcz")
     mode = "string" if (text_out and not o.schema) else o.types
     full = o.infer == "full"
     types: List[infer.LogicalType] = []
+    text_columns: Set[str] = set()
     chunk = max(4 << 20, min(plan.chunk_size * 8, 128 << 20))
     while True:
         reader = None
+        notes: List[str] = []
         try:
             if dialect is not None:
                 reader = CsvReader(src, src_fmt, dialect, o, chunk)
@@ -507,8 +885,7 @@ def convert(src: Path, dst: Path, src_fmt: str, dst_fmt: str, dst_comp: Optional
                 pool = ThreadPoolExecutor(plan.threads)
                 stream = _cast_batches(reader, names, types, schema, mode, o.null_values, pool)
             else:
-                schema, stream = read_batches(src, src_fmt, o)
-                notes = []
+                schema, stream = read_batches(src, src_fmt, o, full=full, text_columns=text_columns, notes=notes)
                 pool = None
             rows = 0
             limit = o.limit
@@ -553,6 +930,25 @@ def convert(src: Path, dst: Path, src_fmt: str, dst_fmt: str, dst_comp: Optional
             else:
                 o.schema = dict(o.schema, **{name: "string"})
                 warnings.append(f"column '{name}': value '{v.value}' forced the column to text")
+        except (_Replan, pure._Restart) as r:
+            # a JSON or Excel value (or key) beyond the sample: plan again from everything
+            restarts += 1
+            if restarts > len(text_columns) + 8:
+                raise DataError("could not settle on a schema") from None
+            if isinstance(r, _Replan):
+                what = f"column '{r.column}': value '{r.value}'"
+            elif r.reason == "columns":
+                what = f"field '{r.value}'"
+            else:
+                what = f"value '{r.value}'"
+            if not full:
+                warnings.append(f"{what} beyond the sample does not fit the planned schema; re-planned from a full scan")
+                full = True
+            elif isinstance(r, _Replan) and r.column not in text_columns:
+                text_columns.add(r.column)
+                warnings.append(f"{what} forced the column to text")
+            else:
+                raise DataError(f"{what} does not fit any type") from None
         except UnicodeDecodeError:
             restarts += 1
             if dialect is None or dialect.encoding not in ("utf-8", "utf8") or restarts > 3:
@@ -560,21 +956,19 @@ def convert(src: Path, dst: Path, src_fmt: str, dst_fmt: str, dst_comp: Optional
             warnings.append("input is not valid UTF-8; re-read as windows-1252")
             dialect.encoding = "cp1252"
     bad = reader.bad if reader is not None else []
-    if bad and o.bad_lines != "skip":
-        qpath = Path(o.quarantine) if o.quarantine else dst.with_name(dst.name + ".rejected.csv")
-        with open(qpath, "w", encoding="utf-8", newline="") as qf:
-            qf.write(pure.csv_line(reader.names, ",", "\n"))  # type: ignore[union-attr]
-            for line in bad:
-                qf.write(line + "\n")
-        report.quarantine = str(qpath)
-        warnings.append(f"{len(bad)} malformed rows moved to {qpath}")
-    elif bad:
-        warnings.append(f"{len(bad)} malformed rows skipped")
+    if reader is not None:
+        forced = reader.forced_at if reader.forced_at is not None else reader.src.forced_at
+        if forced is not None:
+            warnings.append(_csvtok.forced_warning(forced))
+    if dialect is not None:
+        quarantine.finish(reader.names, dialect.delimiter, bad, report, warnings)  # type: ignore[union-attr]
     report.rows = rows
     report.columns = len(schema.names)
     report.schema = ([(n, t.label) for n, t in zip(schema.names, types)] if dialect is not None
                      else [(f.name, str(f.type)) for f in schema])
     report.bad_rows = len(bad)
+    report.blank_lines = reader.src.blank if reader is not None else 0
+    report.irregular_records = reader.src.irregular if reader is not None else 0
     report.restarts = restarts
     report.warnings = notes + warnings
     report.dialect = dialect.to_dict() if dialect else None
@@ -617,7 +1011,7 @@ def head(path: Path, n: int, fmt: str, o: ConvertOptions) -> Dict[str, Any]:
     schema, batches = read_batches(path, fmt, o, batch_rows=max(1, n))
     rows: List[List[Optional[str]]] = []
     for b in batches:
-        for r in zip(*(c.to_pylist() for c in b.columns)):
+        for r in zip(*(py_values(c) for c in b.columns)):
             rows.append([pure.csv_text(v) for v in r])
             if len(rows) >= n:
                 break
@@ -630,5 +1024,7 @@ def count(path: Path, fmt: str, o: ConvertOptions) -> int:
     if fmt == "parquet":
         pq = _compat.require("pyarrow.parquet", "reading Parquet", "arrow")
         return int(pq.ParquetFile(path).metadata.num_rows)
+    if fmt in ("json", "jsonl"):
+        return pure.count(path, fmt, o)
     _, batches = read_batches(path, fmt, o)
     return sum(b.num_rows for b in batches)

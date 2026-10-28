@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Dict, List, Optional, Union
 
+from ._io import NATIVE_ENCODINGS as _NATIVE_ENCODINGS
+from ._sniff import parse_char_option
 from ._util import parse_size
 from .errors import OptionsError
 from .infer import parse_type
@@ -15,25 +17,8 @@ PROFILES = ("fast", "balanced", "max")
 INFER = ("sample", "full")
 ENGINES = ("auto", "native", "arrow", "pure")
 
-# Python codec names -> WHATWG labels understood by the native engine.
-_NATIVE_ENCODINGS = {
-    "utf8": "utf-8",
-    "utf-8-sig": "utf-8",
-    "utf_8": "utf-8",
-    "cp1252": "windows-1252",
-    "latin-1": "iso-8859-1",
-    "latin1": "iso-8859-1",
-    "iso8859-1": "iso-8859-1",
-    "utf-16-le": "utf-16le",
-    "utf-16-be": "utf-16be",
-    "utf_16_le": "utf-16le",
-    "utf_16_be": "utf-16be",
-    "shift-jis": "shift_jis",
-    "sjis": "shift_jis",
-}
 
-
-def parse_schema(spec: Union[None, str, Dict[str, str]]) -> Dict[str, str]:
+def parse_schema(spec: Union[str, Dict[str, str], None]) -> Dict[str, str]:
     """Accept {'zip': 'string'} or 'zip=string, price=decimal(10,2)'."""
     if not spec:
         return {}
@@ -122,6 +107,14 @@ class ConvertOptions:
             if value not in allowed:
                 raise OptionsError(f"{name} must be one of {', '.join(allowed)} (got {value!r})")
         self.schema = parse_schema(self.schema)
+        # dialect characters are read like the native engine reads them ('tab', '\t', 'none')
+        for name in ("delimiter", "quote", "escape", "out_delimiter"):
+            value = getattr(self, name)
+            if value is not None:
+                char = parse_char_option(str(value))
+                if char == "" and name in ("delimiter", "out_delimiter"):
+                    raise OptionsError(f"{name} cannot be empty")
+                setattr(self, name, char)
         if isinstance(self.null_values, str):
             self.null_values = [v.strip() for v in self.null_values.split(",")]
         if isinstance(self.columns, str):

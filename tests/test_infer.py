@@ -107,3 +107,31 @@ def test_python_rules_match_native(tmp_path):
     native = dict(dc.convert(src, tmp_path / "n.jsonl", engine="native").schema)
     for name in names:
         assert native[name] == decide(columns[name]), name
+
+
+def test_writers_format_like_the_native_engine():
+    for days in (-800_000, -719528, -1, 0, 1, 11017, 19723, 2_932_896):
+        y, m, d = infer.civil_from_days(days)
+        assert infer.days_from_civil(y, m, d) == days
+    assert infer.format_date(-719528) == "0000-01-01"
+    assert infer.format_timestamp(1500, "ms", 330) == "1970-01-01T05:30:01.5+05:30"
+    assert infer.format_timestamp(-1, "ms", 330) == "1970-01-01T05:29:59.999+05:30"
+    assert infer.format_timestamp(0, "s", 0) == "1970-01-01T00:00:00Z"
+    assert infer.format_time(36_001_500, "ms") == "10:00:01.500"
+    assert infer.format_duration(1500, "ms") == "PT1.5S" and infer.format_duration(0, "s") == "P0D"
+
+
+def test_converters_keep_every_digit():
+    ns = infer.converter(LogicalType("timestamp", unit="ns"))
+    assert ns("2024-01-01 00:00:00.123456789") == "2024-01-01T00:00:00.123456789"
+    with pytest.raises(ValueError):
+        ns("1677-09-21T00:12:43.145224191")  # before the first nanosecond int64 can hold
+    utc = infer.converter(LogicalType("timestamp", unit="ms", tz="UTC"))
+    assert utc("2024-01-01T10:00:00.5Z") == "2024-01-01T10:00:00.5Z"
+    assert infer.converter(LogicalType("date"))("0000-01-01") == "0000-01-01"
+    dec = infer.converter(LogicalType("decimal", 38, 0))
+    assert str(dec("12345678901234567890123456789012345678")) == "12345678901234567890123456789012345678"
+    assert (
+        str(infer.converter(LogicalType("decimal", 30, 5))("1234567890123456789012345.12345"))
+        == "1234567890123456789012345.12345"
+    )

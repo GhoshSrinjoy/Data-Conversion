@@ -16,7 +16,8 @@ of the DCZ file format.
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+import io
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import _compat
 from .errors import IntegrityError, MissingDependencyError, OptionsError
@@ -34,24 +35,37 @@ PROFILE_LEVELS = {
 }
 
 Compressor = Callable[[bytes, int], bytes]
+#: (data, declared size) -> at most size + 1 decoded bytes: a stream is never
+#: expanded further than its declared length allows
 Decompressor = Callable[[bytes, int], bytes]
 _cache: Dict[int, Optional[Tuple[str, Compressor, Decompressor]]] = {}
+
+
+def _read_up_to(reader: Any, limit: int) -> bytes:
+    parts = []
+    while limit > 0:
+        chunk = reader.read(limit)
+        if not chunk:
+            break
+        parts.append(chunk)
+        limit -= len(chunk)
+    return b"".join(parts)
 
 
 def _zstd() -> Optional[Tuple[str, Compressor, Decompressor]]:
     std = _compat.optional("compression.zstd")
     if std is not None:
-        return "stdlib", lambda d, lvl: std.compress(d, level=lvl), lambda d, n: std.decompress(d)
+        return "stdlib", lambda d, lvl: std.compress(d, level=lvl), lambda d, n: std.ZstdDecompressor().decompress(d, max_length=n + 1)
     zs = _compat.optional("zstandard")
     if zs is not None:
         return (
             "zstandard",
             lambda d, lvl: zs.ZstdCompressor(level=lvl).compress(d),
-            lambda d, n: zs.ZstdDecompressor().decompress(d, max_output_size=max(n, 1)),
+            lambda d, n: _read_up_to(zs.ZstdDecompressor().stream_reader(io.BytesIO(d)), n + 1),
         )
     pz = _compat.optional("pyzstd")
     if pz is not None:
-        return "pyzstd", lambda d, lvl: pz.compress(d, lvl), lambda d, n: pz.decompress(d)
+        return "pyzstd", lambda d, lvl: pz.compress(d, lvl), lambda d, n: pz.ZstdDecompressor().decompress(d, max_length=n + 1)
     return _pyarrow("zstd")
 
 
@@ -78,21 +92,28 @@ def _pyarrow(name: str) -> Optional[Tuple[str, Compressor, Decompressor]]:
 def _lz4() -> Optional[Tuple[str, Compressor, Decompressor]]:
     f = _compat.optional("lz4.frame")
     if f is not None:
-        return "lz4", lambda d, lvl: f.compress(d), lambda d, n: f.decompress(d)
+        return "lz4", lambda d, lvl: f.compress(d), lambda d, n: f.LZ4FrameDecompressor().decompress(d, max_length=n + 1)
     return _pyarrow("lz4")
 
 
 def _brotli() -> Optional[Tuple[str, Compressor, Decompressor]]:
     br = _compat.optional("brotli") or _compat.optional("brotlicffi")
     if br is not None:
-        return "brotli", lambda d, lvl: br.compress(d, quality=lvl), lambda d, n: br.decompress(d)
+
+        def decomp(d: bytes, n: int) -> bytes:
+            try:  # brotli >= 1.1 can stop early
+                return br.Decompressor().process(d, output_buffer_limit=n + 1)  # type: ignore[no-any-return]
+            except TypeError:
+                return br.decompress(d)  # type: ignore[no-any-return]
+
+        return "brotli", lambda d, lvl: br.compress(d, quality=lvl), decomp
     return _pyarrow("brotli")
 
 
 def _zlib() -> Optional[Tuple[str, Compressor, Decompressor]]:
     import zlib
 
-    return "stdlib", lambda d, lvl: zlib.compress(d, lvl), lambda d, n: zlib.decompress(d)
+    return "stdlib", lambda d, lvl: zlib.compress(d, lvl), lambda d, n: zlib.decompressobj().decompress(d, n + 1)
 
 
 def _lzma() -> Optional[Tuple[str, Compressor, Decompressor]]:
@@ -108,7 +129,7 @@ def _lzma() -> Optional[Tuple[str, Compressor, Decompressor]]:
         filters = [{"id": lzma.FILTER_LZMA1, "preset": preset, "dict_size": dict_size}]
         return lzma.compress(d, format=lzma.FORMAT_ALONE, filters=filters)  # type: ignore[no-any-return]
 
-    return "stdlib", comp, lambda d, n: lzma.decompress(d, format=lzma.FORMAT_ALONE)
+    return "stdlib", comp, lambda d, n: lzma.LZMADecompressor(format=lzma.FORMAT_ALONE).decompress(d, max_length=n + 1)
 
 
 _FACTORIES = {ZSTD: _zstd, LZ4: _lz4, BROTLI: _brotli, ZLIB: _zlib, LZMA: _lzma}
@@ -147,6 +168,8 @@ def compress(codec: int, data: bytes, level: int) -> bytes:
 
 
 def decompress(codec: int, data: bytes, size: int) -> bytes:
+    if codec not in NAMES:  # a codec id no writer uses: corrupt data, not a missing package
+        raise IntegrityError(f"unknown codec id {codec}: the data is corrupt")
     b = backend(codec)
     if b is None:
         raise MissingDependencyError(f"this data uses {NAMES.get(codec, codec)} compression, which is not "
@@ -157,6 +180,8 @@ def decompress(codec: int, data: bytes, size: int) -> bytes:
         raise
     except Exception as exc:
         raise IntegrityError(f"{NAMES[codec]} stream is corrupt: {exc}") from None
+    if len(out) > size:
+        raise IntegrityError(f"{NAMES[codec]} stream expands beyond the expected {size} bytes")
     if len(out) != size:
         raise IntegrityError(f"{NAMES[codec]} stream expanded to {len(out)} bytes, expected {size}")
     return out

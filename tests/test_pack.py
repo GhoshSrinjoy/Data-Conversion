@@ -88,3 +88,46 @@ def test_cross_implementation(monkeypatch):
 def test_rejects_garbage(mode):
     with pytest.raises(dc.DataconvError):
         dc.unpack(b"not packed data at all")
+
+
+def test_containers_are_restored_exactly(mode):
+    mixed = (1, "a", None, 2.5)
+    back = dc.unpack(dc.pack(mixed))
+    assert type(back) is tuple and back == mixed
+    assert dc.unpack(dc.pack([b"\xff\x00", None, b""])) == [b"\xff\x00", None, b""]
+    values = [1 + 2j, -0.0 - 1j, complex(math.inf, math.nan)]
+    back = dc.unpack(dc.pack(values))
+    assert bits([c.real for c in back]) == bits([c.real for c in values])
+    assert bits([c.imag for c in back]) == bits([c.imag for c in values])
+    assert dc.unpack(dc.pack([1j, None])) == [1j, None]
+
+
+def test_numpy_scalars_and_dtypes(mode):
+    from dataconv import _compat
+
+    np = _compat.optional("numpy")
+    if np is None:
+        pytest.skip("numpy not available (or disabled)")
+    assert dc.unpack(dc.pack([np.int64(1), np.float32(1.5), None])) == [1, 1.5, None]
+    obj = np.array([[1, "a"], [None, [2, 3]]], dtype=object)
+    back = dc.unpack(dc.pack(obj))
+    assert isinstance(back, np.ndarray) and back.shape == (2, 2) and back.dtype == object
+    assert back.tolist() == obj.tolist()
+    for arr in (
+        np.array([1 + 2j, 3j], dtype=np.complex64),
+        np.array([[1 + 2j], [-0.0j]], dtype=np.complex128),
+        np.array([b"a", b"bc\xff"]),
+        np.array(["x", "é"]),
+    ):
+        back = dc.unpack(dc.pack(arr))
+        assert back.dtype == arr.dtype and back.shape == arr.shape
+        assert back.tobytes() == arr.tobytes()
+
+
+def test_values_json_would_change_are_refused(mode):
+    for values in ([(1, 2), (3, 4)], [{1: "a"}], [{"a": {1, 2}}], [__import__("decimal").Decimal("1.5"), 1]):
+        with pytest.raises(dc.OptionsError):
+            dc.pack(values)
+    for values in ("abc", b"abc", {"a": 1}, 5):
+        with pytest.raises(dc.OptionsError):
+            dc.pack(values)

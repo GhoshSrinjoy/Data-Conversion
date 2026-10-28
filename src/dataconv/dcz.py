@@ -7,6 +7,8 @@ byte-plane transforms when it is installed.
 
 from __future__ import annotations
 
+import functools
+import io
 import json
 import os
 import re
@@ -15,8 +17,8 @@ import zlib
 from collections import Counter
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
-from . import _compat, codec
-from .errors import FormatError, IntegrityError
+from . import _compat, _csvtok, codec
+from .errors import DataconvError, FormatError, IntegrityError
 
 MAGIC = b"\x89DCZ\r\n\x1a\n"
 MAGIC_END = b"\x89DCZEND\n"
@@ -39,6 +41,24 @@ def wrap64(x: int) -> int:
 
 def truncated() -> IntegrityError:
     return IntegrityError("DCZ data is truncated or corrupt")
+
+
+# What corrupt input makes the decoders raise; reported as an IntegrityError.
+_CORRUPT = (StopIteration, IndexError, KeyError, TypeError, ValueError, OverflowError, struct.error, MemoryError,
+            RecursionError, ArithmeticError, AttributeError)
+
+
+def _guard(fn: Callable[..., Any]) -> Callable[..., Any]:
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return fn(*args, **kwargs)
+        except DataconvError:
+            raise
+        except _CORRUPT as exc:
+            raise IntegrityError(f"DCZ data is truncated or corrupt ({type(exc).__name__})") from None
+
+    return wrapper
 
 
 # ---------------------------------------------------------------------------------
@@ -211,12 +231,15 @@ def _encode_ints(out: bytearray, values: List[int], transform: Optional[int] = N
         _encode_ints(out, run_lengths, 0)
 
 
-def decode_ints(r: Reader) -> List[int]:
+def decode_ints(r: Reader, limit: Optional[int] = None, rle: bool = True) -> List[int]:
+    """An int_array; ``limit`` bounds its length where the container knows it (a bit
+    flip in a count must not turn into a huge allocation), and the values and lengths
+    of an RLE array are never RLE arrays themselves."""
     n = r.varint()
     t = r.u8()
     if n == 0:
         return []
-    if n > (1 << 34):
+    if n > (1 << 34) or (limit is not None and n > limit) or (t == 2 and not rle):
         raise truncated()
     if t == 0:
         return _get_for(r, n)
@@ -230,8 +253,10 @@ def decode_ints(r: Reader) -> List[int]:
         return out
     if t == 2:
         runs = r.varint()
-        values = decode_ints(r)
-        lengths = decode_ints(r)
+        if runs > n:
+            raise truncated()
+        values = decode_ints(r, runs, rle=False)
+        lengths = decode_ints(r, runs, rle=False)
         if len(values) != runs or len(lengths) != runs or sum(lengths) != n or any(x < 0 for x in lengths):
             raise truncated()
         out = []
@@ -521,8 +546,8 @@ def decode_column(meta: Reader, take: Callable[[], bytes], n: int) -> Tuple[List
         if has_empty:
             empty = get_bitmap(aux, n)
         if n_exc:
-            positions = decode_ints(aux)
-            lengths = decode_ints(aux)
+            positions = decode_ints(aux, n_exc)
+            lengths = decode_ints(aux, n_exc)
             if len(positions) != n_exc or len(lengths) != n_exc:
                 raise truncated()
             for p, size in zip(positions, lengths):
@@ -543,7 +568,7 @@ def decode_column(meta: Reader, take: Callable[[], bytes], n: int) -> Tuple[List
         return out
 
     if enc == RAW:
-        lengths = decode_ints(Reader(take()))
+        lengths = decode_ints(Reader(take()), n)
         blob = take()
         it = iter(lengths)
         pos = [0]
@@ -560,9 +585,11 @@ def decode_column(meta: Reader, take: Callable[[], bytes], n: int) -> Tuple[List
         cells = emit(lambda: value)
     elif enc == DICT:
         entries = meta.varint()
-        lengths = decode_ints(Reader(take()))
+        if entries > max(n, 1):
+            raise truncated()
+        lengths = decode_ints(Reader(take()), entries)
         blob = take()
-        ids = iter(decode_ints(Reader(take())))
+        ids = iter(decode_ints(Reader(take()), n))
         if len(lengths) != entries:
             raise truncated()
         values: List[bytes] = []
@@ -572,15 +599,17 @@ def decode_column(meta: Reader, take: Callable[[], bytes], n: int) -> Tuple[List
             pos += ln
         cells = emit(lambda: values[next(ids)])
     elif enc == INT:
-        ints = iter(decode_ints(Reader(take())))
+        ints = iter(decode_ints(Reader(take()), n))
         cells = emit(lambda: str(next(ints)).encode())
     elif enc == DECIMAL:
         scale = meta.u8()
-        scales = iter(decode_ints(Reader(take()))) if scale == 255 else None
-        mants = iter(decode_ints(Reader(take())))
+        scales = iter(decode_ints(Reader(take()), n)) if scale == 255 else None
+        mants = iter(decode_ints(Reader(take()), n))
         cells = emit(lambda: write_decimal(next(mants), next(scales) if scales is not None else scale))
     elif enc == TEMPLATE:
         nparts = meta.varint()
+        if nparts > len(meta.data):
+            raise truncated()
         parts: List[Tuple[int, Any]] = []
         for _ in range(nparts):
             kind = meta.u8()
@@ -590,7 +619,7 @@ def decode_column(meta: Reader, take: Callable[[], bytes], n: int) -> Tuple[List
                 parts.append((1, meta.u8()))
             else:
                 raise truncated()
-        streams = [iter(decode_ints(Reader(take()))) for kind, _ in parts if kind == 1]
+        streams = [iter(decode_ints(Reader(take()), n)) for kind, _ in parts if kind == 1]
 
         def template() -> bytes:
             out = bytearray()
@@ -773,6 +802,7 @@ def encode_csv_block(data: bytes, delimiter: str = ",", quote: Optional[str] = '
     return payload, len(records)
 
 
+@_guard
 def decode_csv_block(payload: bytes, raw_len: int) -> bytes:
     r = Reader(payload)
     n = r.varint()
@@ -802,18 +832,19 @@ def decode_csv_block(payload: bytes, raw_len: int) -> bytes:
     n_records, rows, ncols = meta.varint(), meta.varint(), meta.varint()
     term_mode, last_term = meta.u8(), meta.u8()
     n_raw = meta.varint()
-    if rows > n_records or n_raw > n_records:
+    # every record holds at least one byte, and a column at least a delimiter's worth
+    if rows > n_records or n_raw > n_records or n_records > raw_len + 1 or ncols > raw_len + 1:
         raise truncated()
     raws: Dict[int, bytes] = {}
     if n_raw:
         s = Reader(take())
-        positions = decode_ints(s)
-        lengths = decode_ints(s)
+        positions = decode_ints(s, n_raw)
+        lengths = decode_ints(s, n_raw)
         if len(positions) != n_raw or len(lengths) != n_raw:
             raise truncated()
         for p, ln in zip(positions, lengths):
             raws[p] = s.take(ln)
-    terms = decode_ints(Reader(take())) if term_mode == 255 else None
+    terms = decode_ints(Reader(take()), rows) if term_mode == 255 else None
     columns = [decode_column(meta, take, rows) for _ in range(ncols)]
     d = bytes([delim])
     qb = bytes([quote])
@@ -871,6 +902,7 @@ def encode_block(data: bytes, csv: Optional[Tuple[str, Optional[str]]], first: b
     return _block_header(KIND_RAW, c, len(data), len(out), crc, 0), out, KIND_RAW, 0
 
 
+@_guard
 def decode_block(kind: int, codec_id: int, payload: bytes, raw_len: int, crc: int) -> bytes:
     if kind == KIND_RAW:
         data = codec.decompress(codec_id, payload, raw_len)
@@ -883,25 +915,22 @@ def decode_block(kind: int, codec_id: int, payload: bytes, raw_len: int, crc: in
     return data
 
 
-def _record_boundary(buf: bytes, quote: Optional[str]) -> int:
-    """Offset just after the last newline outside quotes (0 when there is none)."""
+@functools.lru_cache(maxsize=64)
+def _scan_dialect(delimiter: str, quote: Optional[str], escape: Optional[str]) -> _csvtok.Dialect:
+    return _csvtok.Dialect(delimiter, quote, escape, escape is None, text=False)
+
+
+def _record_boundary(buf: bytes, quote: Optional[str], delimiter: str = ",", escape: Optional[str] = None) -> int:
+    """Offset just after the last record terminator outside quotes (0 when there is
+    none), by the quote rules every engine shares: a quote opens a field only at its
+    start, and doubled or escaped quotes inside it are literal."""
     if not quote or quote.encode() not in buf:
         return buf.rfind(b"\n") + 1
-    qb = quote.encode()
-    total = buf.count(qb)
-    after = 0
-    end = len(buf)
-    while True:
-        nl = buf.rfind(b"\n", 0, end)
-        if nl < 0:
-            return 0
-        after += buf.count(qb, nl + 1, end)
-        if (total - after) % 2 == 0:
-            return nl + 1
-        end = nl
+    return _csvtok.last_record_end(buf, _scan_dialect(delimiter, quote, escape)) or 0
 
 
-def iter_blocks(stream: Any, block_size: int, csv: Optional[Tuple[str, Optional[str]]]) -> Iterator[bytes]:
+def iter_blocks(stream: Any, block_size: int, csv: Optional[Tuple[str, Optional[str]]],
+                escape: Optional[str] = None) -> Iterator[bytes]:
     carry = b""
     while True:
         chunk = stream.read(block_size)
@@ -914,7 +943,7 @@ def iter_blocks(stream: Any, block_size: int, csv: Optional[Tuple[str, Optional[
             yield buf
             carry = b""
             continue
-        cut = _record_boundary(buf, csv[1])
+        cut = _record_boundary(buf, csv[1], csv[0], escape)
         if cut == 0 and len(buf) < block_size * 8:
             carry = buf
             continue
@@ -932,9 +961,10 @@ class DczWriter:
     """
 
     def __init__(self, out: Any, csv: Optional[Tuple[str, Optional[str]]] = (",", '"'), profile: str = "balanced",
-                 block_size: int = 4 << 20) -> None:
+                 block_size: int = 4 << 20, escape: Optional[str] = None) -> None:
         self.out = out
         self.csv = csv
+        self.escape = escape
         self.profile = profile
         self.block_size = max(4096, block_size)
         self.pending = bytearray()
@@ -959,7 +989,7 @@ class DczWriter:
         self.pending += data
         while len(self.pending) >= self.block_size:
             head = bytes(self.pending[: self.block_size])
-            cut = len(head) if self.csv is None else _record_boundary(head, self.csv[1])
+            cut = len(head) if self.csv is None else _record_boundary(head, self.csv[1], self.csv[0], self.escape)
             if cut == 0:
                 if len(self.pending) < self.block_size * 8:
                     break
@@ -993,11 +1023,11 @@ class DczWriter:
 
 def write_file(src_stream: Any, dst: os.PathLike[str] | str, csv: Optional[Tuple[str, Optional[str]]],
                profile: str = "balanced", block_size: int = 4 << 20, progress: Optional[Callable[[int, int], Any]] = None,
-               total: int = 0) -> Dict[str, Any]:
+               total: int = 0, escape: Optional[str] = None) -> Dict[str, Any]:
     """Write a DCZ file from a binary stream (sequential encoder)."""
     with open(dst, "wb") as out:
-        writer = DczWriter(out, csv, profile, block_size)
-        for data in iter_blocks(src_stream, block_size, csv):
+        writer = DczWriter(out, csv, profile, block_size, escape)
+        for data in iter_blocks(src_stream, block_size, csv, escape):
             writer.write(data)
             if progress is not None:
                 progress(writer.raw_offset + len(writer.pending), total)
@@ -1010,7 +1040,11 @@ def _version() -> str:
     return __version__
 
 
+@_guard
 def read_footer(path: os.PathLike[str] | str) -> Dict[str, Any]:
+    """The footer, with its block index checked against the file: block headers
+    carry no checksum of their own, so only an index that tiles the file exactly
+    lets their lengths be trusted."""
     with open(path, "rb") as f:
         head = f.read(HEADER_LEN)
         if len(head) < HEADER_LEN or not head.startswith(MAGIC):
@@ -1021,21 +1055,46 @@ def read_footer(path: os.PathLike[str] | str) -> Dict[str, Any]:
             raise FormatError(f"{path} holds packed values; use dataconv.unpack()")
         f.seek(0, os.SEEK_END)
         size = f.tell()
-        if size < HEADER_LEN + TRAILER_LEN:
+        if size < HEADER_LEN + BLOCK_HEADER_LEN + TRAILER_LEN:
             raise IntegrityError("DCZ file is truncated")
         f.seek(size - TRAILER_LEN)
         trailer = f.read(TRAILER_LEN)
         if trailer[8:] != MAGIC_END:
             raise IntegrityError("DCZ trailer missing: the file is truncated")
         (footer_offset,) = struct.unpack("<Q", trailer[:8])
+        if not HEADER_LEN <= footer_offset <= size - TRAILER_LEN - BLOCK_HEADER_LEN:
+            raise IntegrityError("DCZ footer is corrupt")
         f.seek(footer_offset)
         kind, c, _, raw_len, payload_len, crc, _ = _BH.unpack(f.read(BLOCK_HEADER_LEN))
-        if kind != KIND_FOOTER:
+        # the footer block runs exactly to the trailer
+        if kind != KIND_FOOTER or footer_offset + BLOCK_HEADER_LEN + payload_len != size - TRAILER_LEN or raw_len > (256 << 20):
             raise IntegrityError("DCZ footer is corrupt")
         js = codec.decompress(c, f.read(payload_len), raw_len)
         if _crc(js) != crc:
             raise IntegrityError("DCZ footer checksum mismatch")
-    return json.loads(js)  # type: ignore[no-any-return]
+    footer = json.loads(js)
+    if not isinstance(footer, dict) or not isinstance(footer.get("blocks"), list):
+        raise IntegrityError("DCZ footer is corrupt")
+    _check_index(footer, footer_offset)
+    return footer  # type: ignore[no-any-return]
+
+
+def _check_index(footer: Dict[str, Any], footer_offset: int) -> None:
+    """Blocks follow one another from the file header to the footer, and their raw
+    lengths add up to the original size."""
+    offset, raw = HEADER_LEN, 0
+    for b in footer["blocks"]:
+        if not isinstance(b, dict):
+            raise IntegrityError("DCZ block index is corrupt")
+        fields = [b.get(k) for k in ("offset", "raw_offset", "raw_len", "payload_len", "kind")]
+        if any(type(v) is not int or v < 0 for v in fields) or b["kind"] not in (KIND_RAW, KIND_CSV):
+            raise IntegrityError("DCZ block index is corrupt")
+        if b["offset"] != offset or b["raw_offset"] != raw:
+            raise IntegrityError("DCZ block index does not match the file")
+        offset += BLOCK_HEADER_LEN + b["payload_len"]
+        raw += b["raw_len"]
+    if offset != footer_offset or raw != footer.get("original_size"):
+        raise IntegrityError("DCZ block index does not match the file")
 
 
 def iter_decoded(path: os.PathLike[str] | str, verify: bool = True) -> Iterator[bytes]:
@@ -1046,7 +1105,13 @@ def iter_decoded(path: os.PathLike[str] | str, verify: bool = True) -> Iterator[
     with open(path, "rb") as f:
         for b in footer["blocks"]:
             f.seek(b["offset"])
-            kind, c, _, raw_len, payload_len, bcrc, _ = _BH.unpack(f.read(BLOCK_HEADER_LEN))
+            header = f.read(BLOCK_HEADER_LEN)
+            if len(header) != BLOCK_HEADER_LEN:
+                raise IntegrityError("DCZ file is truncated")
+            kind, c, _, raw_len, payload_len, bcrc, _ = _BH.unpack(header)
+            # a header must match its (checksummed) index entry before its lengths are used
+            if (kind, raw_len, payload_len) != (b["kind"], b["raw_len"], b["payload_len"]):
+                raise IntegrityError("DCZ block header does not match the block index")
             payload = f.read(payload_len)
             if len(payload) != payload_len:
                 raise IntegrityError("DCZ file is truncated")
@@ -1054,41 +1119,57 @@ def iter_decoded(path: os.PathLike[str] | str, verify: bool = True) -> Iterator[
             crc = zlib.crc32(data, crc)
             produced += len(data)
             yield data
-    if verify and (produced != footer["original_size"] or (crc & 0xFFFFFFFF) != footer["original_crc32"]):
+    if verify and (produced != footer.get("original_size") or (crc & 0xFFFFFFFF) != footer.get("original_crc32")):
         raise IntegrityError("DCZ content checksum mismatch")
 
 
-class DczReader:
+class DczReader(io.RawIOBase):
     """A read-only binary stream over the decoded contents of a DCZ file."""
 
     def __init__(self, path: os.PathLike[str] | str) -> None:
+        super().__init__()
         self._it = iter_decoded(path)
         self._buf = b""
-        self.closed = False
 
-    def read(self, n: int = -1) -> bytes:
-        while n < 0 or len(self._buf) < n:
-            try:
-                self._buf += next(self._it)
-            except StopIteration:
-                break
-        if n < 0:
+    def _more(self) -> bool:
+        try:
+            self._buf += next(self._it)
+            return True
+        except StopIteration:
+            return False
+
+    def read(self, n: int = -1) -> bytes:  # type: ignore[override]
+        if n is None or n < 0:
+            while self._more():
+                pass
             out, self._buf = self._buf, b""
-        else:
-            out, self._buf = self._buf[:n], self._buf[n:]
+            return out
+        while len(self._buf) < n and self._more():
+            pass
+        out, self._buf = self._buf[:n], self._buf[n:]
         return out
+
+    def readall(self) -> bytes:
+        return self.read(-1)
+
+    def readinto(self, b: Any) -> int:
+        if not self._buf and not self._more():
+            return 0
+        n = min(len(b), len(self._buf))
+        b[:n] = self._buf[:n]
+        self._buf = self._buf[n:]
+        return n
 
     def readable(self) -> bool:
         return True
 
     def close(self) -> None:
-        self.closed = True
+        if not self.closed:
+            self._it.close()  # releases the file (Windows cannot delete open files)
+        super().close()
 
     def __enter__(self) -> DczReader:
         return self
-
-    def __exit__(self, *exc: object) -> None:
-        self.close()
 
 
 # ---------------------------------------------------------------------------------
@@ -1201,6 +1282,7 @@ def wrap_packed(payload: bytes) -> bytes:
     return bytes(out)
 
 
+@_guard
 def unwrap_packed(buf: bytes) -> bytes:
     if len(buf) < HEADER_LEN + 6 or not buf.startswith(MAGIC):
         raise FormatError("not DCZ data")
@@ -1221,6 +1303,7 @@ def unwrap_packed(buf: bytes) -> bytes:
     return payload
 
 
+@_guard
 def unpack_payload(payload: bytes) -> Tuple[int, List[Any], Optional[List[bool]], bytes]:
     r = Reader(payload)
     n = r.varint()

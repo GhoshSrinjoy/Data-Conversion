@@ -9,7 +9,7 @@ import zipfile
 from typing import IO, Any, Optional
 
 from . import _compat, formats
-from .errors import FormatError, MissingDependencyError
+from .errors import DataconvError, FormatError, IntegrityError, MissingDependencyError
 
 
 def _c1(error: UnicodeError) -> Any:
@@ -24,7 +24,161 @@ codecs.register_error("dataconv-c1", _c1)
 
 
 def text_errors(encoding: str) -> str:
-    return "dataconv-c1" if encoding.lower().replace("-", "") in ("cp1252", "windows1252") else "strict"
+    return "dataconv-c1" if encoding.lower().replace("-", "").replace("_", "") in ("cp1252", "windows1252") else "strict"
+
+
+# Python codec names -> labels understood by the native engine.  Latin-1 stays true
+# ISO-8859-1 (bytes 0x80-0x9F are C1 controls), as Python's codec decodes it: the
+# WHATWG label "iso-8859-1" would mean windows-1252.
+NATIVE_ENCODINGS = {
+    "utf8": "utf-8",
+    "utf-8-sig": "utf-8",
+    "utf_8": "utf-8",
+    "cp1252": "windows-1252",
+    "latin-1": "latin-1",
+    "latin1": "latin-1",
+    "latin_1": "latin-1",
+    "iso8859-1": "latin-1",
+    "iso8859_1": "latin-1",
+    "iso-8859-1": "latin-1",
+    "l1": "latin-1",
+    "utf-16-le": "utf-16le",
+    "utf-16-be": "utf-16be",
+    "utf_16_le": "utf-16le",
+    "utf_16_be": "utf-16be",
+    "shift-jis": "shift_jis",
+    "sjis": "shift_jis",
+}
+
+#: The latin-1 aliases the native engine reads as ISO-8859-1 itself
+_LATIN1 = frozenset({"latin-1", "latin1", "iso-8859-1", "iso8859-1", "l1", "iso-ir-100", "cp819", "ibm819"})
+
+#: Every WHATWG encoding label the native engine accepts (encoding_rs), by the Python
+#: codec of the encoding it names (None: no Python codec decodes it)
+_WHATWG_LABELS = (
+    (
+        "cp1252",
+        "ansi_x3.4-1968 ascii cp1252 cp819 csisolatin1 ibm819 iso-8859-1 iso-ir-100 iso8859-1 iso88591 "
+        "iso_8859-1 iso_8859-1:1987 l1 latin1 us-ascii windows-1252 x-cp1252",
+    ),
+    ("iso8859-2", "csisolatin2 iso-8859-2 iso-ir-101 iso8859-2 iso88592 iso_8859-2 iso_8859-2:1987 l2 latin2"),
+    ("iso8859-3", "csisolatin3 iso-8859-3 iso-ir-109 iso8859-3 iso88593 iso_8859-3 iso_8859-3:1988 l3 latin3"),
+    ("iso8859-4", "csisolatin4 iso-8859-4 iso-ir-110 iso8859-4 iso88594 iso_8859-4 iso_8859-4:1988 l4 latin4"),
+    ("iso8859-5", "csisolatincyrillic cyrillic iso-8859-5 iso-ir-144 iso8859-5 iso88595 iso_8859-5 iso_8859-5:1988"),
+    (
+        "iso8859-6",
+        "arabic asmo-708 csiso88596e csiso88596i csisolatinarabic ecma-114 iso-8859-6 iso-8859-6-e "
+        "iso-8859-6-i iso-ir-127 iso8859-6 iso88596 iso_8859-6 iso_8859-6:1987",
+    ),
+    (
+        "iso8859-7",
+        "csisolatingreek ecma-118 elot_928 greek greek8 iso-8859-7 iso-ir-126 iso8859-7 iso88597 "
+        "iso_8859-7 iso_8859-7:1987 sun_eu_greek",
+    ),
+    (
+        "iso8859-8",
+        "csiso88598e csisolatinhebrew hebrew iso-8859-8 iso-8859-8-e iso-ir-138 iso8859-8 iso88598 "
+        "iso_8859-8 iso_8859-8:1988 visual csiso88598i iso-8859-8-i logical",
+    ),
+    ("iso8859-10", "csisolatin6 iso-8859-10 iso-ir-157 iso8859-10 iso885910 l6 latin6"),
+    ("iso8859-13", "iso-8859-13 iso8859-13 iso885913"),
+    ("iso8859-14", "iso-8859-14 iso8859-14 iso885914"),
+    ("iso8859-15", "csisolatin9 iso-8859-15 iso8859-15 iso885915 iso_8859-15 l9"),
+    ("iso8859-16", "iso-8859-16"),
+    (
+        "cp1254",
+        "cp1254 csisolatin5 iso-8859-9 iso-ir-148 iso8859-9 iso88599 iso_8859-9 iso_8859-9:1989 l5 latin5 windows-1254 x-cp1254",
+    ),
+    ("cp1250", "cp1250 windows-1250 x-cp1250"),
+    ("cp1251", "cp1251 windows-1251 x-cp1251"),
+    ("cp1253", "cp1253 windows-1253 x-cp1253"),
+    ("cp1255", "cp1255 windows-1255 x-cp1255"),
+    ("cp1256", "cp1256 windows-1256 x-cp1256"),
+    ("cp1257", "cp1257 windows-1257 x-cp1257"),
+    ("cp1258", "cp1258 windows-1258 x-cp1258"),
+    ("cp874", "dos-874 iso-8859-11 iso8859-11 iso885911 tis-620 windows-874"),
+    ("cp866", "866 cp866 csibm866 ibm866"),
+    ("mac-roman", "csmacintosh mac macintosh x-mac-roman"),
+    ("mac-cyrillic", "x-mac-cyrillic x-mac-ukrainian"),
+    ("koi8-r", "cskoi8r koi koi8 koi8-r koi8_r"),
+    ("koi8-u", "koi8-ru koi8-u"),
+    ("gb18030", "chinese csgb2312 csiso58gb231280 gb2312 gb_2312 gb_2312-80 gbk iso-ir-58 x-gbk gb18030"),
+    ("big5hkscs", "big5 big5-hkscs cn-big5 csbig5 x-x-big5"),
+    ("utf-8", "unicode-1-1-utf-8 unicode11utf8 unicode20utf8 utf-8 utf8 x-unicode20utf8"),
+    ("cp932", "csshiftjis ms932 ms_kanji shift-jis shift_jis sjis windows-31j x-sjis"),
+    ("euc-jp", "cseucpkdfmtjapanese euc-jp x-euc-jp"),
+    ("iso2022-jp", "csiso2022jp iso-2022-jp"),
+    ("cp949", "cseuckr csksc56011987 euc-kr iso-ir-149 korean ks_c_5601-1987 ks_c_5601-1989 ksc5601 ksc_5601 windows-949"),
+    ("utf-16-le", "csunicode iso-10646-ucs-2 ucs-2 unicode unicodefeff utf-16 utf-16le"),
+    ("utf-16-be", "unicodefffe utf-16be"),
+    (None, "csiso2022kr hz-gb-2312 iso-2022-cn iso-2022-cn-ext iso-2022-kr replacement x-user-defined"),
+)
+_WHATWG = {label: codec for codec, labels in _WHATWG_LABELS for label in labels.split()}
+
+
+def known_encoding(label: str) -> bool:
+    """Whether the native engine accepts an encoding label (a WHATWG label, also with
+    ``_`` for ``-`` as Python spells them, or a latin-1 alias), as Python passes it."""
+    key = label.strip().lower()
+    key = NATIVE_ENCODINGS.get(key, key)
+    if key.replace("_", "-") in _LATIN1:
+        return True
+    return key in _WHATWG or key.replace("_", "-") in _WHATWG
+
+
+def python_codec(label: str) -> str:
+    """The Python codec that decodes text in an encoding label: Python's own reading
+    of a label it knows, else that of the WHATWG encoding the label names."""
+    try:
+        codecs.lookup(label)
+        return label
+    except LookupError:
+        key = label.strip().lower()
+        codec = _WHATWG.get(key) or _WHATWG.get(key.replace("_", "-"))
+        return codec or label
+
+
+class _ZstdFrames(io.RawIOBase):
+    """Every frame of a zstd stream, failing on a truncated last frame (zstandard's
+    stream reader just stops there, silently dropping the rest)."""
+
+    def __init__(self, raw: IO[bytes], zs: Any) -> None:
+        super().__init__()
+        self.raw, self.zs = raw, zs
+        self.dobj = zs.ZstdDecompressor().decompressobj()
+        self.pending = b""
+        self.in_frame = False
+        self.done = False
+
+    def readable(self) -> bool:
+        return True
+
+    def _feed(self, data: bytes) -> None:
+        out = []
+        while data:
+            self.in_frame = True
+            out.append(self.dobj.decompress(data))
+            if not self.dobj.eof:
+                break
+            # a frame ended: the next one starts with the unused input
+            data = self.dobj.unused_data
+            self.dobj = self.zs.ZstdDecompressor().decompressobj()
+            self.in_frame = False
+        self.pending += b"".join(out)
+
+    def readinto(self, b: Any) -> int:
+        while not self.pending and not self.done:
+            data = self.raw.read(1 << 20)
+            if not data:
+                if self.in_frame:
+                    raise EOFError("the zstd data ends inside a frame")
+                self.done = True
+                break
+            self._feed(data)
+        n = min(len(b), len(self.pending))
+        b[:n] = self.pending[:n]
+        self.pending = self.pending[n:]
+        return n
 
 
 def _zstd_reader(raw: IO[bytes]) -> IO[bytes]:
@@ -33,7 +187,7 @@ def _zstd_reader(raw: IO[bytes]) -> IO[bytes]:
         return std.ZstdFile(raw)  # type: ignore[no-any-return]
     zs = _compat.optional("zstandard")
     if zs is not None:
-        return zs.ZstdDecompressor().stream_reader(raw, read_across_frames=True)  # type: ignore[no-any-return]
+        return _ZstdFrames(raw, zs)  # type: ignore[return-value]
     pz = _compat.optional("pyzstd")
     if pz is not None:
         return pz.ZstdFile(raw)  # type: ignore[no-any-return]
@@ -57,11 +211,13 @@ def _zstd_writer(raw: IO[bytes], level: int) -> IO[bytes]:
 
 
 class _Closing(io.RawIOBase):
-    """Close an outer stream together with the file underneath it."""
+    """Close an outer stream together with the file underneath it.  A decompressor
+    failing on truncated or corrupt input raises an IntegrityError naming the file."""
 
-    def __init__(self, inner: Any, *owned: Any) -> None:
+    def __init__(self, inner: Any, *owned: Any, what: str = "") -> None:
         self.inner = inner
         self.owned = owned
+        self.what = what
 
     def readable(self) -> bool:
         return True
@@ -70,7 +226,12 @@ class _Closing(io.RawIOBase):
         return hasattr(self.inner, "write")
 
     def readinto(self, b: Any) -> int:
-        data = self.inner.read(len(b))
+        try:
+            data = self.inner.read(len(b))
+        except DataconvError:
+            raise
+        except Exception as exc:
+            raise _corrupt(self.what, exc) from None
         n = len(data)
         b[:n] = data
         return n
@@ -90,41 +251,58 @@ class _Closing(io.RawIOBase):
                 super().close()
 
 
+def _corrupt(what: str, exc: BaseException) -> IntegrityError:
+    detail = str(exc) or type(exc).__name__
+    return IntegrityError(f"{what}: the compressed data is truncated or corrupt ({detail})")
+
+
 def open_binary(path: os.PathLike[str] | str) -> IO[bytes]:
-    """Open for reading, decompressing gzip, bz2, xz, zstd, lz4, brotli and zip."""
+    """Open for reading, decompressing gzip, bz2, xz, zstd, lz4, brotli and zip
+    (every member, stream or frame of concatenated ones)."""
     _, compression = formats.detect(path)
     raw = open(path, "rb")  # noqa: SIM115 - returned to the caller, who closes it
+    what = f"{path} ({compression})"
     try:
         if compression is None:
             return raw
         if compression == "gzip":
             import gzip
 
-            return io.BufferedReader(_Closing(gzip.GzipFile(fileobj=raw), raw), 1 << 20)
+            return io.BufferedReader(_Closing(gzip.GzipFile(fileobj=raw), raw, what=what), 1 << 20)
         if compression == "bz2":
             import bz2
 
-            return io.BufferedReader(_Closing(bz2.BZ2File(raw), raw), 1 << 20)
+            return io.BufferedReader(_Closing(bz2.BZ2File(raw), raw, what=what), 1 << 20)
         if compression == "xz":
             import lzma
 
-            return io.BufferedReader(_Closing(lzma.LZMAFile(raw), raw), 1 << 20)
+            return io.BufferedReader(_Closing(lzma.LZMAFile(raw), raw, what=what), 1 << 20)
         if compression == "zstd":
-            return io.BufferedReader(_Closing(_zstd_reader(raw), raw), 1 << 20)
+            return io.BufferedReader(_Closing(_zstd_reader(raw), raw, what=what), 1 << 20)
         if compression == "lz4":
             lz4f = _compat.require("lz4.frame", "reading .lz4 files", "fast")
-            return io.BufferedReader(_Closing(lz4f.LZ4FrameFile(raw), raw), 1 << 20)
+            return io.BufferedReader(_Closing(lz4f.LZ4FrameFile(raw), raw, what=what), 1 << 20)
         if compression == "brotli":
             br = _compat.optional("brotli") or _compat.require("brotlicffi", "reading .br files", "fast")
-            data = br.decompress(raw.read())
+            try:
+                data = br.decompress(raw.read())
+            except Exception as exc:
+                raise _corrupt(what, exc) from None
             raw.close()
             return io.BytesIO(data)
         if compression == "zip":
-            zf = zipfile.ZipFile(raw)
+            try:
+                zf = zipfile.ZipFile(raw)
+            except (zipfile.BadZipFile, OSError, ValueError, EOFError) as exc:
+                raise _corrupt(what, exc) from None
             members = [m for m in zf.infolist() if not m.is_dir()]
             if len(members) != 1:
                 raise FormatError(f"{path}: zip archives must contain exactly one file ({len(members)} found)")
-            return io.BufferedReader(_Closing(zf.open(members[0]), zf, raw), 1 << 20)
+            try:
+                member = zf.open(members[0])
+            except (zipfile.BadZipFile, OSError, ValueError, EOFError, NotImplementedError, RuntimeError) as exc:
+                raise _corrupt(what, exc) from None
+            return io.BufferedReader(_Closing(member, zf, raw, what=what), 1 << 20)
     except BaseException:
         raw.close()
         raise
@@ -134,6 +312,7 @@ def open_binary(path: os.PathLike[str] | str) -> IO[bytes]:
 
 def open_text(path: os.PathLike[str] | str, encoding: str) -> IO[str]:
     binary = open_binary(path)
+    encoding = python_codec(encoding)
     enc = "utf-8-sig" if encoding.lower() in ("utf-8", "utf8") else encoding
     return io.TextIOWrapper(binary, encoding=enc, errors=text_errors(enc), newline="")
 

@@ -6,16 +6,23 @@ leading preamble lines from a sample of the file.
 
 from __future__ import annotations
 
+import codecs
 import csv
-import io
 import os
+import re
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from . import _compat, _io, infer  # noqa: F401  (_io registers the cp1252 error handler)
+from . import _compat, _csvtok, _io, infer  # _io also registers the cp1252 error handler
+from .errors import OptionsError
 
 CANDIDATES = [",", "\t", ";", "|", "^", "~", ":"]
+#: a time of day: H:MM or HH:MM:SS (a leap second too) with up to 9 fraction digits,
+#: then optionally Z or a +HH:MM / -HH:MM offset
+_TIME = re.compile(r"([0-9]{1,2}):([0-9]{2})(?::([0-9]{2})(?:\.[0-9]{1,9})?)?(?:Z|[+-][0-9]{2}:[0-9]{2})?")
+#: characters that may delimit a sample read as one column, the first absent one wins
+_LONE = (",", "\t", ";", "|", "\x1f")
 
 
 @dataclass
@@ -58,10 +65,17 @@ class Dialect:
         return kw
 
 
-def _option_char(value: Optional[str]) -> Optional[str]:
+def parse_char_option(value: Optional[str]) -> Optional[str]:
+    """A one-character dialect option (``;``, ``tab``, ``\\t``, ``space``, ``none``), as
+    the native engine reads it: '' for none, else a single ASCII character."""
     if value is None:
         return None
-    return {"\\t": "\t", "tab": "\t", "TAB": "\t", "space": " ", "none": "", "": ""}.get(value, value[:1])
+    named = {"\\t": "\t", "tab": "\t", "TAB": "\t", "\\n": "\n", "space": " ", "none": "", "": ""}
+    if value in named:
+        return named[value]
+    if len(value) != 1 or not value.isascii():
+        raise OptionsError(f"{value!r} is not a single ASCII character (e.g. ',', ';', '|', 'tab' or 'none')")
+    return value
 
 
 def detect_encoding(sample: bytes, complete: bool = True) -> Tuple[str, bool]:
@@ -110,33 +124,63 @@ def trim_partial_utf8(sample: bytes) -> bytes:
 
 
 def decode_sample(raw: bytes, encoding: str, complete: bool) -> str:
-    data = raw if complete or encoding != "utf-8" else trim_partial_utf8(raw)
-    errors = "dataconv-c1" if encoding in ("cp1252", "windows-1252") else "replace"
+    encoding = _io.python_codec(encoding)
+    utf8 = codecs.lookup(encoding).name == "utf-8"
+    data = raw if complete or not utf8 else trim_partial_utf8(raw)
+    errors = "dataconv-c1" if _io.text_errors(encoding) == "dataconv-c1" else "replace"
     return data.decode(encoding, errors=errors).lstrip("﻿")
 
 
+def _sample(
+    text: str, delimiter: str, quote: Optional[str], escape: Optional[str], limit: int, complete: bool
+) -> Tuple[List[List[str]], List[int], int]:
+    """Records of the sample, split exactly as the converters split them (the record
+    cut off by the end of an incomplete sample is dropped)."""
+    d = _csvtok.Dialect(delimiter, quote, escape, escape is None)
+    return _csvtok.sample_records(text, d, limit, complete)
+
+
 def _rows(text: str, delimiter: str, quote: Optional[str], escape: Optional[str], limit: int, complete: bool) -> List[List[str]]:
-    kw: Dict[str, Any] = {"delimiter": delimiter, "strict": False}
-    if quote:
-        kw["quotechar"] = quote
-    else:
-        kw["quoting"] = csv.QUOTE_NONE
-    if escape:
-        kw["escapechar"] = escape
-        kw["doublequote"] = False
-    if not complete:
-        # drop the record cut off by the sample boundary
-        cut = text.rfind("\n")
-        text = text[: cut + 1] if cut >= 0 else ""
-    rows = []
-    try:
-        for row in csv.reader(io.StringIO(text, newline=""), **kw):
-            rows.append(row)
-            if len(rows) >= limit:
-                break
-    except csv.Error:
-        pass
-    return rows
+    return _sample(text, delimiter, quote, escape, limit, complete)[0]
+
+
+def _backslash_escape(text: str, quote: Optional[str]) -> Optional[str]:
+    """Backslash-escaped quotes (``\\"``) and no RFC 4180 doubled quotes mean the
+    writer escapes with backslashes (the native rule)."""
+    if not quote or quote not in text:
+        return None
+    backslashed = doubled = 0
+    i = 1
+    n = len(text)
+    while i < n:
+        i = text.find(quote, i)
+        if i < 0:
+            break
+        if text[i - 1] == "\\":
+            backslashed += 1
+        elif i + 1 < n and text[i + 1] == quote and text[i - 1] != quote:
+            doubled += 1
+            i += 1
+        i += 1
+    return "\\" if backslashed > 0 and doubled == 0 else None
+
+
+def _time_of_day(v: str) -> bool:
+    m = _TIME.fullmatch(v)
+    return bool(m) and int(m.group(1)) <= 23 and int(m.group(2)) <= 59 and int(m.group(3) or 0) <= 60
+
+
+def _one_temporal_column(text: str, quote: Optional[str], escape: Optional[str], complete: bool) -> bool:
+    """Whether a sample that ``:`` would split is really one column of times, dates or
+    timestamps (``10:30``, ``2024-01-02 03:04:05``)."""
+    rows = _rows(text, ",", quote, escape, 400, complete)
+    if any(len(r) != 1 for r in rows):
+        return False
+    values = [r[0] for r in rows[1:] if r[0] != ""]  # the first row may be a header
+    if not values:
+        return False
+    hits = sum(1 for v in values if infer.parse_timestamp(v) is not None or infer.parse_date(v) is not None or _time_of_day(v))
+    return hits * 10 >= len(values) * 9
 
 
 def _score(rows: Sequence[Sequence[str]]) -> Tuple[float, int]:
@@ -191,11 +235,53 @@ def looks_like_header(rows: Sequence[Sequence[str]]) -> bool:
     return score >= 0
 
 
+def _layout(
+    text: str, delimiter: str, quote: Optional[str], escape: Optional[str], skip_rows: Optional[int], complete: bool
+) -> Tuple[List[List[str]], List[int], int, int, int]:
+    """(rows, terminator counts, longest record, dominant field count, preamble rows
+    before the data, ``skip_rows`` when given) of the sample read with ``delimiter``."""
+    rows, terms, longest = _sample(text, delimiter, quote, escape, 2000, complete)
+    # dominant field count from the body of the sample (so preamble lines cannot
+    # outvote the data); small samples use every row
+    body = rows[len(rows) // 4 :] if len(rows) >= 20 else rows
+    _, ncols = _score(body)
+    if skip_rows is not None:
+        return rows, terms, longest, ncols, skip_rows
+    k = 0
+    while k < len(rows) and k < 50:
+        n = len(rows[k])
+        blank = n == 0 or (n == 1 and rows[k][0] == "")
+        if n == ncols and not blank:
+            break
+        if not (blank or (ncols >= 2 and n <= ncols // 2)):
+            k = 0
+            break
+        k += 1
+    return rows, terms, longest, ncols, (0 if k >= len(rows) else k)
+
+
+def _header_evidence(rows: Sequence[Sequence[str]]) -> bool:
+    """Whether the first of ``rows`` is a header with evidence: a text name over a
+    column whose values are all numbers, dates, timestamps or booleans.  (All-text data
+    is read as having a header when undecided; this asks for more.)"""
+    if not rows:
+        return False
+    first, rest = rows[0], rows[1:101]
+    for j, name in enumerate(first):
+        col = [r[j] for r in rest if j < len(r) and r[j] != ""]
+        if _kind(name) == "text" and col and all(_kind(v) != "text" for v in col):
+            return True
+    return False
+
+
 def unique_names(raw: Sequence[str], width: int) -> List[str]:
+    """Column names exactly as written; only an empty or blank name becomes
+    ``column_N``, and duplicates get ``_2``, ``_3``..."""
     out: List[str] = []
     seen = set()
     for i in range(width):
-        base = (raw[i] if i < len(raw) else "").strip() or f"column_{i + 1}"
+        text = raw[i] if i < len(raw) else ""
+        base = text if text.strip() else f"column_{i + 1}"
         name, n = base, 2
         while name in seen:
             name, n = f"{base}_{n}", n + 1
@@ -216,18 +302,22 @@ def sniff_bytes(
     extension: Optional[str] = None,
 ) -> Dialect:
     detected, bom = detect_encoding(raw, complete)
+    if encoding is not None and not _io.known_encoding(encoding):
+        raise OptionsError(f"unknown encoding '{encoding}'")
     enc = encoding or detected
     text = decode_sample(raw, enc, complete)
-    q = '"' if quote is None else (_option_char(quote) or None)
+    q = '"' if quote is None else (parse_char_option(quote) or None)
     has_quotes = bool(q) and q in text
-    esc = _option_char(escape) if escape is not None else None
-    if escape is None and has_quotes and '\\"' in text:
-        doubled = sum(1 for i in range(1, len(text) - 1) if text[i] == '"' and text[i + 1] == '"' and text[i - 1] not in '\\"')
-        esc = "\\" if doubled == 0 else None
+    esc = (parse_char_option(escape) or None) if escape is not None else _backslash_escape(text, q)
     tsv_hint = (extension or "").lower().lstrip(".") in ("tsv", "tab")
+
+    def lone() -> Optional[str]:
+        # a character that never occurs in the sample, for reading it as one column
+        return next((c for c in (_LONE if complete else _LONE[-1:]) if c not in text), None)
+
     confidence = 1.0
     if delimiter:
-        delim = _option_char(delimiter) or ","
+        delim = parse_char_option(delimiter) or ","
     else:
         best = (",", 0.0)
         for cand in CANDIDATES:
@@ -237,32 +327,39 @@ def sniff_bytes(
             if score > best[1] + 1e-9:
                 best = (cand, score)
         delim, confidence = best if best[1] > 0 else ("\t" if tsv_hint else ",", 0.0)
-    rows = _rows(text, delim, q, esc, 2000, complete)
-    crlf = text.count("\r\n")
-    lf = text.count("\n") - crlf
-    cr = text.count("\r") - crlf
+        if delim == ":" and _one_temporal_column(text, q, esc, complete):
+            # "10:30" or "2024-01-02 03:04:05" splits on ':' consistently, but it is a
+            # single column of times
+            delim = lone() or ","
+    if delim in (q, esc):
+        raise OptionsError(f"the delimiter {delim!r} is also the quote or escape character; they must differ")
+    rows, terms, longest, ncols, skip = _layout(text, delim, q, esc, skip_rows, complete)
+    # A first row without the delimiter, taken for a one-line preamble before data that
+    # has no header, is far more often the header of a single column whose values
+    # contain that character (MAC addresses, URLs with ports, key:value pairs).  Unless
+    # the rows below show a real header (a name over typed values), read one column:
+    # every line is kept whole either way.
+    if (
+        delimiter is None
+        and skip_rows is None
+        and skip == 1
+        and rows
+        and len(rows[0]) == 1
+        and rows[0][0] != ""
+        and delim not in rows[0][0]
+        and not _header_evidence(rows[1:])
+    ):
+        c = lone()
+        if c is not None:
+            delim = c
+            rows, terms, longest, ncols, skip = _layout(text, delim, q, esc, None, complete)
+    lf, crlf, cr = terms[_csvtok.LF], terms[_csvtok.CRLF], terms[_csvtok.CR]
     terminator = "\r\n" if crlf >= lf and crlf >= cr and crlf > 0 else "\r" if cr > lf and cr > crlf else "\n"
-    body = rows[len(rows) // 4 :] if len(rows) >= 20 else rows
-    _, ncols = _score(body)
-    if skip_rows is None:
-        k = 0
-        while k < len(rows) and k < 50:
-            n = len(rows[k])
-            blank = n == 0 or (n == 1 and rows[k][0] == "")
-            if n == ncols and not blank:
-                break
-            if not (blank or (ncols >= 2 and n <= ncols // 2)):
-                k = 0
-                break
-            k += 1
-        skip = 0 if k >= len(rows) else k
-    else:
-        skip = skip_rows
     data_rows = [r for r in rows[skip:]]
     has_header = looks_like_header(data_rows) if header is None else header
     width = max(len(data_rows[0]) if data_rows else ncols, ncols, 1)
     columns = unique_names(data_rows[0], width) if has_header and data_rows else [f"column_{i + 1}" for i in range(width)]
-    max_len = max((len(line) for line in text.splitlines()), default=0)
+    max_len = longest
     return Dialect(
         delimiter=delim,
         quote=q,

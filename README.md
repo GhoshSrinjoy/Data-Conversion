@@ -215,22 +215,60 @@ Types are inferred from a sample (the start of the file plus windows spread
 through it). If a later value does not fit, the job re-plans from a full scan
 and restarts; `--infer full` scans everything up front.
 
+JSON Lines and JSON follow the same rules. An integer within int64 stays an
+integer, a longer one becomes `decimal(p,0)`, and a number with more digits than
+a double holds becomes a decimal (or text, beyond 38 digits). Keys keep their
+order in the file. A field that mixes strings, numbers and objects keeps every
+value as its JSON text, so `1` and `"1"` stay different. Such columns are marked,
+and JSON output writes them back as the JSON they hold, so JSON → Parquet → JSON
+returns the same values. `NaN` and `Infinity` are written as the strings `"NaN"`
+and `"Infinity"`, and read back as floats.
+
 ## Robustness
 
 - **Bad rows.** Rows with the wrong number of fields go to
   `<output>.rejected.csv` by default (`--bad-lines quarantine`). Alternatives
-  are `skip`, `error` and `pad` (pad short rows with missing values).
+  are `skip`, `error` and `pad` (pad short rows with missing values). The
+  quarantine file is never the input, and it replaces an existing file only with
+  `--force`. A clean run with `--force` removes the rejected rows of an earlier
+  run.
+- **Stray quotes.** A quote inside a field (`55" screen`) is a literal
+  character. A quote that is never closed costs only its own line: that line is
+  a malformed row and parsing resumes on the next one, instead of the rest of
+  the file becoming one value. When a stray quote pairs up with a later one, the
+  lines between them become one rejected row, and the warning says how many
+  lines it holds. A genuine quoted field may run to 1 GiB; a quote still open
+  after that is taken to be a stray, and the report warns about it.
 - **Encodings.** UTF-8 with or without BOM, UTF-16 and Windows-1252 are detected
   from samples. Invalid bytes found later in the file trigger an automatic
-  re-read as Windows-1252.
+  re-read as Windows-1252. `--encoding latin-1` means ISO-8859-1 itself, where
+  every byte is the character of the same number.
 - **Dialects.** The delimiter (`,` `;` `\t` `|` and more), quoting, backslash
   escapes, line endings, header presence and preamble lines before the header are
-  detected. Duplicate or empty column names are made unique.
+  detected. A single column whose values contain a delimiter (timestamps, MAC
+  addresses, URLs with ports, `key:value` pairs) keeps its header and its values
+  whole. Header names are kept exactly as written; duplicate or empty names are
+  made unique. In a single-column file a blank line is a row with a missing
+  value. Options that cannot work (an unknown encoding, a delimiter that is also
+  the quote character) are refused up front.
 - **Compressed inputs.** `.gz`, `.zst`, `.xz`, `.bz2`, `.lz4`, `.br` and
-  single-file `.zip` inputs are read transparently, and outputs such as
-  `.csv.gz` or `.jsonl.zst` are compressed on the way out.
+  single-file `.zip` inputs are read transparently, including multi-member gzip
+  and concatenated frames, and outputs such as `.csv.gz` or `.jsonl.zst` are
+  compressed on the way out. A truncated or corrupt stream is an error, never a
+  shorter result.
 - **Atomic outputs.** Results are written to a temporary file and moved into
   place only on success. Ctrl-C or an error leaves the destination untouched.
+  `split` writes its parts into a private folder and publishes them together,
+  so a failed or restarted split never leaves some parts behind.
+- **Readable everywhere.** Timestamps without fractional digits are stored in
+  Parquet as milliseconds and date64 values as dates, so every reader sees the
+  right type rather than bare integers.
+- **Files from other tools.** Parquet and Arrow columns of any type become the
+  same CSV and JSON text with every engine. Floats are written with the shortest
+  digits that read back exactly (float32 and float16 in their own precision).
+  Times are written at any unit and year, and structs, lists and maps become
+  JSON. A map stays an object even with repeated or non-text keys. pyarrow's
+  `timestamp[s]` columns keep their time zone.
 - **Verification.** `dataconv verify a b` compares contents across formats and
   reports the first differences; DCZ checks a CRC-32 per block and for the
   whole file.
@@ -261,8 +299,8 @@ large files all the threads. `--skip-existing` makes repeated runs incremental.
 
 ```text
 dataconv convert SRC [DST] [options]   convert a file or a directory tree
-dataconv compress SRC [DST]            lossless DCZ compression
-dataconv decompress SRC [DST]          restore the original bytes
+dataconv compress SRC [DST]            lossless DCZ compression of any file, byte for byte
+dataconv decompress SRC [DST]          restore the original bytes (a .gz stays a .gz)
 dataconv split SRC DIR --rows N | --size SIZE [--to FORMAT] [--pattern P]
 dataconv merge SRC... -o DST           concatenate, unifying schemas
 dataconv info FILE [--exact]           format, rows, schema, codecs, statistics
@@ -348,6 +386,7 @@ dataconv (Python)                         dataconv-native (Rust, PyO3, abi3)
   dcz.py      DCZ reader/writer               decode.rs    guarded typed column builders
   resources.py container-aware planning       convert.rs   streaming pipeline, re-planning
   tune.py     Parquet tuning                  tables.rs    parallel Parquet, IPC, JSONL, CSV
+  _csvtok.py  CSV chunks and records          jsonl.rs     lossless JSON Lines
                                               split.rs     byte-exact and size-targeted splits
                                               dcz/         columnar codec, container, int coding
                                               pack.rs      value packing
@@ -364,8 +403,9 @@ DATACONV_DISABLE=all pytest             # the pure-Python fallbacks only
 cd native && cargo test                 # Rust unit and integration tests
 ```
 
-Changes to the type rules or to DCZ must be made in both implementations;
-`tests/test_infer.py` and `tests/test_dcz.py` check that they agree.
+Changes to the type rules, the CSV and JSON rules or DCZ must be made in both
+implementations; `tests/test_infer.py`, `tests/test_csv_rules.py`,
+`tests/test_json_rules.py` and `tests/test_dcz.py` check that they agree.
 
 ## License
 

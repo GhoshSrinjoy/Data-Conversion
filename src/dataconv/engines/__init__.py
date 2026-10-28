@@ -23,6 +23,15 @@ def installed() -> List[str]:
     return found
 
 
+def unsupported(engine: str, src_fmt: str, dst_fmt: str, src_comp: Optional[str], dst_comp: Optional[str]) -> str:
+    """Why an installed engine cannot do a job."""
+    if formats.engine_supports(engine, src_fmt, dst_fmt, None, None):
+        if src_comp and not formats.engine_supports(engine, src_fmt, dst_fmt, src_comp, None):
+            return f"the {engine} engine cannot read {src_comp}-compressed input (use engine='auto')"
+        return f"the {engine} engine cannot write {dst_comp}-compressed {dst_fmt} (use engine='auto')"
+    return f"the {engine} engine cannot convert {src_fmt} to {dst_fmt}"
+
+
 def choose(engine: str, src_fmt: str, dst_fmt: str, src_comp: Optional[str] = None, dst_comp: Optional[str] = None) -> str:
     have = installed()
     if engine != "auto":
@@ -30,7 +39,7 @@ def choose(engine: str, src_fmt: str, dst_fmt: str, src_comp: Optional[str] = No
             hint = {"native": "dataconv[native]", "arrow": "dataconv[arrow]"}.get(engine, "dataconv")
             raise MissingDependencyError(f"the {engine} engine is not installed (pip install \"{hint}\")")
         if not formats.engine_supports(engine, src_fmt, dst_fmt, src_comp, dst_comp):
-            raise OptionsError(f"the {engine} engine cannot convert {src_fmt} to {dst_fmt}")
+            raise OptionsError(unsupported(engine, src_fmt, dst_fmt, src_comp, dst_comp))
         return engine
     for candidate in have:
         if formats.engine_supports(candidate, src_fmt, dst_fmt, src_comp, dst_comp):

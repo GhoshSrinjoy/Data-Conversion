@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-from .errors import FormatError
+from .errors import FileError, FormatError
 
 
 @dataclass(frozen=True)
@@ -34,7 +34,7 @@ FORMATS: Dict[str, Format] = {
         Format("ipc", (".arrow", ".feather", ".ipc", ".fea"), "Arrow IPC / Feather v2", True, True, False),
         Format("orc", (".orc",), "Apache ORC", False, True, False),
         Format("dcz", (".dcz",), "DCZ lossless columnar compression", True, True, True),
-        Format("xlsx", (".xlsx", ".xlsm"), "Excel workbook (read-only)", False, True, True, writable=False),
+        Format("xlsx", (".xlsx", ".xlsm"), "Excel workbook (read-only)", False, True, False, writable=False),
     )
 }
 
@@ -127,6 +127,8 @@ def _magic(path: Path) -> Tuple[Optional[str], Optional[str]]:
 def detect(path: os.PathLike, explicit: Optional[str] = None) -> Tuple[str, Optional[str]]:
     """(format, compression) of an existing file.  Magic bytes win over extensions."""
     p = Path(path)
+    if p.is_dir():
+        raise FileError(f"{p} is a directory, not a file")
     magic_fmt, magic_comp = _magic(p)
     _, ext_fmt, ext_comp = split_name(p)
     compression = magic_comp or ext_comp

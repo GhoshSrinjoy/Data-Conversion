@@ -98,3 +98,24 @@ def test_int_codec_extremes():
         enc = dcz.encode_ints(values)
         assert dcz.decode_ints(dcz.Reader(enc)) == values
     assert len(dcz.encode_ints(list(range(10_000)))) < 32
+
+
+def test_block_cuts_follow_the_quote_rules():
+    # a literal quote inside a field does not hide the records after it
+    data = b'id,size\n1,55" screen\n2,x\n'
+    assert dcz._record_boundary(data, '"') == len(data)
+    # an escaped quote does not close a field
+    esc = b'1,"a\\"b\nc"\n2,x\n'
+    assert dcz._record_boundary(esc[: esc.index(b"c")], '"', ",", "\\") == 0
+    assert dcz._record_boundary(esc, '"', ",", "\\") == len(esc)
+
+
+def test_reader_is_a_binary_stream(tmp_path, no_native):
+    import io
+
+    src = tmp_path / "r.csv"
+    src.write_bytes(b"a,b\n" + b"".join(b"%d,x\n" % i for i in range(1000)))
+    dst = tmp_path / "r.dcz"
+    dc.compress(src, dst)
+    with io.TextIOWrapper(io.BufferedReader(dcz.DczReader(dst)), encoding="utf-8", newline="") as f:
+        assert f.read() == src.read_bytes().decode()

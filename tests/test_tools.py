@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 import dataconv as dc
 from conftest import needs_arrow, needs_native
 
@@ -98,3 +100,59 @@ def test_system_info_and_plan():
     assert "pure" in info["engines"]
     plan = dc.plan("10GB")
     assert plan["threads"] >= 1 and plan["memory_budget"] > 0
+
+
+def test_split_without_native_is_byte_exact(tmp_path, no_native):
+    src = tmp_path / "in.csv"
+    body = 'id,price,when,flag\r\n1,1.50,2024-01-01 10:00:00,True\r\n2,1e5,"x\r\ny",False\r\nbad\r\n3,2.25,z,True\r\n'
+    src.write_bytes(body.encode())
+    r = dc.split(src, tmp_path / "parts", rows=2)
+    parts = [Path(p["path"]).read_bytes() for p in r.parts]
+    header = b"id,price,when,flag\r\n"
+    assert all(p.startswith(header) for p in parts)
+    # records copied verbatim (the malformed one too), values untouched
+    assert b"".join(p[len(header) :] for p in parts) == body.encode()[len(header) :]
+    assert r.rows == 4 and [p["rows"] for p in r.parts] == [2, 2]
+    assert not [p for p in (tmp_path / "parts").iterdir() if p.name.startswith(".")]  # no staging left
+    with pytest.raises(FileExistsError):
+        dc.split(src, tmp_path / "parts", rows=2)
+
+
+@needs_arrow
+def test_split_without_native_reports_rejects(tmp_path, no_native):
+    src = tmp_path / "s.csv"
+    src.write_bytes(b"a,b\n1,2\n3,4,5\n6,7\n8\n9,10\n")
+    r = dc.split(src, tmp_path / "parts", rows=2, to="jsonl")
+    assert (r.rows, r.bad_rows) == (3, 2)
+    assert r.quarantine == str(tmp_path / "parts.rejected.csv")
+    assert Path(r.quarantine).read_bytes() == b"a,b\n3,4,5\n8\n"
+    assert any("2 malformed rows moved to" in w for w in r.warnings)
+
+
+@needs_arrow
+def test_verify_is_lossless(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    csv = tmp_path / "zip.csv"
+    csv.write_bytes(b"id,zip,x\n1,007,1.5\n2,010,2.0\n")
+    pq.write_table(pa.table({"id": [1, 2], "zip": [7, 10], "x": pa.array([1.5, 2.0], pa.float32())}), tmp_path / "p.parquet")
+    for a, b in ((csv, tmp_path / "p.parquet"), (tmp_path / "p.parquet", csv)):
+        res = dc.verify(a, b)
+        assert not res["equal"]
+        assert {d["column"] for d in res["differences"] if d["kind"] == "value"} == {"zip"}
+
+
+@needs_arrow
+def test_load_arrow_streams_and_options(tmp_path):
+    import pyarrow as pa
+
+    t = pa.table({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+    with pa.OSFile(str(tmp_path / "s.arrow"), "wb") as f, pa.ipc.new_stream(f, t.schema) as w:
+        w.write_table(t)
+    with pa.OSFile(str(tmp_path / "f.arrow"), "wb") as f, pa.ipc.new_file(f, t.schema) as w:
+        w.write_table(t)
+    assert dc.load(tmp_path / "s.arrow").equals(t)
+    assert dc.load(tmp_path / "f.arrow", columns=["a"], limit=2).to_pydict() == {"a": [1, 2]}
+    r = dc.convert(tmp_path / "s.arrow", tmp_path / "s.csv", engine="arrow")
+    assert r.rows == 3

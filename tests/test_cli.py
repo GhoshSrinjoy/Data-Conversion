@@ -65,3 +65,32 @@ def test_doctor(capsys):
 def test_module_entry_point(tricky):
     proc = subprocess.run([sys.executable, "-m", "dataconv", "count", str(tricky)], capture_output=True, text=True)
     assert proc.returncode == 0 and int(proc.stdout) >= 2000
+
+
+def test_false_flags_reach_the_engine(tmp_path, capsys):
+    src = tmp_path / "nh.csv"
+    src.write_bytes(b"name,city\nalice,paris\n")
+    out = tmp_path / "nh.jsonl"
+    assert run(["convert", src, out, "--no-header", "-q"], capsys)[0] == 0
+    first = json.loads(out.read_text(encoding="utf-8").splitlines()[0])
+    assert first == {"column_1": "name", "column_2": "city"}
+    code, stdout, _ = run(["count", src, "--no-header"], capsys)
+    assert code == 0 and int(stdout) == 2
+
+
+def test_tab_names_and_clean_errors(tmp_path, capsys):
+    src = tmp_path / "c.csv"
+    src.write_bytes(b"a,b\n1,2\n")
+    out = tmp_path / "c.out.csv"
+    assert run(["convert", src, out, "--out-delimiter", r"\t", "-q"], capsys)[0] == 0  # as typed in a shell
+    assert out.read_bytes() == b"a\tb\n1\t2\n"
+    # a directory, a truncated input: one-line errors, exit code 1
+    code, _, err = run(["count", tmp_path], capsys)
+    assert code == 1 and "is a directory" in err and "Traceback" not in err
+    gz = tmp_path / "t.csv.gz"
+    import gzip
+
+    packed = gzip.compress(b"".join(b"%d,%d\n" % (i, i * 7) for i in range(20_000)))
+    gz.write_bytes(packed[: len(packed) // 2])
+    code, _, err = run(["convert", gz, tmp_path / "t.jsonl", "--engine", "pure"], capsys)
+    assert code == 1 and "truncated or corrupt" in err and len(err.strip().splitlines()) == 1

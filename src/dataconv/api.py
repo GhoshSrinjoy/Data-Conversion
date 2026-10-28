@@ -6,6 +6,8 @@ import array
 import fnmatch
 import json
 import os
+import secrets
+import shutil
 import struct
 import tempfile
 import time
@@ -13,12 +15,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
-from . import _compat, _native, codec, dcz, engines, formats, resources
+from . import _compat, _csvtok, _native, codec, dcz, engines, formats, resources
 from ._util import PathLike, atomic_output, parse_size
 from .engines import arrow as arrow_engine
 from .engines import native as native_engine
 from .engines import pure as pure_engine
-from .errors import FormatError, MissingDependencyError, OptionsError
+from .errors import FileError, FormatError, MissingDependencyError, OptionsError, OutputExistsError
 from .options import ConvertOptions
 from .progress import Progress
 from .report import BatchReport, Report
@@ -37,6 +39,14 @@ def _progress(arg: ProgressArg, label: str) -> Tuple[Optional[Callable[[int, int
 
 def _engine_for(engine: str, src_fmt: str, dst_fmt: str, src_comp: Optional[str], dst_comp: Optional[str]) -> str:
     return engines.choose(engine, src_fmt, dst_fmt, src_comp, dst_comp)
+
+
+def _check_input(path: Path) -> None:
+    """A clear error for a missing input or a directory (Windows says "Access is denied")."""
+    if not path.exists():
+        raise FileNotFoundError(f"no such file: {path}")
+    if path.is_dir():
+        raise FileError(f"{path} is a directory, not a file")
 
 
 # ---------------------------------------------------------------------------------
@@ -187,7 +197,7 @@ def convert_dir(
     return batch
 
 
-def split(src: PathLike, out_dir: PathLike, *, rows: Optional[int] = None, size: Union[None, int, str] = None,
+def split(src: PathLike, out_dir: PathLike, *, rows: Optional[int] = None, size: Union[int, str, None] = None,
           to: Optional[str] = None, pattern: str = "part-{n:05}", extension: Optional[str] = None,
           progress: ProgressArg = None, **options: Any) -> Report:
     """Split a file into parts of at most ``rows`` rows or ``size`` bytes ('100MB').
@@ -195,69 +205,194 @@ def split(src: PathLike, out_dir: PathLike, *, rows: Optional[int] = None, size:
     CSV to CSV is byte-exact (records are copied verbatim, every part keeps the
     header).  Other formats stream through the converter; for size targets the
     rows per part adapt to the measured output size so parts land near the target.
+    Parts are published only when the whole job succeeded.
     """
     target_bytes = parse_size(size, "m") if size is not None else None
     if rows is None and target_bytes is None:
         raise OptionsError("split needs rows=... or size=...")
     src = Path(src)
+    _check_input(src)
     src_fmt, src_comp = formats.detect(src, options.get("from_") or options.get("source_format"))
     fmt = formats.canonical(to) if to else src_fmt
     o = ConvertOptions.build(to=fmt, **options)
     ext = extension or formats.FORMATS[fmt].extensions[0]
+    # parts are named, not placed: a path in the pattern would put them elsewhere
+    if "/" in pattern or "\\" in pattern or ".." in pattern or "/" in ext or "\\" in ext:
+        raise OptionsError(f"the part name pattern '{pattern}{ext}' must be a file name, without folders")
     engine = engines.choose(o.engine, src_fmt, fmt, src_comp, None)
     callback, bar = _progress(progress, f"split {src.name}")
     try:
         if engine == "native":
-            data = o.to_native(fmt, formats.DELIMITERS.get(fmt) if fmt in ("tsv", "psv") else None)
+            data = native_engine.options(o, src_fmt, fmt)
             data.update(split_rows=rows, split_bytes=target_bytes, split_pattern=pattern, split_extension=ext)
-            if src_fmt in ("tsv", "psv") and o.delimiter is None:
-                data.setdefault("sniff", {})["delimiter"] = formats.DELIMITERS[src_fmt]
             raw = _native.call_json("convert", os.fspath(src), os.fspath(out_dir), _native.options_json(data), callback)
             return Report.from_dict(raw)
-        return _split_python(src, Path(out_dir), src_fmt, fmt, rows, target_bytes, pattern, ext, o, callback)
+        return _split_python(src, Path(out_dir), src_fmt, src_comp, fmt, rows, target_bytes, pattern, ext, o, callback)
     finally:
         if bar is not None:
             bar.close()
 
 
-def _split_python(src: Path, out_dir: Path, src_fmt: str, fmt: str, rows: Optional[int], target: Optional[int],
-                  pattern: str, ext: str, o: ConvertOptions, callback: Any) -> Report:
-    """Fallback splitter: write parts through a temporary full conversion."""
+def _part_path(dir_: Path, pattern: str, n: int, ext: str) -> Path:
+    return dir_ / f"{part_name(pattern, n)}{ext}"
+
+
+def _split_csv_bytes(src: Path, staging: Path, dialect: Any, rows: Optional[int], target: Optional[int],
+                     pattern: str, ext: str, callback: Any) -> List[Dict[str, Any]]:
+    """Byte-exact CSV split: records are copied verbatim and every part starts with the
+    original header (the native ``split_csv_bytes``)."""
+    tok = _csvtok.Dialect.of(dialect, text=False)
+    blank_is_row = len(dialect.columns) == 1  # as in conversion
+    header = b""
+    leading = dialect.leading_records
+    parts: List[Dict[str, Any]] = []
+    current: Optional[List[Any]] = None  # [file, path, rows, bytes]
+    total = src.stat().st_size
+
+    def finish() -> None:
+        f, path, n, _ = current  # type: ignore[misc]
+        f.close()
+        parts.append({"path": str(path), "rows": n, "bytes": path.stat().st_size})
+
+    try:
+        with open(src, "rb") as stream:
+            chunker = _csvtok.Chunker(stream, 8 << 20, tok)
+            for chunk in chunker:
+                for values, start, end, _, _ in _csvtok.tokenize(chunk, tok):
+                    rec = chunk[start:end]
+                    if leading:
+                        leading -= 1
+                        header += rec
+                        continue
+                    if current is None:
+                        path = _part_path(staging, pattern, len(parts), ext)
+                        f = open(path, "wb")  # noqa: SIM115 - closed by finish()
+                        f.write(header)
+                        current = [f, path, 0, len(header)]
+                    current[0].write(rec)
+                    if blank_is_row or not _csvtok.is_blank(values):
+                        current[2] += 1
+                    current[3] += len(rec)
+                    if (rows and current[2] >= rows) or (target and current[3] >= target):
+                        finish()
+                        current = None
+                if callback is not None and callback(chunker.offset, total) is False:
+                    raise KeyboardInterrupt
+        if current is not None:
+            finish()
+            current = None
+    finally:
+        if current is not None:
+            current[0].close()
+    return parts
+
+
+def _publish(staging: Path, out_dir: Path, parts: List[Dict[str, Any]], overwrite: bool) -> List[Dict[str, Any]]:
+    """Move the parts into place; nothing moves if one would replace a file without overwrite."""
+    moves = [(Path(p["path"]), out_dir / Path(p["path"]).name) for p in parts]
+    if not overwrite:
+        for _, to in moves:
+            if to.exists():
+                raise OutputExistsError(f"{to} already exists (pass overwrite=True / --overwrite to replace it)")
+    for frm, to in moves:
+        os.replace(frm, to)
+    return [dict(p, path=str(to)) for p, (_, to) in zip(parts, moves)]
+
+
+def _split_python(src: Path, out_dir: Path, src_fmt: str, src_comp: Optional[str], fmt: str, rows: Optional[int],
+                  target: Optional[int], pattern: str, ext: str, o: ConvertOptions, callback: Any) -> Report:
+    """Python splitter: byte-exact for CSV to CSV, else through a staged full conversion."""
     started = time.perf_counter()
+    first = _part_path(out_dir, pattern, 0, ext)
+    if not o.overwrite and first.exists():
+        raise OutputExistsError(f"{first} already exists (pass overwrite=True / --overwrite to replace it)")
+    dst_comp = formats.split_name(Path("x" + ext))[2]
+    byte_exact = (src_fmt in ("csv", "tsv", "psv") and fmt == "csv" and dst_comp is None and src_comp is None
+                  and not o.columns and o.limit is None and not o.out_delimiter and not o.schema)
+    report = Report(source=str(src), destination=str(out_dir), source_format=src_fmt, destination_format=fmt,
+                    bytes_in=src.stat().st_size)
+    created = not out_dir.exists()
     out_dir.mkdir(parents=True, exist_ok=True)
+    staging = out_dir / f".dataconv-staging-{os.getpid()}-{secrets.token_hex(4)}"
+    staging.mkdir()
+    published = False
+    try:
+        if byte_exact:
+            dialect = pure_engine._dialect(src, src_fmt, o)
+            parts = _split_csv_bytes(src, staging, dialect, rows, target, pattern, ext, callback)
+            report.engine = "pure"
+            report.rows = sum(p["rows"] for p in parts)
+            report.columns = len(dialect.columns)
+            report.compression = "csv (byte-exact)"
+            report.dialect = dialect.to_dict()
+        else:
+            parts = _split_typed(src, staging, out_dir, src_fmt, fmt, rows, target, pattern, ext, o, report)
+        report.parts = _publish(staging, out_dir, parts, o.overwrite)
+        published = True
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+        if created and not published:
+            try:
+                out_dir.rmdir()  # only while empty
+            except OSError:
+                pass
+    report.bytes_out = sum(p["bytes"] for p in report.parts)
+    stale = []
+    n = len(report.parts)
+    while len(stale) < 100_000 and _part_path(out_dir, pattern, n + len(stale), ext).exists():
+        stale.append(_part_path(out_dir, pattern, n + len(stale), ext))
+    if stale:
+        report.warnings.append(f"{len(stale)} older part file(s) from an earlier run remain in {out_dir} "
+                               f"(starting with {stale[0].name})")
+    report.seconds = time.perf_counter() - started
+    return report
+
+
+def _split_typed(src: Path, staging: Path, out_dir: Path, src_fmt: str, fmt: str, rows: Optional[int],
+                 target: Optional[int], pattern: str, ext: str, o: ConvertOptions, report: Report) -> List[Dict[str, Any]]:
+    """Parts written from a staged full conversion (needs pyarrow); rejected rows go to
+    ``<dir>.rejected.csv`` next to the directory."""
+    if not _compat.have("pyarrow"):
+        raise MissingDependencyError('splitting into other formats without the native engine needs pyarrow: '
+                                     'pip install "dataconv[arrow]"')
+    delimited = src_fmt in pure_engine.DELIMITED
+    default_q = out_dir.with_name(out_dir.name + ".rejected.csv")
+    quarantine = pure_engine.Quarantine(src, out_dir, o, delimited, default=default_q)
+    parts: List[Dict[str, Any]] = []
     with tempfile.TemporaryDirectory() as tmp:
-        staged = Path(tmp) / f"all.{ 'arrow' if _compat.have('pyarrow') else 'jsonl'}"
-        convert(src, staged, **{**o.to_dict(), "to": None, "overwrite": True, "limit": o.limit, "columns": o.columns})
-        reader = load(staged) if _compat.have("pyarrow") else None
-        report = Report(source=str(src), destination=str(out_dir), source_format=src_fmt, destination_format=fmt,
-                        engine="arrow" if reader is not None else "pure")
-        if reader is None:
-            raise MissingDependencyError('splitting without the native engine needs pyarrow: pip install "dataconv[arrow]"')
+        staged = Path(tmp) / "all.arrow"
+        full = convert(src, staged, **{**o.to_dict(), "to": None, "overwrite": True, "quarantine": str(quarantine.path)})
+        report.engine = full.engine
+        report.bad_rows = full.bad_rows
+        report.blank_lines = full.blank_lines
+        report.quarantine = full.quarantine
+        report.warnings.extend(full.warnings)
+        report.columns = full.columns
+        report.schema = full.schema
+        if not full.bad_rows and quarantine.delimited and o.overwrite and not quarantine.explicit and default_q.is_file():
+            default_q.unlink()  # stale rejects of an earlier run
+        reader = load(staged)
         n = reader.num_rows
         per = rows or n
+        part_opts = {**o.to_dict(), "to": fmt, "overwrite": True, "quarantine": None}
         if target:
             sample = reader.slice(0, min(n, 65536))
             probe = Path(tmp) / f"probe{ext}"
-            write(sample, probe, **{**o.to_dict(), "to": fmt, "overwrite": True})
+            write(sample, probe, **part_opts)
             bpr = max(1.0, probe.stat().st_size / max(1, sample.num_rows))
             per = max(1, min(per, int(target / bpr)))
         start = 0
-        k = 0
         while start < n:
             part = reader.slice(start, per)
-            path = out_dir / f"{part_name(pattern, k)}{ext}"
-            write(part, path, **{**o.to_dict(), "to": fmt})
+            path = _part_path(staging, pattern, len(parts), ext)
+            write(part, path, **part_opts)
             size = path.stat().st_size
-            report.parts.append({"path": str(path), "rows": part.num_rows, "bytes": size})
-            report.bytes_out += size
+            parts.append({"path": str(path), "rows": part.num_rows, "bytes": size})
             start += per
-            k += 1
             if target and size:
                 per = max(1, int(target / (size / max(1, part.num_rows))))
         report.rows = n
-        report.bytes_in = src.stat().st_size
-        report.seconds = time.perf_counter() - started
-    return report
+    return parts
 
 
 def merge(sources: Sequence[PathLike], dst: PathLike, *, progress: ProgressArg = None, **options: Any) -> Report:
@@ -324,8 +459,12 @@ def load(path: PathLike, **options: Any) -> Any:
     path = Path(path)
     fmt, _ = formats.detect(path, options.get("from_") or options.get("source_format"))
     if fmt == "ipc":
-        with pa.OSFile(str(path), "rb") as f:
-            return pa.ipc.open_file(f).read_all()
+        # typed already: only the selection options apply
+        o = ConvertOptions.build(**options)
+        table = _read_ipc(pa, path)
+        if o.columns:
+            table = table.select(o.columns)
+        return table.slice(0, o.limit) if o.limit is not None else table
     if fmt == "parquet" and not options:
         import pyarrow.parquet as pq
 
@@ -333,9 +472,18 @@ def load(path: PathLike, **options: Any) -> Any:
     with tempfile.TemporaryDirectory() as tmp:
         staged = Path(tmp) / "data.arrow"
         convert(path, staged, **dict(options, to="ipc", compression="none", overwrite=True))
-        # read into memory (not a memory map) so the temporary file can be deleted
-        with pa.OSFile(str(staged), "rb") as f:
+        return _read_ipc(pa, staged)
+
+
+def _read_ipc(pa: Any, path: Path) -> Any:
+    """An Arrow IPC file or stream, read into memory (not a memory map, so the file can
+    be deleted afterwards)."""
+    with pa.OSFile(str(path), "rb") as f:
+        try:
             return pa.ipc.open_file(f).read_all()
+        except pa.ArrowInvalid:
+            f.seek(0)
+            return pa.ipc.open_stream(f).read_all()
 
 
 def write(data: Any, dst: PathLike, *, progress: ProgressArg = None, **options: Any) -> Report:
@@ -390,9 +538,17 @@ def to_arrow(data: Any) -> Any:
 # ---------------------------------------------------------------------------------
 
 
+def _memory(memory: Union[int, str, None]) -> Optional[int]:
+    """A memory budget in bytes ('2GB'; a bare number on the command line is MiB)."""
+    try:
+        return parse_size(memory, "m")
+    except ValueError as exc:
+        raise OptionsError(str(exc)) from None
+
+
 def compress(src: PathLike, dst: Optional[PathLike] = None, *, profile: str = "balanced", threads: Optional[int] = None,
-             block_size: Union[None, int, str] = None, overwrite: bool = False, engine: str = "auto",
-             progress: ProgressArg = None) -> Report:
+             block_size: Union[int, str, None] = None, overwrite: bool = False, engine: str = "auto",
+             progress: ProgressArg = None, memory: Union[int, str, None] = None) -> Report:
     """Losslessly compress any file into DCZ.
 
     Delimited text (CSV, TSV, logs) is encoded column by column - integers,
@@ -402,14 +558,15 @@ def compress(src: PathLike, dst: Optional[PathLike] = None, *, profile: str = "b
     if profile not in ("fast", "balanced", "max"):
         raise OptionsError("profile must be fast, balanced or max")
     src = Path(src)
+    _check_input(src)
     dst_path = Path(dst) if dst is not None else src.with_name(src.name + ".dcz")
     size = parse_size(block_size)
+    budget = _memory(memory)
     callback, bar = _progress(progress, f"compress {src.name}")
     try:
+        # the file's own bytes, never decompressed first: x.csv.gz restores as the same gzip file
         if engine in ("auto", "native") and _native.available():
-            _, comp = formats.detect(src)
-            if comp in (None, "gzip", "zstd", "xz", "lz4", "brotli"):
-                return native_engine.compress(src, dst_path, profile, threads, size, overwrite, callback)
+            return native_engine.compress(src, dst_path, profile, threads, size, overwrite, callback, budget)
         if engine == "native":
             raise MissingDependencyError('the native engine is not installed (pip install "dataconv[native]")')
         return pure_engine.compress(src, dst_path, profile, overwrite, callback, size)
@@ -419,9 +576,11 @@ def compress(src: PathLike, dst: Optional[PathLike] = None, *, profile: str = "b
 
 
 def decompress(src: PathLike, dst: Optional[PathLike] = None, *, threads: Optional[int] = None, overwrite: bool = False,
-               engine: str = "auto", progress: ProgressArg = None) -> Report:
+               engine: str = "auto", progress: ProgressArg = None, memory: Union[int, str, None] = None) -> Report:
     """Restore the original bytes of a DCZ file (every checksum is verified)."""
     src = Path(src)
+    _check_input(src)
+    budget = _memory(memory)
     if dst is None:
         dst_path = src.with_suffix("") if src.suffix.lower() == ".dcz" else src.with_name(src.name + ".out")
     else:
@@ -429,7 +588,7 @@ def decompress(src: PathLike, dst: Optional[PathLike] = None, *, threads: Option
     callback, bar = _progress(progress, f"decompress {src.name}")
     try:
         if engine in ("auto", "native") and _native.available():
-            return native_engine.decompress(src, dst_path, threads, overwrite, callback)
+            return native_engine.decompress(src, dst_path, threads, overwrite, callback, budget)
         if engine == "native":
             raise MissingDependencyError('the native engine is not installed (pip install "dataconv[native]")')
         return pure_engine.decompress(src, dst_path, overwrite, callback)
@@ -443,6 +602,37 @@ def decompress(src: PathLike, dst: Optional[PathLike] = None, *, threads: Option
 # ---------------------------------------------------------------------------------
 
 _I64 = (-(1 << 63), (1 << 63) - 1)
+_SUPPORTED = "int, float, str, bool, None, bytes, complex, and lists or str-keyed dicts of int/float/str/bool/None"
+
+
+def _unsupported(v: Any) -> OptionsError:
+    return OptionsError(f"pack() cannot store {type(v).__name__} values exactly (supported: {_SUPPORTED})")
+
+
+def _plain(v: Any, np: Any) -> Any:
+    """Numpy scalars as the Python values they hold."""
+    if np is not None and isinstance(v, np.generic) and not isinstance(v, (np.str_, np.bytes_)):
+        return v.item()
+    return v
+
+
+def _check_json(v: Any) -> None:
+    """Values stored as JSON must come back exactly: no tuples, sets or non-string keys
+    (JSON would turn them into lists and strings), only JSON scalar types."""
+    stack = [v]
+    while stack:
+        x = stack.pop()
+        if x is None or isinstance(x, (str, bool, int, float)):
+            continue
+        if isinstance(x, list):
+            stack.extend(x)
+        elif isinstance(x, dict):
+            for k, y in x.items():
+                if not isinstance(k, str):
+                    raise _unsupported(k)
+                stack.append(y)
+        else:
+            raise _unsupported(x)
 
 
 def _classify(values: Sequence[Any]) -> str:
@@ -450,7 +640,9 @@ def _classify(values: Sequence[Any]) -> str:
     for v in values:
         if v is None:
             continue
-        t = "bool" if isinstance(v, bool) else "int" if isinstance(v, int) else "float" if isinstance(v, float) else "str" if isinstance(v, str) else "json"
+        t = ("bool" if isinstance(v, bool) else "int" if isinstance(v, int) else "float" if isinstance(v, float)
+             else "str" if isinstance(v, str) else "bytes" if isinstance(v, (bytes, bytearray))
+             else "complex" if isinstance(v, complex) else "json")
         if kind is None:
             kind = t
         elif kind != t:
@@ -472,24 +664,36 @@ def pack(values: Any, *, profile: str = "balanced") -> bytes:
     tag: Dict[str, Any] = {"v": 1}
     if np is not None and isinstance(values, np.ndarray):
         arr = values
+        if arr.dtype.names is not None:
+            raise OptionsError("pack() cannot store structured numpy arrays; pack each field separately")
         tag.update(container="ndarray", dtype=arr.dtype.str, shape=list(arr.shape))
         flat = arr.reshape(-1)
-        if arr.dtype.kind in "iu" and arr.dtype.itemsize <= 8 and not (arr.dtype.kind == "u" and arr.dtype.itemsize == 8 and flat.size and int(flat.max()) > _I64[1]):
+        kind = arr.dtype.kind
+        if kind in "iu" and arr.dtype.itemsize <= 8 and not (kind == "u" and arr.dtype.itemsize == 8 and flat.size and int(flat.max()) > _I64[1]):
             return _pack("int", flat.astype("<i8").tobytes(), None, tag, profile)
-        if arr.dtype.kind == "f" and arr.dtype.itemsize <= 8:
+        if kind == "f" and arr.dtype.itemsize <= 8:
             return _pack("float", flat.astype("<f8").tobytes(), None, tag, profile)
-        if arr.dtype.kind == "b":
+        if kind == "c" and arr.dtype.itemsize <= 16:  # real and imaginary parts, bit-exact
+            tag["complex"] = True
+            return _pack("float", np.ascontiguousarray(flat.astype("<c16")).view("<f8").tobytes(), None, tag, profile)
+        if kind == "b":
             return _pack("bool", flat.astype("u1").tobytes(), None, tag, profile)
-        if arr.dtype.kind in "Mm":  # datetime64 / timedelta64: exact as int64 ticks
+        if kind in "Mm":  # datetime64 / timedelta64: exact as int64 ticks
             return _pack("int", np.ascontiguousarray(flat).view("<i8").tobytes(), None, tag, profile)
+        if kind in "fcV":  # long double, complex256, void: the exact bytes
+            tag["raw"] = True
+            return _pack("str", [np.ascontiguousarray(flat).tobytes().decode("latin-1")], None, tag, profile)
         values = flat.tolist()
         tag["container"] = "ndarray-list"
     elif isinstance(values, array.array):
         tag.update(container="array", typecode=values.typecode)
         values = values.tolist()
+    elif isinstance(values, (str, bytes, bytearray, dict, set, frozenset)) or not hasattr(values, "__iter__"):
+        raise OptionsError(f"pack() takes a list, tuple, array.array or numpy array, not {type(values).__name__}")
     else:
         tag["container"] = "tuple" if isinstance(values, tuple) else "list"
         values = list(values)
+    values = [_plain(v, np) for v in values]
     kind = _classify(values)
     valid = None if all(v is not None for v in values) else bytes(v is not None for v in values)
     present = [v for v in values if v is not None]
@@ -506,6 +710,17 @@ def pack(values: Any, *, profile: str = "balanced") -> bytes:
         return _pack("bool", bytes(present), valid, tag, profile)
     if kind == "str":
         return _pack("str", present, valid, tag, profile)
+    if kind == "bytes":  # every byte value 0-255 is one latin-1 character
+        tag["bytes"] = True
+        return _pack("str", [bytes(v).decode("latin-1") for v in present], valid, tag, profile)
+    if kind == "complex" and valid is None:
+        tag["complex"] = True
+        return _pack("float", struct.pack(f"<{2 * len(present)}d", *(x for c in present for x in (c.real, c.imag))), None, tag, profile)
+    if kind == "complex":  # with missing values: [re, im] pairs as JSON
+        tag["json"] = tag["complex"] = True
+        text = json.dumps([None if v is None else [v.real, v.imag] for v in values], separators=(",", ":"), allow_nan=True)
+        return _pack("str", [text], None, tag, profile)
+    _check_json(values)
     tag["json"] = True
     text = json.dumps(values, ensure_ascii=False, separators=(",", ":"), allow_nan=True)
     return _pack("str", [text], None, tag, profile)
@@ -533,10 +748,12 @@ def unpack(data: bytes) -> Any:
     if _native.available():
         kind, raw, valid, tag_bytes = _native.call("unpack_values", bytes(data))
         tag = json.loads(bytes(tag_bytes) or b"{}")
-        if tag.get("container") == "ndarray" and valid is None and kind in ("int", "float", "bool"):
+        if tag.get("container") == "ndarray" and valid is None and kind in ("int", "float", "bool") and not tag.get("raw"):
             np = _compat.require("numpy", "unpacking numpy arrays", "fast")
             dtype = np.dtype(tag["dtype"])
             base = np.frombuffer(raw, dtype={"int": "<i8", "float": "<f8", "bool": "?"}[kind])
+            if tag.get("complex"):
+                base = base.view("<c16")
             out = base.view(dtype) if dtype.kind in "Mm" else base.astype(dtype)
             return out.reshape(tag["shape"])
         if kind == "int":
@@ -554,23 +771,42 @@ def unpack(data: bytes) -> Any:
         if kind == "str":
             values = [v.decode("utf-8") for v in values]
     tag = json.loads(bytes(tag_bytes) or b"{}")
+    container = tag.get("container", "list")
+    if tag.get("raw"):
+        np = _compat.require("numpy", "unpacking numpy arrays", "fast")
+        return np.frombuffer(values[0].encode("latin-1"), dtype=np.dtype(tag["dtype"])).reshape(tag["shape"]).copy()
     if tag.get("json"):
-        return json.loads(values[0])
+        values = json.loads(values[0])
+        if tag.get("complex"):
+            values = [None if v is None else complex(v[0], v[1]) for v in values]
+        mask = None
+    elif tag.get("complex"):
+        values = [complex(values[i], values[i + 1]) for i in range(0, len(values), 2)]
     if tag.get("bigint"):
         values = [int(v) for v in values]
+    if tag.get("bytes"):
+        values = [v.encode("latin-1") for v in values]
     if mask is not None:
         it = iter(values)
         values = [next(it) if m else None for m in mask]
-    container = tag.get("container", "list")
     if container == "ndarray":
         np = _compat.require("numpy", "unpacking numpy arrays", "fast")
         dtype = np.dtype(tag["dtype"])
+        if tag.get("complex"):
+            return np.array(values, dtype="<c16").astype(dtype).reshape(tag["shape"])
         base = np.array(values, dtype={"int": "<i8", "float": "<f8", "bool": "?"}[kind])
         out = base.view(dtype) if dtype.kind in "Mm" else base.astype(dtype)
         return out.reshape(tag["shape"])
     if container == "ndarray-list":
         np = _compat.require("numpy", "unpacking numpy arrays", "fast")
-        return np.array(values, dtype=np.dtype(tag["dtype"])).reshape(tag["shape"])
+        dtype = np.dtype(tag["dtype"])
+        if dtype.kind == "O":
+            # element by element: np.array would turn list values into extra dimensions
+            out = np.empty(len(values), dtype=object)
+            for i, v in enumerate(values):
+                out[i] = v
+            return out.reshape(tag["shape"])
+        return np.array(values, dtype=dtype).reshape(tag["shape"])
     if container == "array":
         return array.array(tag["typecode"], values)
     if container == "tuple":
@@ -584,12 +820,21 @@ def unpack(data: bytes) -> Any:
 
 
 def _inspect_engine(path: Path, o: ConvertOptions) -> Tuple[str, str]:
+    _check_input(path)
     fmt, comp = formats.detect(path, o.source_format)
-    for candidate in engines.installed():
+    installed = engines.installed()
+    for candidate in installed:
         if o.engine not in ("auto", candidate):
             continue
         if formats.engine_supports(candidate, fmt, "ipc" if candidate != "pure" else "csv", comp, None):
             return candidate, fmt
+    if o.engine != "auto":
+        if o.engine not in installed:
+            hint = {"native": "dataconv[native]", "arrow": "dataconv[arrow]"}.get(o.engine, "dataconv")
+            raise MissingDependencyError(f"the {o.engine} engine is not installed (pip install \"{hint}\")")
+        if formats.engine_supports(o.engine, fmt, "ipc" if o.engine != "pure" else "csv", None, None):
+            raise OptionsError(f"the {o.engine} engine cannot read {comp}-compressed input (use engine='auto')")
+        raise OptionsError(f"the {o.engine} engine cannot read {fmt}")
     raise MissingDependencyError(f"reading {fmt} needs pyarrow or the native engine")
 
 
@@ -645,9 +890,15 @@ def sniff(path: PathLike, **options: Any) -> Dict[str, Any]:
     """Detected CSV dialect: encoding, delimiter, quoting, header, columns."""
     p = Path(path)
     o = ConvertOptions.build(**options)
+    _check_input(p)
     fmt, comp = formats.detect(p, o.source_format)
-    if _native.available() and o.engine in ("auto", "native") and comp in (None, "gzip", "zstd", "xz", "lz4", "brotli"):
+    native_ok = comp in (None, "gzip", "zstd", "xz", "lz4", "brotli")
+    if _native.available() and o.engine in ("auto", "native") and native_ok:
         return native_engine.sniff(p, o, fmt)
+    if o.engine == "native":
+        if not _native.available():
+            raise MissingDependencyError('the native engine is not installed (pip install "dataconv[native]")')
+        raise OptionsError(f"the native engine cannot read {comp}-compressed input (use engine='auto')")
     return pure_engine._dialect(p, fmt, o).to_dict()
 
 
@@ -674,7 +925,7 @@ def system_info() -> Dict[str, Any]:
     return info_
 
 
-def plan(input_size: Union[None, int, str] = None, *, threads: Optional[int] = None, memory: Union[None, int, str] = None) -> Dict[str, Any]:
+def plan(input_size: Union[int, str, None] = None, *, threads: Optional[int] = None, memory: Union[int, str, None] = None) -> Dict[str, Any]:
     """How a job of this size would use the machine (threads, memory budget, chunking)."""
     size = parse_size(input_size, "m") if isinstance(input_size, str) else input_size
     if _native.available():

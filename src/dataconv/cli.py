@@ -115,7 +115,7 @@ def _opts(args: argparse.Namespace, *names: str) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for n in names:
         v = getattr(args, n, None)
-        if v is not None and v is not False:
+        if v is not None:  # False is an answer too (--no-header)
             out[n] = v
     if getattr(args, "crlf", False):
         out["out_crlf"] = True
@@ -145,7 +145,7 @@ def cmd_compress(args: argparse.Namespace) -> int:
     from .api import compress
 
     report = compress(args.src, args.dst, profile=args.profile, threads=args.threads, block_size=args.block_size,
-                      overwrite=args.overwrite, engine=args.engine, progress=args.progress)
+                      overwrite=args.overwrite, engine=args.engine, progress=args.progress, memory=args.memory)
     _report(report, args)
     return 0
 
@@ -153,7 +153,8 @@ def cmd_compress(args: argparse.Namespace) -> int:
 def cmd_decompress(args: argparse.Namespace) -> int:
     from .api import decompress
 
-    report = decompress(args.src, args.dst, threads=args.threads, overwrite=args.overwrite, engine=args.engine, progress=args.progress)
+    report = decompress(args.src, args.dst, threads=args.threads, overwrite=args.overwrite, engine=args.engine,
+                        progress=args.progress, memory=args.memory)
     _report(report, args)
     return 0
 
