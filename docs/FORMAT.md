@@ -46,6 +46,13 @@ the footer, or read the trailer and footer first and decode blocks in parallel.
 A block's decoded bytes are the bytes of the original file at `raw_offset`;
 concatenating all blocks in order reproduces the file.
 
+Block headers carry no checksum of their own, so a reader checks them against
+the footer's block index, which is checksummed: the blocks must follow one
+another from the end of the file header to the footer, every header must match
+its index entry (`kind`, `raw_len`, `payload_len`), and the `raw_len` values must
+add up to `original_size`. Only then are lengths taken from a header trusted for
+allocation.
+
 ### Footer
 
 A UTF-8 JSON object, compressed with `codec` (zlib or none):
@@ -138,7 +145,8 @@ int_array := count:varint transform:u8 body
 `planes` holds `count` unsigned `width`-byte numbers (`width` 0-8), stored as
 byte planes: all first bytes, then all second bytes, and so on. A value is
 `base + number`; DELTA arrays store consecutive differences, starting from
-`first`. All arithmetic wraps at 64 bits.
+`first`. All arithmetic wraps at 64 bits. The `values` and `lengths` of an RLE
+array are never RLE arrays themselves; decoders reject nested RLE.
 
 ### Column meta and streams
 

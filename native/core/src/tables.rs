@@ -6,12 +6,12 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Cursor, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
-use arrow::datatypes::{DataType, Schema, SchemaRef};
+use arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
+use arrow::datatypes::{DataType, Date64Type, Field, Schema, SchemaRef, TimeUnit};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::arrow_writer::{compute_leaves, ArrowColumnChunk, ArrowRowGroupWriterFactory, ArrowWriterOptions};
 use parquet::arrow::ArrowWriter;
@@ -215,6 +215,8 @@ impl ParquetOptions {
             _ => WriterVersion::PARQUET_1_0,
         };
         let mut b = WriterProperties::builder()
+            // standard list and map field names, which every reader understands
+            .set_coerce_types(true)
             .set_compression(codec)
             .set_writer_version(version)
             .set_created_by(format!("dataconv {}", crate::VERSION))
@@ -365,10 +367,69 @@ type EncodedGroup = std::result::Result<Vec<ArrowColumnChunk>, parquet::errors::
 /// Parquet output whose row groups are encoded on worker threads (every column of a
 /// row group in parallel, and up to `max_in_flight` row groups at once) while the
 /// finished ones are appended to the file in order.
+/// The type a column is stored as in Parquet, when its own has no Parquet form that
+/// readers recognise: there is no unit for seconds (such timestamps and times would
+/// read back as bare integers) and no 64-bit date.  None when the type is fine.
+fn parquet_type(dt: &DataType) -> Option<DataType> {
+    match dt {
+        DataType::Timestamp(TimeUnit::Second, tz) => Some(DataType::Timestamp(TimeUnit::Millisecond, tz.clone())),
+        DataType::Time32(TimeUnit::Second) => Some(DataType::Time32(TimeUnit::Millisecond)),
+        DataType::Date64 => Some(DataType::Date32),
+        DataType::Struct(fields) => {
+            let mapped: Vec<Option<DataType>> = fields.iter().map(|f| parquet_type(f.data_type())).collect();
+            mapped.iter().any(Option::is_some).then(|| {
+                DataType::Struct(
+                    fields
+                        .iter()
+                        .zip(mapped)
+                        .map(|(f, t)| match t {
+                            Some(t) => Arc::new(f.as_ref().clone().with_data_type(t)),
+                            None => f.clone(),
+                        })
+                        .collect(),
+                )
+            })
+        }
+        DataType::List(f) => {
+            parquet_type(f.data_type()).map(|t| DataType::List(Arc::new(f.as_ref().clone().with_data_type(t))))
+        }
+        DataType::LargeList(f) => {
+            parquet_type(f.data_type()).map(|t| DataType::LargeList(Arc::new(f.as_ref().clone().with_data_type(t))))
+        }
+        _ => None,
+    }
+}
+
+/// A date64 value with a time of day would lose it as a Parquet date.
+fn check_date64(name: &str, array: &dyn Array) -> Result<()> {
+    match array.data_type() {
+        DataType::Date64 => {
+            let days = array.as_primitive::<Date64Type>();
+            if let Some(v) = days.iter().flatten().find(|v| v.rem_euclid(86_400_000) != 0) {
+                return Err(Error::Schema(format!(
+                    "column '{name}': date64 value {v} has a time of day, which a Parquet date cannot keep; \
+                     cast the column to a timestamp first"
+                )));
+            }
+        }
+        DataType::Struct(_) => {
+            for c in array.as_struct().columns() {
+                check_date64(name, c.as_ref())?;
+            }
+        }
+        DataType::List(_) => check_date64(name, array.as_list::<i32>().values().as_ref())?,
+        DataType::LargeList(_) => check_date64(name, array.as_list::<i64>().values().as_ref())?,
+        _ => {}
+    }
+    Ok(())
+}
+
 pub struct ParquetSink {
     writer: Option<SerializedFileWriter<BufWriter<File>>>,
     factory: Arc<ArrowRowGroupWriterFactory>,
     schema: SchemaRef,
+    /// Per column, the type it is stored as when that differs (see `parquet_type`).
+    casts: Vec<Option<DataType>>,
     pending: Vec<RecordBatch>,
     pending_rows: usize,
     row_group_rows: usize,
@@ -390,6 +451,21 @@ impl ParquetSink {
         row_group_rows: usize,
         pool: Arc<rayon::ThreadPool>,
     ) -> Result<Self> {
+        let casts: Vec<Option<DataType>> = schema.fields().iter().map(|f| parquet_type(f.data_type())).collect();
+        let schema = if casts.iter().any(Option::is_some) {
+            let fields: Vec<Field> = schema
+                .fields()
+                .iter()
+                .zip(&casts)
+                .map(|(f, t)| match t {
+                    Some(t) => f.as_ref().clone().with_data_type(t.clone()),
+                    None => f.as_ref().clone(),
+                })
+                .collect();
+            Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
+        } else {
+            schema
+        };
         let options = ArrowWriterOptions::new().with_properties(props);
         let writer = ArrowWriter::try_new_with_options(file, schema.clone(), options)?;
         let (writer, factory) = writer.into_serialized_writer()?;
@@ -398,6 +474,7 @@ impl ParquetSink {
             writer: Some(writer),
             factory: Arc::new(factory),
             schema,
+            casts,
             pending: Vec::new(),
             pending_rows: 0,
             row_group_rows: row_group_rows.max(1),
@@ -490,6 +567,23 @@ impl ParquetSink {
 
 impl Sink for ParquetSink {
     fn write(&mut self, batch: &RecordBatch) -> Result<()> {
+        let converted;
+        let batch = if self.casts.iter().any(Option::is_some) {
+            let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+            for ((column, cast), field) in batch.columns().iter().zip(&self.casts).zip(batch.schema().fields()) {
+                columns.push(match cast {
+                    Some(t) => {
+                        check_date64(field.name(), column.as_ref())?;
+                        arrow::compute::cast(column, t)?
+                    }
+                    None => column.clone(),
+                });
+            }
+            converted = RecordBatch::try_new(self.schema.clone(), columns)?;
+            &converted
+        } else {
+            batch
+        };
         let mut offset = 0;
         let rows = batch.num_rows();
         while offset < rows {
@@ -593,6 +687,7 @@ fn encode_jsonl(batch: &RecordBatch) -> Result<Vec<u8>> {
     {
         let mut w = arrow::json::WriterBuilder::new()
             .with_explicit_nulls(true)
+            .with_encoder_factory(Arc::new(crate::jsonl::FloatText))
             .build::<_, arrow::json::writer::LineDelimited>(&mut buf);
         w.write(batch)?;
         w.finish()?;
@@ -635,6 +730,10 @@ pub trait Source: Send {
     fn progress(&self) -> (u64, u64);
     fn rows_hint(&self) -> Option<u64> {
         None
+    }
+    /// Notes about the input's types (e.g. JSON fields that mix value types).
+    fn warnings(&self) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -753,22 +852,62 @@ impl Source for ParquetSource {
     }
 }
 
+enum IpcLayout {
+    File(arrow::ipc::reader::FileReader<BufReader<File>>),
+    Stream(arrow::ipc::reader::StreamReader<BufReader<File>>),
+}
+
+/// The record batches of an Arrow IPC file in either layout: the file format (which
+/// starts with `ARROW1` and has an index) or the stream format.
+pub struct IpcBatches {
+    layout: IpcLayout,
+    pub schema: SchemaRef,
+    /// Batches in the file; the stream format has no index.
+    pub batches: Option<usize>,
+}
+
+impl IpcBatches {
+    pub fn open(path: &Path) -> Result<Self> {
+        let head = crate::io::read_head(path, 6)?;
+        let file = BufReader::new(File::open(path).map_err(|e| Error::io(e, path))?);
+        if head == b"ARROW1" {
+            let r = arrow::ipc::reader::FileReader::try_new(file, None)?;
+            let (schema, batches) = (r.schema(), Some(r.num_batches()));
+            Ok(IpcBatches { layout: IpcLayout::File(r), schema, batches })
+        } else {
+            let r = arrow::ipc::reader::StreamReader::try_new(file, None)?;
+            Ok(IpcBatches { schema: r.schema(), layout: IpcLayout::Stream(r), batches: None })
+        }
+    }
+}
+
+impl Iterator for IpcBatches {
+    type Item = Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Result<RecordBatch>> {
+        let next = match &mut self.layout {
+            IpcLayout::File(r) => r.next(),
+            IpcLayout::Stream(r) => r.next(),
+        };
+        next.map(|b| b.map_err(Error::from))
+    }
+}
+
 pub struct IpcSource {
-    reader: arrow::ipc::reader::FileReader<BufReader<File>>,
+    reader: IpcBatches,
     wave: usize,
     total_bytes: u64,
     batches_done: usize,
-    batches_total: usize,
     projection: Option<Vec<usize>>,
     schema: SchemaRef,
+    done: bool,
 }
 
 impl IpcSource {
     pub fn open(path: &Path, wave: usize, columns: Option<&[String]>) -> Result<Self> {
-        let file = File::open(path).map_err(|e| Error::io(e, path))?;
-        let total_bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
-        let reader = arrow::ipc::reader::FileReader::try_new(BufReader::new(file), None)?;
-        let full = reader.schema();
+        let total_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let reader = IpcBatches::open(path)?;
+        let full = reader.schema.clone();
         let projection = match columns {
             None => None,
             Some(cols) => Some(
@@ -781,8 +920,7 @@ impl IpcSource {
             None => full,
             Some(p) => Arc::new(full.project(p)?),
         };
-        let batches_total = reader.num_batches();
-        Ok(IpcSource { reader, wave: wave.max(1), total_bytes, batches_done: 0, batches_total, projection, schema })
+        Ok(IpcSource { reader, wave: wave.max(1), total_bytes, batches_done: 0, projection, schema, done: false })
     }
 }
 
@@ -803,23 +941,32 @@ impl Source for IpcSource {
                         None => b,
                     });
                 }
-                None => break,
+                None => {
+                    self.done = true;
+                    break;
+                }
             }
         }
         Ok(if out.is_empty() { None } else { Some(out) })
     }
 
     fn progress(&self) -> (u64, u64) {
-        let frac = if self.batches_total == 0 { 1.0 } else { self.batches_done as f64 / self.batches_total as f64 };
+        let frac = match self.reader.batches {
+            _ if self.done => 1.0,
+            Some(n) if n > 0 => self.batches_done as f64 / n as f64,
+            _ => 0.0,
+        };
         ((self.total_bytes as f64 * frac) as u64, self.total_bytes)
     }
 }
 
 /// JSON Lines: split on newlines (raw newlines cannot occur inside NDJSON values) and
-/// decode chunks in parallel against one inferred schema.
+/// decode chunks in parallel against one inferred layout (see [`crate::jsonl`]).
 pub struct JsonlSource {
     chunker: Chunker<Box<dyn std::io::Read + Send>>,
+    layout: Arc<crate::jsonl::Layout>,
     schema: SchemaRef,
+    warnings: Vec<String>,
     wave: usize,
     consumed: Arc<std::sync::atomic::AtomicU64>,
     total: u64,
@@ -828,19 +975,25 @@ pub struct JsonlSource {
 }
 
 impl JsonlSource {
+    /// Infer types from the first `sample` bytes, or from the whole file with None.
     pub fn open(
         path: &Path,
         chunk_size: usize,
         wave: usize,
         pool: Arc<rayon::ThreadPool>,
-        full_scan: bool,
+        sample: Option<u64>,
     ) -> Result<Self> {
-        let schema = Arc::new(infer_jsonl_schema(path, if full_scan { None } else { Some(64 << 20) })?);
+        let head = crate::io::open_input(path)?;
+        let (layout, warnings) = pool.install(|| crate::jsonl::infer(head.reader, sample))?;
+        let schema = layout.schema();
         let input = crate::io::open_input(path)?;
-        let chunker = Chunker::new(input.reader, chunk_size, None, b'\n');
+        let reader: Box<dyn std::io::Read + Send> = Box::new(crate::io::SkipBom::new(input.reader));
+        let chunker = Chunker::new(reader, chunk_size, None, b'\n');
         Ok(JsonlSource {
             chunker,
+            layout: Arc::new(layout),
             schema,
+            warnings,
             wave: wave.max(1),
             consumed: input.consumed,
             total: input.file_size,
@@ -848,17 +1001,6 @@ impl JsonlSource {
             done: false,
         })
     }
-}
-
-pub fn infer_jsonl_schema(path: &Path, limit_bytes: Option<u64>) -> Result<Schema> {
-    let input = crate::io::open_input(path)?;
-    let reader: Box<dyn std::io::Read> = match limit_bytes {
-        Some(n) => Box::new(std::io::Read::take(input.reader, n)),
-        None => input.reader,
-    };
-    let mut buf = std::io::BufReader::with_capacity(1 << 20, reader);
-    let (schema, _) = arrow::json::reader::infer_json_schema(&mut buf, None)?;
-    Ok(schema)
 }
 
 impl Source for JsonlSource {
@@ -883,19 +1025,15 @@ impl Source for JsonlSource {
         if chunks.is_empty() {
             return Ok(None);
         }
-        let schema = self.schema.clone();
-        let parts: Vec<Vec<RecordBatch>> = self.pool.install(|| {
-            chunks
-                .par_iter()
-                .map(|c| -> Result<Vec<RecordBatch>> {
-                    let reader = arrow::json::ReaderBuilder::new(schema.clone())
-                        .with_batch_size(65_536)
-                        .build(Cursor::new(&c.data[..]))?;
-                    Ok(reader.collect::<std::result::Result<Vec<_>, _>>()?)
-                })
-                .collect::<Result<Vec<_>>>()
+        let (layout, schema) = (self.layout.clone(), self.schema.clone());
+        let parts: Vec<Option<RecordBatch>> = self.pool.install(|| {
+            chunks.par_iter().map(|c| crate::jsonl::decode(&layout, &schema, &c.data, c.offset)).collect::<Result<_>>()
         })?;
         Ok(Some(parts.into_iter().flatten().collect()))
+    }
+
+    fn warnings(&self) -> Vec<String> {
+        self.warnings.clone()
     }
 
     fn progress(&self) -> (u64, u64) {

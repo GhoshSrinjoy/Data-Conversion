@@ -143,7 +143,7 @@ pub fn split_csv_bytes(
     let input = io::open_input(src)?;
     let consumed = input.consumed.clone();
     let total = input.file_size;
-    let mut chunker = Chunker::new(input.reader, 8 << 20, td.quote, dialect.split_byte()).with_escape(td.escape);
+    let mut chunker = Chunker::new(input.reader, 8 << 20, td.quote, dialect.split_byte()).with_dialect(td);
     // a blank line is a row only in a single-column file (as in conversion)
     let blank_is_row = dialect.columns.len() == 1;
     std::fs::create_dir_all(&spec.dir).map_err(|e| Error::io(e, &spec.dir))?;

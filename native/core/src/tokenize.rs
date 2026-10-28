@@ -86,9 +86,24 @@ pub struct Record<'a> {
     /// Every field is either unquoted or cleanly quoted, so the record's bytes are
     /// exactly the fields joined by the delimiter plus the terminator.
     pub regular: bool,
+    /// The last field opens a quote that is never closed (a stray quote): the record
+    /// is malformed.
+    pub unterminated: bool,
 }
 
 impl<'a> Record<'a> {
+    /// A quote that is never closed, or a quoted field that spans lines and still has
+    /// text after its closing quote (two stray quotes that paired up across records):
+    /// the record cannot be trusted and is a malformed row.
+    pub fn suspect(&self) -> bool {
+        self.unterminated
+            || (!self.regular
+                && self
+                    .fields
+                    .iter()
+                    .any(|f| f.malformed && f.quoted && memchr2(b'\n', b'\r', &self.data[f.start..f.end]).is_some()))
+    }
+
     #[inline]
     pub fn raw(&self) -> &'a [u8] {
         &self.data[self.start..self.end]
@@ -130,6 +145,7 @@ impl Tokenizer {
             let start = pos;
             self.fields.clear();
             let mut regular = true;
+            let mut unterminated = false;
             let term;
             loop {
                 if pos < n && Some(data[pos]) == d.quote {
@@ -174,6 +190,7 @@ impl Tokenizer {
                                 malformed: true,
                             });
                             regular = false;
+                            unterminated = true;
                             pos = n;
                             term = Term::Eof;
                             break;
@@ -246,7 +263,7 @@ impl Tokenizer {
                 }
                 break;
             }
-            let record = Record { data, start, end: pos, fields: &self.fields, term, regular };
+            let record = Record { data, start, end: pos, fields: &self.fields, term, regular, unterminated };
             if !visit(&record) {
                 return;
             }

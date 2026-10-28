@@ -296,3 +296,211 @@ fn corrupt_packed_values_never_panic() {
         }
     }
 }
+
+#[test]
+fn a_stray_quote_costs_one_row() {
+    let d = dir("stray");
+    let src = d.join("stray.csv");
+    let mut s = String::from("id,name,note\n");
+    for i in 0..200_000 {
+        match i {
+            // a quote inside a field is a literal character
+            5 => s.push_str("5,55\" screen,x\n"),
+            // a quote that is never closed costs its own line only
+            10 => s.push_str("10,name10,\"note10\n"),
+            _ => s.push_str(&format!("{i},name{i},note{i}\n")),
+        }
+    }
+    std::fs::write(&src, &s).unwrap();
+    let dst = d.join("stray.parquet");
+    let o = ConvertOptions { chunk_size: Some(256 << 10), ..opts() };
+    let r = convert(&src, &dst, &o, &NoHooks).unwrap();
+    assert_eq!((r.rows, r.bad_rows), (199_999, 1), "{:?}", r.warnings);
+    let rejected = std::fs::read_to_string(r.quarantine.unwrap()).unwrap();
+    assert_eq!(rejected, "id,name,note\n10,name10,\"note10\n");
+    let b = read_parquet(&dst);
+    assert_eq!(b.column(1).as_string::<i32>().value(5), "55\" screen");
+    assert_eq!(b.column(0).as_primitive::<Int64Type>().value(10), 11);
+    assert_eq!(count(&src, &o), 200_000);
+
+    // a second quote later closes the first one: the record between them is one
+    // malformed row, and the warning says how many lines it holds
+    s = s.replace("15,name15,note15\n", "15,name15,note\"15\n");
+    std::fs::write(&src, &s).unwrap();
+    let r = convert(&src, &dst, &o, &NoHooks).unwrap();
+    assert_eq!((r.rows, r.bad_rows), (199_994, 1));
+    assert!(r.warnings.iter().any(|w| w.contains("1 malformed rows (6 lines)")), "{:?}", r.warnings);
+}
+
+#[test]
+fn jsonl_round_trips_losslessly() {
+    let d = dir("jsonl");
+    let src = d.join("in.csv");
+    std::fs::write(&src, "id,amount,ratio,name\n18446744073709551615,1.00000000000000000001,NaN,a\n1,2.5,0.5,b\n")
+        .unwrap();
+    let jl = d.join("mid.jsonl");
+    convert(&src, &jl, &opts(), &NoHooks).unwrap();
+    let text = std::fs::read_to_string(&jl).unwrap();
+    assert!(text.contains("\"ratio\":\"NaN\""), "{text}");
+    let r = convert(&jl, &d.join("back.parquet"), &opts(), &NoHooks).unwrap();
+    let types: Vec<&str> = r.schema.iter().map(|(_, t)| t.as_str()).collect();
+    assert_eq!(types, ["Decimal128(20, 0)", "Decimal128(21, 20)", "Float64", "Utf8"], "{:?}", r.schema);
+    let back = d.join("back.csv");
+    convert(&d.join("back.parquet"), &back, &opts(), &NoHooks).unwrap();
+    let text = std::fs::read_to_string(&back).unwrap();
+    assert!(text.starts_with("id,amount,ratio,name\n18446744073709551615,1.00000000000000000001,NaN,a\n"), "{text}");
+}
+
+#[test]
+fn jsonl_types_widen_beyond_the_sample() {
+    let d = dir("jsonl-replan");
+    let src = d.join("late.jsonl");
+    let mut s = String::from("\u{feff}");
+    for i in 0..20_000 {
+        s.push_str(&format!("{{\"z\": {i}, \"a\": \"x{i}\"}}\n"));
+    }
+    s.push_str("{\"z\": 1.5, \"a\": 7, \"new\": true}\n");
+    std::fs::write(&src, &s).unwrap();
+    let pq = d.join("late.parquet");
+    let r = convert(&src, &pq, &ConvertOptions { sample_bytes: Some(64 << 10), ..opts() }, &NoHooks).unwrap();
+    assert_eq!((r.restarts, r.rows), (1, 20_001), "{:?}", r.warnings);
+    let names: Vec<&str> = r.schema.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["z", "a", "new"]);
+    assert_eq!((r.schema[0].1.as_str(), r.schema[1].1.as_str()), ("Float64", "Utf8"));
+    assert!(r.warnings.iter().any(|w| w.contains("'a' mixes JSON types")), "{:?}", r.warnings);
+    let b = read_parquet(&pq);
+    let a = b.column(1).as_string::<i32>();
+    assert_eq!((a.value(0), a.value(20_000)), ("\"x0\"", "7"));
+}
+
+#[test]
+fn quarantine_never_replaces_files_by_accident() {
+    let d = dir("quarantine");
+    let src = d.join("ragged.csv");
+    std::fs::write(&src, "a,b\n1,2\n3\n4,5\n").unwrap();
+    let out = d.join("out.jsonl");
+    let q = d.join("out.jsonl.rejected.csv");
+    std::fs::write(&q, "keep me").unwrap();
+    let err = convert(&src, &out, &ConvertOptions::default(), &NoHooks).unwrap_err();
+    assert!(err.to_string().contains("already exists"), "{err}");
+    assert_eq!(std::fs::read_to_string(&q).unwrap(), "keep me");
+    assert!(!out.exists());
+    let o = ConvertOptions { quarantine: Some(src.display().to_string()), ..opts() };
+    assert!(convert(&src, &out, &o, &NoHooks).is_err());
+    assert_eq!(std::fs::read_to_string(&src).unwrap(), "a,b\n1,2\n3\n4,5\n");
+    let r = convert(&src, &out, &opts(), &NoHooks).unwrap();
+    assert_eq!(r.bad_rows, 1);
+    assert_eq!(std::fs::read_to_string(&q).unwrap(), "a,b\n3\n");
+    std::fs::write(&src, "a,b\n1,2\n").unwrap();
+    convert(&src, &out, &opts(), &NoHooks).unwrap();
+    assert!(!q.exists(), "a clean re-run removes rejected rows of an earlier run");
+}
+
+#[test]
+fn compress_keeps_compressed_files_byte_for_byte() {
+    use std::io::Write;
+    let d = dir("archive");
+    let gz = d.join("data.csv.gz");
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(sample_csv(2000).as_bytes()).unwrap();
+    let bytes = enc.finish().unwrap();
+    std::fs::write(&gz, &bytes).unwrap();
+    let packed = d.join("data.csv.gz.dcz");
+    let eo = dcz::EncodeOptions { profile: Profile::Balanced, threads: 2, block_size: None };
+    dcz::compress_file(&gz, &packed, &eo, true, &NoHooks).unwrap();
+    let back = d.join("restored.csv.gz");
+    dcz::decompress_file(&packed, &back, true, 2, &NoHooks).unwrap();
+    assert_eq!(std::fs::read(&back).unwrap(), bytes);
+    // converting the same file to DCZ stores the CSV itself
+    let conv = d.join("conv.dcz");
+    convert(&gz, &conv, &opts(), &NoHooks).unwrap();
+    let csv = d.join("conv.csv");
+    convert(&conv, &csv, &opts(), &NoHooks).unwrap();
+    assert_eq!(std::fs::read_to_string(&csv).unwrap(), sample_csv(2000));
+}
+
+#[test]
+fn concatenated_lz4_frames_are_read_fully() {
+    use std::io::Write;
+    let d = dir("lz4");
+    let rows = |a: usize, b: usize| (a..b).map(|i| format!("{i},v{i}\n")).collect::<String>();
+    let mut bytes = Vec::new();
+    for text in [format!("id,v\n{}", rows(0, 1000)), rows(1000, 2000)] {
+        let mut e = lz4_flex::frame::FrameEncoder::new(Vec::new());
+        e.write_all(text.as_bytes()).unwrap();
+        bytes.extend_from_slice(&e.finish().unwrap());
+    }
+    let src = d.join("two.csv.lz4");
+    std::fs::write(&src, &bytes).unwrap();
+    assert_eq!(count(&src, &opts()), 2000);
+    assert_eq!(convert(&src, &d.join("two.parquet"), &opts(), &NoHooks).unwrap().rows, 2000);
+}
+
+#[test]
+fn latin1_means_latin1() {
+    let d = dir("latin1");
+    let src = d.join("l1.csv");
+    std::fs::write(&src, b"name,n\n\x80x,1\nZ\xfcrich,2\n").unwrap();
+    let o = ConvertOptions { sniff: SniffOptions { encoding: Some("latin-1".into()), ..Default::default() }, ..opts() };
+    let pq = d.join("l1.parquet");
+    convert(&src, &pq, &o, &NoHooks).unwrap();
+    let b = read_parquet(&pq);
+    let name = b.column(0).as_string::<i32>();
+    assert_eq!((name.value(0), name.value(1)), ("\u{80}x", "Zürich"));
+}
+
+#[test]
+fn second_timestamps_and_nested_values_stay_readable() {
+    use arrow::datatypes::{DataType, TimeUnit};
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    let d = dir("types");
+    let src = d.join("ts.csv");
+    std::fs::write(&src, "t,n\n2024-01-01 10:00:00,1\n2024-01-02 11:30:15,2\n").unwrap();
+    let pq = d.join("ts.parquet");
+    let r = convert(&src, &pq, &opts(), &NoHooks).unwrap();
+    assert_eq!(r.schema[0].1, "timestamp[s]");
+    // stored as a Parquet timestamp (milliseconds) rather than a bare integer
+    let reader = SerializedFileReader::new(File::open(&pq).unwrap()).unwrap();
+    let col = reader.metadata().file_metadata().schema_descr().column(0);
+    assert!(matches!(col.logical_type_ref(), Some(parquet::basic::LogicalType::Timestamp { .. })));
+    assert_eq!(read_parquet(&pq).column(0).data_type(), &DataType::Timestamp(TimeUnit::Millisecond, None));
+    let back = d.join("ts-back.csv");
+    convert(&pq, &back, &opts(), &NoHooks).unwrap();
+    assert_eq!(std::fs::read_to_string(&back).unwrap(), "t,n\n2024-01-01T10:00:00,1\n2024-01-02T11:30:15,2\n");
+    // nested JSON values are written to CSV as JSON text
+    let jl = d.join("nested.jsonl");
+    std::fs::write(&jl, "{\"id\": 1, \"p\": {\"x\": null, \"y\": \"b\"}, \"tags\": [\"a\", \"b\"]}\n").unwrap();
+    let out = d.join("nested.csv");
+    convert(&jl, &out, &opts(), &NoHooks).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "id,p,tags\n1,\"{\"\"x\"\":null,\"\"y\"\":\"\"b\"\"}\",\"[\"\"a\"\",\"\"b\"\"]\"\n"
+    );
+}
+
+#[test]
+fn a_directory_is_not_a_file() {
+    let d = dir("isdir");
+    let err = convert(&d, &d.join("x.parquet"), &opts(), &NoHooks).unwrap_err();
+    assert!(err.to_string().contains("is a directory"), "{err}");
+}
+
+#[test]
+fn arrow_ipc_streams_are_read() {
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+    let d = dir("ipc-stream");
+    let src = d.join("stream.arrow");
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, true)]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2, 3]))]).unwrap();
+    let mut w = arrow::ipc::writer::StreamWriter::try_new(File::create(&src).unwrap(), &schema).unwrap();
+    w.write(&batch).unwrap();
+    w.write(&batch).unwrap();
+    w.finish().unwrap();
+    drop(w);
+    assert_eq!(count(&src, &opts()), 6);
+    let out = d.join("stream.csv");
+    assert_eq!(convert(&src, &out, &opts(), &NoHooks).unwrap().rows, 6);
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "x\n1\n2\n3\n1\n2\n3\n");
+}

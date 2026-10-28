@@ -25,6 +25,9 @@ pub enum Error {
     Invalid(String),
     /// The caller asked to stop (e.g. Ctrl-C).
     Cancelled,
+    /// A value beyond the inference sample does not fit the inferred schema: the job
+    /// infers again from the whole input and restarts.
+    Replan(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -39,7 +42,7 @@ impl Error {
             Error::Io { .. } => "io",
             Error::Arrow(_) | Error::Parquet(_) => "data",
             Error::Format(_) => "format",
-            Error::Data(_) => "data",
+            Error::Data(_) | Error::Replan(_) => "data",
             Error::Schema(_) => "schema",
             Error::Integrity(_) => "integrity",
             Error::Exists(_) => "exists",
@@ -56,9 +59,12 @@ impl fmt::Display for Error {
             Error::Io { source, path: None } => write!(f, "{source}"),
             Error::Arrow(e) => write!(f, "{e}"),
             Error::Parquet(e) => write!(f, "{e}"),
-            Error::Format(m) | Error::Data(m) | Error::Schema(m) | Error::Integrity(m) | Error::Invalid(m) => {
-                f.write_str(m)
-            }
+            Error::Format(m)
+            | Error::Data(m)
+            | Error::Schema(m)
+            | Error::Integrity(m)
+            | Error::Invalid(m)
+            | Error::Replan(m) => f.write_str(m),
             Error::Exists(p) => write!(f, "{} already exists (use overwrite to replace it)", p.display()),
             Error::Cancelled => f.write_str("cancelled"),
         }

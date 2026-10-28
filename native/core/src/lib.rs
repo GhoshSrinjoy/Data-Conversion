@@ -16,6 +16,7 @@ pub mod decode;
 pub mod error;
 pub mod inspect;
 pub mod io;
+pub mod jsonl;
 pub mod pack;
 pub mod resources;
 pub mod sniff;

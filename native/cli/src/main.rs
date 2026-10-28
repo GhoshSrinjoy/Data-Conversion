@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -124,6 +125,10 @@ fn fmt_size(n: u64) -> String {
     unreachable!()
 }
 
+/// Set by Ctrl-C.  Jobs check it through their progress hook, stop with
+/// `Error::Cancelled`, and their temporary files are removed on the way out.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
 struct Bar {
     enabled: bool,
     started: Instant,
@@ -148,6 +153,9 @@ impl Bar {
 
 impl Hooks for Bar {
     fn progress(&self, done: u64, total: u64) -> bool {
+        if INTERRUPTED.load(Ordering::Relaxed) {
+            return false;
+        }
         if !self.enabled {
             return true;
         }
@@ -372,8 +380,18 @@ fn main() -> ExitCode {
         println!("dataconv native {}", dataconv_core::VERSION);
         return ExitCode::SUCCESS;
     }
+    // The first Ctrl-C stops the job cleanly; a second one exits at once.
+    let _ = ctrlc::set_handler(|| {
+        if INTERRUPTED.swap(true, Ordering::SeqCst) {
+            std::process::exit(130);
+        }
+    });
     match run(raw) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(_) if INTERRUPTED.load(Ordering::SeqCst) => {
+            eprintln!("\ndataconv: interrupted; no output was written");
+            ExitCode::from(130)
+        }
         Err(e) => {
             eprintln!("dataconv: error: {e}");
             ExitCode::FAILURE

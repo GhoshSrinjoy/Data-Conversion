@@ -136,6 +136,11 @@ pub fn trim_partial_utf8(sample: &[u8]) -> &[u8] {
 }
 
 pub fn to_utf8(sample: &[u8], encoding: &str) -> Vec<u8> {
+    if crate::io::is_latin1(encoding) {
+        let mut out = Vec::with_capacity(sample.len() + sample.len() / 8);
+        crate::io::latin1_to_utf8(sample, &mut out);
+        return out;
+    }
     match encoding_rs::Encoding::for_label(encoding.as_bytes()) {
         Some(enc) if enc != encoding_rs::UTF_8 => {
             let (text, _, _) = enc.decode(sample);
@@ -238,6 +243,58 @@ fn field_count_score(rows: &[Vec<Vec<u8>>]) -> (f64, usize) {
     (consistency * (1.0 + (mode.min(64) as f64) / 200.0), mode)
 }
 
+/// A time of day: `H:MM`, `HH:MM:SS` with an optional fraction, then optionally `Z` or
+/// a `+HH:MM` / `-HH:MM` offset.
+fn is_time_of_day(v: &[u8]) -> bool {
+    fn num(v: &[u8], i: &mut usize, min: usize, max: usize) -> Option<u32> {
+        let s = *i;
+        while *i < v.len() && *i - s < max && v[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        if *i - s < min {
+            return None;
+        }
+        std::str::from_utf8(&v[s..*i]).ok()?.parse().ok()
+    }
+    let mut i = 0;
+    let (Some(h), Some(b':')) = (num(v, &mut i, 1, 2), v.get(i)) else { return false };
+    i += 1;
+    match num(v, &mut i, 2, 2) {
+        Some(m) if h <= 23 && m <= 59 => {}
+        _ => return false,
+    }
+    if v.get(i) == Some(&b':') {
+        i += 1;
+        if num(v, &mut i, 2, 2).is_none_or(|s| s > 60) {
+            return false;
+        }
+        if v.get(i) == Some(&b'.') {
+            i += 1;
+            if num(v, &mut i, 1, 9).is_none() {
+                return false;
+            }
+        }
+    }
+    match &v[i..] {
+        [] | [b'Z'] => true,
+        [b'+' | b'-', a, b, b':', c, d] => [a, b, c, d].iter().all(|x| x.is_ascii_digit()),
+        _ => false,
+    }
+}
+
+/// Whether the sample reads as a single column whose values (after a possible
+/// header) are at least 90% timestamps, dates or times of day.
+fn temporal_column(text: &[u8], base: Dialect, limit: usize, complete: bool) -> bool {
+    let s = sample_records(text, Dialect { delimiter: b',', ..base }, limit, complete);
+    if s.rows.iter().any(|r| r.len() != 1) {
+        return false;
+    }
+    let values: Vec<&[u8]> = s.rows.iter().skip(1).map(|r| r[0].as_slice()).filter(|v| !v.is_empty()).collect();
+    let temporal =
+        values.iter().filter(|v| parse_timestamp(v).is_some() || parse_date(v).is_some() || is_time_of_day(v)).count();
+    !values.is_empty() && temporal * 10 >= values.len() * 9
+}
+
 /// Detect the dialect of a CSV sample (raw bytes from the start of the file).
 pub fn sniff(raw: &[u8], complete: bool, opts: &SniffOptions) -> Result<CsvDialect> {
     let (detected, bom) = detect_encoding(raw, complete);
@@ -279,6 +336,12 @@ pub fn sniff(raw: &[u8], complete: bool, opts: &SniffOptions) -> Result<CsvDiale
                 best
             }
         }
+    };
+    // Timestamps and times contain ':', so a single column of them is not ':'-delimited.
+    let delimiter = if delimiter == b':' && opts.delimiter.is_none() && temporal_column(&text, base, LIMIT, complete) {
+        b','
+    } else {
+        delimiter
     };
     let d = Dialect { delimiter, ..base };
     let sampled = sample_records(&text, d, LIMIT.max(2000), complete);
@@ -395,8 +458,9 @@ pub fn unique_names(raw: &[String], width: usize) -> Vec<String> {
     let mut out = Vec::with_capacity(width);
     let mut seen = std::collections::HashSet::new();
     for i in 0..width {
-        let base = raw.get(i).map(|s| s.trim().to_string()).unwrap_or_default();
-        let base = if base.is_empty() { format!("column_{}", i + 1) } else { base };
+        // names are kept exactly as written; only a blank one is replaced
+        let base = raw.get(i).cloned().unwrap_or_default();
+        let base = if base.trim().is_empty() { format!("column_{}", i + 1) } else { base };
         let mut name = base.clone();
         let mut n = 2;
         while !seen.insert(name.clone()) {
@@ -444,6 +508,30 @@ mod tests {
         assert_eq!(d.columns, vec!["id", "value", "flag"]);
         assert_eq!(sn("a,b\r\n1,2\r\n").terminator, "\r\n");
         assert_eq!(sn("a,b\r1,2\r3,4\r").terminator, "\r");
+    }
+
+    #[test]
+    fn a_column_of_times_is_not_colon_delimited() {
+        let mut ts = String::from("created_at\n");
+        let mut times = String::from("t\n");
+        for i in 0..200 {
+            ts.push_str(&format!("2024-03-01T{:02}:{:02}:00+05:30\n", i % 24, i % 60));
+            times.push_str(&format!("{:02}:{:02}:{:02}.5\n", i % 24, i % 60, i % 60));
+        }
+        for text in [&ts, &times] {
+            let d = sn(text);
+            assert_eq!((d.delimiter.as_str(), d.columns.len(), d.skip_rows), (",", 1, 0), "{text:.40}");
+        }
+        // genuinely ':'-separated data still is
+        assert_eq!(sn("user:uid:shell\nroot:0:/bin/sh\nada:1000:/bin/zsh\nbob:1001:/bin/bash\n").delimiter, ":");
+        assert!(is_time_of_day(b"9:05") && is_time_of_day(b"23:59:60Z") && is_time_of_day(b"10:00:00-03:00"));
+        assert!(!is_time_of_day(b"24:00") && !is_time_of_day(b"1:2") && !is_time_of_day(b"10:00:00+0300"));
+    }
+
+    #[test]
+    fn header_names_are_kept_exactly() {
+        assert_eq!(sn(" id,name ,,id\n1,a,b,c\n2,d,e,f\n").columns, vec![" id", "name ", "column_3", "id"]);
+        assert_eq!(unique_names(&["a".into(), "a".into(), "  ".into()], 3), vec!["a", "a_2", "column_3"]);
     }
 
     #[test]

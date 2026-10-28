@@ -239,6 +239,7 @@ fn open_csv_stream(path: &Path, encoding: &str) -> Result<Counted<Box<dyn Read +
             (input.reader, input.consumed, input.file_size)
         };
     let reader: Box<dyn Read + Send> = match encoding_rs::Encoding::for_label(encoding.as_bytes()) {
+        _ if io::is_latin1(encoding) => Box::new(io::Latin1Reader::new(raw)),
         Some(enc) if enc != encoding_rs::UTF_8 => Box::new(io::Utf8Reader::new(raw, enc)),
         _ => Box::new(io::SkipBom::new(raw)),
     };
@@ -247,51 +248,44 @@ fn open_csv_stream(path: &Path, encoding: &str) -> Result<Counted<Box<dyn Read +
 
 /// Read past the `leading` records (preamble and header) of a stream.  Returns the
 /// stream and the bytes already read beyond them, so that chunking starts at the
-/// first data record however long the header is.
+/// first data record however long the header is.  Records are split by the same
+/// chunker as the data, so a stray quote in a header ends with its line.
 fn skip_leading(
-    mut reader: Box<dyn Read + Send>,
+    reader: Box<dyn Read + Send>,
     d: Dialect,
+    term: u8,
     leading: usize,
 ) -> Result<(Box<dyn Read + Send>, Vec<u8>)> {
     if leading == 0 {
         return Ok((reader, Vec::new()));
     }
-    let mut buf = Vec::new();
-    let mut tok = Tokenizer::new(d);
-    loop {
-        let more = io::read_up_to(&mut reader, 1 << 20)?;
-        let eof = more.is_empty();
-        buf.extend_from_slice(&more);
-        let buf_len = buf.len();
-        let (mut seen, mut cut) = (0usize, None);
-        tok.for_each(&buf, |r| {
-            if !eof && (r.term == crate::tokenize::Term::Eof || r.end >= buf_len) {
-                return false; // the record (or a CR LF pair) may continue beyond what was read
-            }
-            seen += 1;
-            if seen == leading {
+    let mut chunker = Chunker::new(reader, 1 << 20, d.quote, term).with_dialect(d);
+    let mut skipped = 0usize;
+    while let Some(chunk) = chunker.next_chunk()? {
+        let mut cut = None;
+        Tokenizer::new(d).for_each(&chunk.data, |r| {
+            skipped += 1;
+            if skipped == leading {
                 cut = Some(r.end);
                 return false;
             }
             true
         });
         if let Some(c) = cut {
-            let rest = buf.split_off(c);
+            let (reader, carry) = chunker.into_parts();
+            let mut rest = chunk.data[c..].to_vec();
+            rest.extend_from_slice(&carry);
             return Ok((reader, rest));
         }
-        if eof {
-            return Ok((reader, Vec::new())); // nothing but leading records
-        }
-        if buf.len() > (1 << 30) {
-            return Err(Error::Data("the header is larger than 1 GB".into()));
-        }
     }
+    Ok((chunker.into_parts().0, Vec::new())) // nothing but leading records
 }
 
 /// The decoded stream of a CSV file positioned at its first data record.
 pub(crate) fn data_stream(path: &Path, dialect: &CsvDialect) -> Result<Counted<Box<dyn Read + Send>>> {
     let (reader, consumed, total) = open_csv_stream(path, &dialect.encoding)?;
-    let (reader, prefix) = skip_leading(reader, dialect.tokenizer_dialect(), dialect.leading_records())?;
+    let (reader, prefix) =
+        skip_leading(reader, dialect.tokenizer_dialect(), dialect.split_byte(), dialect.leading_records())?;
     let reader: Box<dyn Read + Send> =
         if prefix.is_empty() { reader } else { Box::new(std::io::Cursor::new(prefix).chain(reader)) };
     Ok((reader, consumed, total))
@@ -305,10 +299,9 @@ fn open_records(
     chunk_size: usize,
 ) -> Result<Counted<Chunker<Box<dyn Read + Send>>>> {
     let (reader, consumed, total) = open_csv_stream(path, encoding)?;
-    let (reader, prefix) = skip_leading(reader, plan.dialect, plan.leading)?;
-    let chunker = Chunker::new(reader, chunk_size, plan.dialect.quote, plan.split)
-        .with_escape(plan.dialect.escape)
-        .with_prefix(prefix);
+    let (reader, prefix) = skip_leading(reader, plan.dialect, plan.split, plan.leading)?;
+    let chunker =
+        Chunker::new(reader, chunk_size, plan.dialect.quote, plan.split).with_dialect(plan.dialect).with_prefix(prefix);
     Ok((chunker, consumed, total))
 }
 
@@ -339,6 +332,8 @@ struct CsvPlan {
     /// Source column index for every output column.
     projection: Vec<usize>,
     names: Vec<String>,
+    /// Every source column name (the header of the quarantine file).
+    header: Vec<String>,
     types: Vec<LogicalType>,
     mode: TypesMode,
     extra_nulls: Vec<Vec<u8>>,
@@ -385,15 +380,18 @@ fn decode_chunk(plan: &CsvPlan, schema: &SchemaRef, chunk: &Chunk) -> Result<Dec
             out.irregular += 1;
         }
         let nf = rec.fields.len();
-        if nf != plan.ncols {
-            let pad = plan.bad_lines == BadLines::Pad && nf < plan.ncols;
+        // A stray quote makes the record malformed whatever its width.
+        let suspect = rec.suspect();
+        if nf != plan.ncols || suspect {
+            let pad = plan.bad_lines == BadLines::Pad && nf < plan.ncols && !suspect;
             if !pad {
                 if plan.bad_lines == BadLines::Error {
-                    out.error = Some(format!(
-                        "record with {nf} fields where {} were expected: {}",
-                        plan.ncols,
-                        String::from_utf8_lossy(&rec.raw()[..rec.raw().len().min(200)])
-                    ));
+                    let shown = String::from_utf8_lossy(&rec.raw()[..rec.raw().len().min(200)]).into_owned();
+                    out.error = Some(if suspect {
+                        format!("a quote is not closed where it should be: {shown}")
+                    } else {
+                        format!("record with {nf} fields where {} were expected: {shown}", plan.ncols)
+                    });
                     return false;
                 }
                 out.bad.push(rec.raw().to_vec());
@@ -446,7 +444,7 @@ fn observe_chunk(plan: &CsvPlan, data: &[u8], stats: &mut [ColumnStats]) -> (u64
             return true;
         }
         let nf = rec.fields.len();
-        if nf != plan.ncols && !(plan.bad_lines == BadLines::Pad && nf < plan.ncols) {
+        if rec.suspect() || (nf != plan.ncols && !(plan.bad_lines == BadLines::Pad && nf < plan.ncols)) {
             bad += 1;
             return true;
         }
@@ -473,47 +471,6 @@ fn observe_chunk(plan: &CsvPlan, data: &[u8], stats: &mut [ColumnStats]) -> (u64
     (good, bad)
 }
 
-/// Up to `n` record-aligned ranges covering `data` (which starts at a record boundary).
-fn record_ranges(data: &[u8], quote: Option<u8>, term: u8, n: usize) -> Vec<std::ops::Range<usize>> {
-    // One forward pass: quote parity is carried from cut to cut, so the whole split
-    // costs O(len) rather than one scan per part.
-    let count = |s: &[u8], q: u8| s.iter().filter(|&&b| b == q).count();
-    let mut cuts = vec![0usize];
-    let mut pos = 0usize;
-    let mut parity = 0usize;
-    for k in 1..n {
-        let target = data.len() * k / n;
-        if target <= pos {
-            continue;
-        }
-        if let Some(q) = quote {
-            parity += count(&data[pos..target], q);
-        }
-        pos = target;
-        loop {
-            let Some(i) = memchr::memchr(term, &data[pos..]) else {
-                pos = data.len();
-                break;
-            };
-            let nl = pos + i;
-            if let Some(q) = quote {
-                parity += count(&data[pos..nl], q);
-            }
-            pos = nl + 1;
-            if parity.is_multiple_of(2) {
-                cuts.push(pos);
-                break;
-            }
-        }
-        if pos >= data.len() {
-            break;
-        }
-    }
-    cuts.push(data.len());
-    cuts.dedup();
-    cuts.windows(2).filter(|w| w[1] > w[0]).map(|w| w[0]..w[1]).collect()
-}
-
 fn sample_stats(
     path: &Path,
     plan: &CsvPlan,
@@ -530,9 +487,8 @@ fn sample_stats(
     let t = Instant::now();
     if let Some(head) = head {
         // Split the head sample at record boundaries and observe the parts in parallel.
-        // (escape dialects are observed in one piece: parity cannot split them safely)
-        let pieces = if plan.dialect.escape.is_some() { 1 } else { rayon::current_num_threads().max(1) };
-        let parts = record_ranges(&head.data, plan.dialect.quote, plan.split, pieces);
+        let pieces = rayon::current_num_threads().max(1);
+        let parts = crate::chunk::split_records(&head.data, &plan.dialect, plan.split, pieces);
         let partials: Vec<Vec<ColumnStats>> = parts
             .par_iter()
             .map(|r| {
@@ -944,6 +900,9 @@ pub fn convert(src: &Path, dst: &Path, opts: &ConvertOptions, hooks: &dyn Hooks)
     if !src.exists() {
         return Err(Error::io(std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"), src));
     }
+    if src.is_dir() {
+        return Err(Error::Invalid(format!("{} is a directory, not a file", src.display())));
+    }
     if src.canonicalize().ok() == dst.canonicalize().ok() {
         return Err(Error::Invalid("source and destination are the same file".into()));
     }
@@ -959,7 +918,7 @@ pub fn convert(src: &Path, dst: &Path, opts: &ConvertOptions, hooks: &dyn Hooks)
     // Byte-exact paths: CSV <-> DCZ never re-encode values.
     if dst_fmt == Format::Dcz && src_fmt == Format::Csv {
         let profile = crate::codec::Profile::parse(opts.profile.as_deref().unwrap_or("balanced"))?;
-        return crate::dcz::compress_file(
+        return crate::dcz::compress_content(
             src,
             dst,
             &crate::dcz::EncodeOptions { profile, threads: opts.threads.unwrap_or(0), block_size: opts.chunk_size },
@@ -1156,6 +1115,7 @@ fn convert_csv(
         ncols: dialect.columns.len(),
         projection,
         names: names.clone(),
+        header: dialect.columns.clone(),
         types: vec![LogicalType::String; names.len()],
         mode,
         extra_nulls: opts.null_values.iter().map(|s| s.as_bytes().to_vec()).collect(),
@@ -1174,6 +1134,12 @@ fn convert_csv(
         };
         cplan.types = decide_types(&stats, &names, opts, &mut warnings)?;
         trace("infer types", t);
+    }
+
+    let quarantine =
+        opts.quarantine.as_ref().map(PathBuf::from).unwrap_or_else(|| default_quarantine(&target.final_dst));
+    if matches!(opts.bad_lines, BadLines::Quarantine | BadLines::Pad) {
+        check_quarantine(src, &target.final_dst, &quarantine, opts.overwrite)?;
     }
 
     let mut restarts = 0u32;
@@ -1221,11 +1187,30 @@ fn convert_csv(
             }
         }
     }
+    // A clean run that replaces its output also drops the rejected rows of an earlier run.
+    if report.quarantine.is_none() && opts.overwrite && opts.quarantine.is_none() && quarantine.is_file() {
+        let _ = std::fs::remove_file(&quarantine);
+    }
     report.restarts = restarts;
     report.warnings.extend(warnings);
     report.schema = cplan.names.iter().cloned().zip(cplan.types.iter().map(|t| t.label())).collect();
     report.columns = cplan.names.len();
     report.dialect = Some(dialect);
+    Ok(())
+}
+
+/// Rejected rows must not land on the input or the output, and an existing file is
+/// replaced only with overwrite.  Checked before any work is done.
+fn check_quarantine(src: &Path, dst: &Path, quarantine: &Path, overwrite: bool) -> Result<()> {
+    if quarantine == dst || io::same_file(quarantine, src) || io::same_file(quarantine, dst) {
+        return Err(Error::Invalid(format!(
+            "the file for rejected rows ({}) would replace the input or the output; pass another quarantine path",
+            quarantine.display()
+        )));
+    }
+    if quarantine.exists() && !overwrite {
+        return Err(Error::Exists(quarantine.to_path_buf()));
+    }
     Ok(())
 }
 
@@ -1253,7 +1238,7 @@ fn csv_attempt(
     let mut out = Out::new(target, schema.clone(), opts, plan, pool);
     // Rejected rows go to a temporary file too, published only if the job succeeds.
     let mut quarantine: Option<(PathBuf, AtomicFile)> = None;
-    let (mut rows, mut bad, mut blank, mut irregular) = (0u64, 0u64, 0u64, 0u64);
+    let (mut rows, mut bad, mut bad_lines, mut blank, mut irregular) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let limit = opts.limit.unwrap_or(u64::MAX);
     // Ordered streaming pipeline: chunks are decoded on worker threads as soon as
     // they are read, and written in file order as they complete, so reading,
@@ -1305,6 +1290,7 @@ fn csv_attempt(
             irregular += d.irregular;
             if !d.bad.is_empty() {
                 bad += d.bad.len() as u64;
+                bad_lines += d.bad.iter().map(|r| lines_in(r)).sum::<u64>();
                 if cplan.bad_lines != BadLines::Skip {
                     if quarantine.is_none() {
                         let path =
@@ -1312,7 +1298,7 @@ fn csv_attempt(
                         let mut f = AtomicFile::create(&path, true)?;
                         crate::csvout::write_header(
                             f.writer(),
-                            &cplan.names,
+                            &cplan.header,
                             &CsvWriteOptions { delimiter: cplan.dialect.delimiter, ..CsvWriteOptions::default() },
                         )?;
                         quarantine = Some((path, f));
@@ -1358,12 +1344,28 @@ fn csv_attempt(
     report.irregular_records = irregular;
     report.compression = describe(target.format, target.compression, opts);
     if bad > 0 {
+        // a malformed record can span lines (a quote that pairs up with a later one)
+        let what = if bad_lines > bad {
+            format!("{bad} malformed rows ({bad_lines} lines)")
+        } else {
+            format!("{bad} malformed rows")
+        };
         report.warnings.push(match cplan.bad_lines {
-            BadLines::Skip => format!("{bad} malformed rows skipped"),
-            _ => format!("{bad} malformed rows moved to {}", report.quarantine.as_deref().unwrap_or("?")),
+            BadLines::Skip => format!("{what} skipped"),
+            _ => format!("{what} moved to {}", report.quarantine.as_deref().unwrap_or("?")),
         });
     }
     Ok(())
+}
+
+/// Physical lines in a raw record.
+fn lines_in(raw: &[u8]) -> u64 {
+    let breaks = match memchr::memchr_iter(b'\n', raw).count() {
+        0 => memchr::memchr_iter(b'\r', raw).count(),
+        n => n,
+    };
+    let open = !raw.last().is_some_and(|&b| b == b'\n' || b == b'\r');
+    (breaks + usize::from(open)).max(1) as u64
 }
 
 pub fn default_quarantine(dst: &Path) -> PathBuf {
@@ -1382,22 +1384,61 @@ fn convert_table(
     hooks: &dyn Hooks,
     report: &mut Report,
 ) -> Result<()> {
+    // JSON Lines types come from a sample; a value beyond it that does not fit starts
+    // the job again with types inferred from the whole file.
+    let mut full = opts.infer == InferMode::Full;
+    loop {
+        match table_attempt(src, src_fmt, target, opts, plan, pool, hooks, report, full) {
+            Err(Error::Replan(why)) if !full => {
+                report.warnings.push(format!("{why}; re-planned from a full scan"));
+                report.restarts += 1;
+                full = true;
+            }
+            other => return other,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn table_attempt(
+    src: &Path,
+    src_fmt: Format,
+    target: &Target,
+    opts: &ConvertOptions,
+    plan: &Plan,
+    pool: &Arc<rayon::ThreadPool>,
+    hooks: &dyn Hooks,
+    report: &mut Report,
+    full_scan: bool,
+) -> Result<()> {
+    if target.split.is_some() {
+        crate::split::reset_staging(&target.dst)?;
+    }
     let wave_bytes = plan.memory_budget / 5;
     let mut source: Box<dyn Source> = match src_fmt {
         Format::Parquet => {
             Box::new(tables::ParquetSource::open(src, wave_bytes, plan.threads, pool.clone(), opts.columns.as_deref())?)
         }
         Format::Ipc => Box::new(tables::IpcSource::open(src, plan.threads * 2, opts.columns.as_deref())?),
-        Format::Jsonl => Box::new(tables::JsonlSource::open(
-            src,
-            plan.chunk_size,
-            plan.wave_chunks,
-            pool.clone(),
-            opts.infer == InferMode::Full,
-        )?),
+        Format::Jsonl => {
+            let sample = (!full_scan).then(|| opts.sample_bytes.unwrap_or(64 << 20).max(64 << 10) as u64);
+            Box::new(tables::JsonlSource::open(src, plan.chunk_size, plan.wave_chunks, pool.clone(), sample)?)
+        }
         _ => unreachable!(),
     };
-    let schema = source.schema();
+    // JSON Lines are projected here (the other sources read only the columns asked for).
+    let projection: Option<Vec<usize>> = match (&opts.columns, src_fmt) {
+        (Some(cols), Format::Jsonl) => Some(
+            cols.iter()
+                .map(|c| source.schema().index_of(c).map_err(|_| Error::Schema(format!("no column named '{c}'"))))
+                .collect::<Result<_>>()?,
+        ),
+        _ => None,
+    };
+    let schema = match &projection {
+        Some(p) => Arc::new(source.schema().project(p)?),
+        None => source.schema(),
+    };
     let mut out = Out::new(target, schema.clone(), opts, plan, pool);
     let mut rows = 0u64;
     let limit = opts.limit.unwrap_or(u64::MAX);
@@ -1405,6 +1446,9 @@ fn convert_table(
         for mut batch in wave {
             if rows >= limit {
                 break;
+            }
+            if let Some(p) = &projection {
+                batch = batch.project(p)?;
             }
             if rows + batch.num_rows() as u64 > limit {
                 batch = batch.slice(0, (limit - rows) as usize);
@@ -1427,5 +1471,6 @@ fn convert_table(
     report.columns = schema.fields().len();
     report.schema = schema.fields().iter().map(|f| (f.name().clone(), f.data_type().to_string())).collect();
     report.compression = describe(target.format, target.compression, opts);
+    report.warnings.extend(source.warnings());
     Ok(())
 }

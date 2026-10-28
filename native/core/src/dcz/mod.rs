@@ -252,7 +252,7 @@ impl DczWriter {
                 limit
             } else {
                 match self.csv {
-                    Some(d) => crate::chunk::last_record_end(&self.pending[..limit], d.quote, d.escape, b'\n')
+                    Some(d) => crate::chunk::last_record_end(&self.pending[..limit], &d, b'\n')
                         .or_else(|| memchr::memrchr(b'\n', &self.pending[..limit]).map(|i| i + 1))
                         .unwrap_or(limit),
                     None => limit,
@@ -538,14 +538,11 @@ impl Read for DczReader {
 }
 
 /// The dialect and record terminator byte of delimited text, or None for other data.
-fn looks_delimited(path: &Path) -> Option<(Dialect, u8)> {
-    let input = io::open_input(path).ok()?;
-    let mut reader = input.reader;
-    let head = io::read_up_to(&mut reader, 1 << 20).ok()?;
+fn looks_delimited(head: &[u8]) -> Option<(Dialect, u8)> {
     if head.is_empty() || head.contains(&0) {
         return None;
     }
-    let d = sniff::sniff(&head, head.len() < (1 << 20), &SniffOptions::default()).ok()?;
+    let d = sniff::sniff(head, head.len() < (1 << 20), &SniffOptions::default()).ok()?;
     if d.encoding != "utf-8" && d.encoding != "windows-1252" {
         return None;
     }
@@ -553,8 +550,9 @@ fn looks_delimited(path: &Path) -> Option<(Dialect, u8)> {
     Some((d.tokenizer_dialect(), d.split_byte()))
 }
 
-/// Compress a file into DCZ.  Delimited text is encoded column-wise (byte-exact);
-/// anything else is stored as compressed raw blocks.
+/// Compress a file into DCZ byte for byte: decompressing gives back exactly the
+/// file, even one that is itself compressed (`x.csv.gz` stays gzip).  Delimited text
+/// is encoded column-wise; anything else is stored as compressed raw blocks.
 pub fn compress_file(
     src: &Path,
     dst: &Path,
@@ -562,10 +560,36 @@ pub fn compress_file(
     overwrite: bool,
     hooks: &dyn Hooks,
 ) -> Result<Report> {
+    compress_input(src, io::open_raw(src)?, dst, opts, overwrite, hooks)
+}
+
+/// Compress the decompressed content of a (possibly compressed) delimited file:
+/// converting `x.csv.gz` to DCZ stores the CSV.
+pub fn compress_content(
+    src: &Path,
+    dst: &Path,
+    opts: &EncodeOptions,
+    overwrite: bool,
+    hooks: &dyn Hooks,
+) -> Result<Report> {
+    compress_input(src, io::open_input(src)?, dst, opts, overwrite, hooks)
+}
+
+fn compress_input(
+    src: &Path,
+    input: io::Input,
+    dst: &Path,
+    opts: &EncodeOptions,
+    overwrite: bool,
+    hooks: &dyn Hooks,
+) -> Result<Report> {
     let started = Instant::now();
-    let input = io::open_input(src)?;
-    let size = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
-    let dialect = looks_delimited(src);
+    let size = input.file_size;
+    let mut reader = input.reader;
+    let head = io::read_up_to(&mut reader, 1 << 20)?;
+    let dialect = looks_delimited(&head);
+    let mut reader: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(head).chain(reader));
+    let input = io::Input { reader: Box::new(std::io::empty()), ..input };
     let mut out = AtomicFile::create(dst, overwrite)?;
     let mut writer = DczWriter::new(out.take_writer(), opts.clone())?;
     writer = match dialect {
@@ -574,14 +598,13 @@ pub fn compress_file(
     };
     let consumed = input.consumed.clone();
     let block_size = writer.block_size;
-    let mut reader = input.reader;
     // Delimited text is cut at record boundaries (or anywhere once a block reaches
     // twice its size without one, e.g. text without line breaks); opaque bytes at
     // fixed sizes.  Blocks decode byte-exactly wherever they are cut.
     let mut chunker = dialect.map(|(d, split)| {
         Chunker::new(std::mem::replace(&mut reader, Box::new(std::io::empty())), block_size, d.quote, split)
-            .with_escape(d.escape)
-            .with_max_record(block_size.saturating_mul(2))
+            .with_dialect(d)
+            .cut_at(block_size.saturating_mul(2))
     });
     loop {
         let mut wave = Vec::new();

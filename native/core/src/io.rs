@@ -109,20 +109,66 @@ pub struct Input {
     pub consumed: Arc<AtomicU64>,
 }
 
-/// Open `path` for streaming, decompressing transparently.
-pub fn open_input(path: &Path) -> Result<Input> {
-    let head = read_head(path, 16)?;
-    let compression = detect_compression(path, &head);
+fn open_counted(path: &Path) -> Result<(BufReader<CountingReader<File>>, u64, Arc<AtomicU64>)> {
+    if path.is_dir() {
+        return Err(Error::Invalid(format!("{} is a directory, not a file", path.display())));
+    }
     let file = File::open(path).map_err(|e| Error::io(e, path))?;
     let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
     let consumed = Arc::new(AtomicU64::new(0));
     let counted = BufReader::with_capacity(1 << 20, CountingReader { inner: file, count: consumed.clone() });
+    Ok((counted, file_size, consumed))
+}
+
+/// Whether two paths name the same existing file.
+pub fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Open `path` for streaming its bytes as they are (no decompression).
+pub fn open_raw(path: &Path) -> Result<Input> {
+    let (counted, file_size, consumed) = open_counted(path)?;
+    Ok(Input { reader: Box::new(counted), compression: Compression::None, file_size, consumed })
+}
+
+/// Decodes concatenated LZ4 frames: the frame decoder reports the end of the data
+/// at the end of each frame.
+struct Lz4Frames<R: io::BufRead> {
+    decoder: Option<lz4_flex::frame::FrameDecoder<R>>,
+}
+
+impl<R: io::BufRead> Read for Lz4Frames<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let n = self.decoder.as_mut().expect("decoder").read(buf)?;
+            if n > 0 || buf.is_empty() {
+                return Ok(n);
+            }
+            // the end of a frame: another one may follow
+            let mut inner = self.decoder.take().expect("decoder").into_inner();
+            let more = !inner.fill_buf()?.is_empty();
+            self.decoder = Some(lz4_flex::frame::FrameDecoder::new(inner));
+            if !more {
+                return Ok(0);
+            }
+        }
+    }
+}
+
+/// Open `path` for streaming, decompressing transparently.
+pub fn open_input(path: &Path) -> Result<Input> {
+    let (counted, file_size, consumed) = open_counted(path)?;
+    let head = read_head(path, 16)?;
+    let compression = detect_compression(path, &head);
     let reader: Box<dyn Read + Send> = match compression {
         Compression::None => Box::new(counted),
         Compression::Gzip => Box::new(flate2::read::MultiGzDecoder::new(counted)),
         Compression::Zstd => Box::new(zstd::stream::read::Decoder::with_buffer(counted)?),
         Compression::Xz => Box::new(liblzma::read::XzDecoder::new_multi_decoder(counted)),
-        Compression::Lz4 => Box::new(lz4_flex::frame::FrameDecoder::new(counted)),
+        Compression::Lz4 => Box::new(Lz4Frames { decoder: Some(lz4_flex::frame::FrameDecoder::new(counted)) }),
         Compression::Brotli => Box::new(brotli::Decompressor::new(counted, 1 << 16)),
         Compression::Bzip2 | Compression::Zip => {
             return Err(Error::Format(format!(
@@ -194,6 +240,60 @@ impl<R: Read> Read for Utf8Reader<R> {
                 self.eof = true;
             }
         }
+    }
+}
+
+/// Whether an encoding label names ISO-8859-1 itself.  WHATWG, and so encoding_rs,
+/// maps these labels to windows-1252, which reads bytes 0x80-0x9F as other
+/// characters (0x80 as €); an explicit latin-1 means every byte is the code point of
+/// the same value.
+pub fn is_latin1(label: &str) -> bool {
+    matches!(
+        label.trim().to_ascii_lowercase().replace('_', "-").as_str(),
+        "latin-1" | "latin1" | "iso-8859-1" | "iso8859-1" | "l1" | "iso-ir-100" | "cp819" | "ibm819"
+    )
+}
+
+/// Append ISO-8859-1 bytes to `out` as UTF-8.
+pub fn latin1_to_utf8(bytes: &[u8], out: &mut Vec<u8>) {
+    for &b in bytes {
+        if b < 0x80 {
+            out.push(b);
+        } else {
+            out.extend_from_slice(&[0xC0 | (b >> 6), 0x80 | (b & 0x3F)]);
+        }
+    }
+}
+
+/// Streaming ISO-8859-1 to UTF-8 transcoder.
+pub struct Latin1Reader<R> {
+    inner: R,
+    raw: Vec<u8>,
+    out: Vec<u8>,
+    pos: usize,
+}
+
+impl<R: Read> Latin1Reader<R> {
+    pub fn new(inner: R) -> Self {
+        Latin1Reader { inner, raw: vec![0; 64 << 10], out: Vec::new(), pos: 0 }
+    }
+}
+
+impl<R: Read> Read for Latin1Reader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.out.len() {
+            let n = self.inner.read(&mut self.raw)?;
+            if n == 0 {
+                return Ok(0);
+            }
+            self.out.clear();
+            self.pos = 0;
+            latin1_to_utf8(&self.raw[..n], &mut self.out);
+        }
+        let n = (self.out.len() - self.pos).min(buf.len());
+        buf[..n].copy_from_slice(&self.out[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
     }
 }
 

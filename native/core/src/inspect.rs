@@ -3,7 +3,6 @@
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
-use std::sync::Arc;
 
 use arrow::array::{Array, RecordBatch};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
@@ -71,8 +70,7 @@ pub fn head(path: &Path, n: usize, opts: &ConvertOptions) -> Result<Preview> {
             preview_from_batches(&batches, n)
         }
         Format::Ipc => {
-            let file = File::open(path).map_err(|e| Error::io(e, path))?;
-            let reader = arrow::ipc::reader::FileReader::try_new(BufReader::new(file), None)?;
+            let reader = crate::tables::IpcBatches::open(path)?;
             let mut batches = Vec::new();
             let mut rows = 0;
             for b in reader {
@@ -89,11 +87,10 @@ pub fn head(path: &Path, n: usize, opts: &ConvertOptions) -> Result<Preview> {
             let input = io::open_input(path)?;
             let mut reader = input.reader;
             let head = io::read_up_to(&mut reader, 8 << 20)?;
-            let lines: Vec<&[u8]> = head.split(|&b| b == b'\n').filter(|l| !l.is_empty()).take(n).collect();
+            let lines: Vec<&[u8]> =
+                head.split(|&b| b == b'\n').filter(|l| l.iter().any(|b| !b.is_ascii_whitespace())).take(n).collect();
             let text = lines.join(&b'\n');
-            let (schema, _) = arrow::json::reader::infer_json_schema(&mut std::io::Cursor::new(&text), None)?;
-            let reader = arrow::json::ReaderBuilder::new(Arc::new(schema)).build(std::io::Cursor::new(&text))?;
-            let batches: Vec<RecordBatch> = reader.collect::<std::result::Result<_, _>>()?;
+            let batches: Vec<RecordBatch> = crate::jsonl::read_text(&text)?.into_iter().collect();
             preview_from_batches(&batches, n)
         }
         Format::Csv | Format::Dcz => {
@@ -128,9 +125,8 @@ pub fn count(path: &Path, opts: &ConvertOptions) -> Result<u64> {
             Ok(reader.metadata().file_metadata().num_rows().max(0) as u64)
         }
         Format::Ipc => {
-            let reader = arrow::ipc::reader::FileReader::try_new(BufReader::new(File::open(path)?), None)?;
             let mut rows = 0u64;
-            for b in reader {
+            for b in crate::tables::IpcBatches::open(path)? {
                 rows += b?.num_rows() as u64;
             }
             Ok(rows)
@@ -151,7 +147,7 @@ pub fn count(path: &Path, opts: &ConvertOptions) -> Result<u64> {
             let (reader, _, _) = convert::data_stream(path, &dialect)?;
             // blank lines are skipped like the converters do, except in a single-column
             // file, where they are rows with a missing value
-            count_records(reader, td.quote, td.escape, dialect.split_byte(), dialect.columns.len() == 1)
+            count_records(reader, td, dialect.split_byte(), dialect.columns.len() == 1)
         }
     }
 }
@@ -250,12 +246,16 @@ pub fn info(path: &Path, exact: bool, opts: &ConvertOptions) -> Result<Value> {
     match fmt {
         Format::Parquet => parquet_info(path),
         Format::Ipc => {
-            let reader = arrow::ipc::reader::FileReader::try_new(BufReader::new(File::open(path)?), None)?;
-            let schema = reader.schema();
-            let batches = reader.num_batches();
+            let reader = crate::tables::IpcBatches::open(path)?;
+            let schema = reader.schema.clone();
+            let layout = if reader.batches.is_some() { "file" } else { "stream" };
+            let batches = match reader.batches {
+                Some(n) => n,
+                None => reader.count(),
+            };
             let rows = if exact { Some(count(path, opts)?) } else { None };
             Ok(json!({
-                "format": "ipc", "path": path.display().to_string(), "file_size": size,
+                "format": "ipc", "layout": layout, "path": path.display().to_string(), "file_size": size,
                 "rows": rows, "record_batches": batches,
                 "columns": schema.fields().iter().map(|f| json!({"name": f.name(), "type": f.data_type().to_string(), "nullable": f.is_nullable()})).collect::<Vec<_>>(),
             }))
@@ -299,14 +299,14 @@ pub fn csv_column_stats(path: &Path, opts: &ConvertOptions) -> Result<Vec<(Strin
     let dialect = convert::sniff_file(path, &opts.sniff)?;
     let td = dialect.tokenizer_dialect();
     let (reader, _, _) = convert::data_stream(path, &dialect)?;
-    let mut chunker = Chunker::new(reader, 16 << 20, td.quote, dialect.split_byte()).with_escape(td.escape);
+    let mut chunker = Chunker::new(reader, 16 << 20, td.quote, dialect.split_byte()).with_dialect(td);
     let ncols = dialect.columns.len();
     let mut stats = vec![ColumnStats::default(); ncols];
     let mut scratch = Vec::new();
     let mut tok = crate::tokenize::Tokenizer::new(td);
     while let Some(c) = chunker.next_chunk()? {
         tok.for_each(&c.data, |r| {
-            if r.fields.len() != ncols {
+            if r.fields.len() != ncols || r.suspect() {
                 return true;
             }
             for (j, f) in r.fields.iter().enumerate() {

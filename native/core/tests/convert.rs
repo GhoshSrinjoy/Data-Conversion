@@ -7,10 +7,17 @@ use arrow::datatypes::{DataType, Float64Type, Int64Type, TimeUnit};
 use dataconv_core::convert::{convert, BadLines, ConvertOptions, NoHooks};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
+/// A directory of this test run (process ids are reused, so a run never sees the
+/// files of an earlier one).
 fn dir() -> PathBuf {
-    let d = std::env::temp_dir().join(format!("dcv-it-{}", std::process::id()));
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let d = std::env::temp_dir().join(format!("dcv-it-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    })
+    .clone()
 }
 
 fn read_parquet(path: &PathBuf) -> RecordBatch {

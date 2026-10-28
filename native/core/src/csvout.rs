@@ -14,7 +14,7 @@ use arrow::array::{
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
     UInt32Array, UInt64Array, UInt8Array,
 };
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::{DataType, FieldRef, TimeUnit};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use rayon::prelude::*;
 
@@ -165,6 +165,8 @@ enum Col<'a> {
     Dec(&'a Decimal128Array, i8),
     Date(&'a Date32Array),
     Ts(&'a dyn Array, TimeUnit, Option<i32>),
+    /// Structs, lists and maps as JSON text.
+    Json(arrow::json::writer::NullableEncoder<'a>),
     Other(ArrayFormatter<'a>),
 }
 
@@ -205,7 +207,12 @@ fn float_text(out: &mut Vec<u8>, v: f64) {
 }
 
 impl<'a> Col<'a> {
-    fn new(array: &'a ArrayRef, fmt: &'a FormatOptions<'a>) -> Result<Col<'a>> {
+    fn new(
+        field: &'a FieldRef,
+        array: &'a ArrayRef,
+        fmt: &'a FormatOptions<'a>,
+        json: &'a arrow::json::writer::EncoderOptions,
+    ) -> Result<Col<'a>> {
         Ok(match array.data_type() {
             DataType::Utf8 => Col::Str(array.as_string::<i32>()),
             DataType::LargeUtf8 => Col::Str(array.as_string::<i64>()),
@@ -234,11 +241,18 @@ impl<'a> Col<'a> {
                 };
                 Col::Ts(array.as_ref(), *unit, offset)
             }
+            DataType::Struct(_)
+            | DataType::List(_)
+            | DataType::LargeList(_)
+            | DataType::FixedSizeList(..)
+            | DataType::ListView(_)
+            | DataType::LargeListView(_)
+            | DataType::Map(..) => Col::Json(arrow::json::writer::make_encoder(field, array.as_ref(), json)?),
             _ => Col::Other(ArrayFormatter::try_new(array.as_ref(), fmt)?),
         })
     }
 
-    fn write(&self, out: &mut Vec<u8>, i: usize, o: &CsvWriteOptions) {
+    fn write(&mut self, out: &mut Vec<u8>, i: usize, o: &CsvWriteOptions) {
         match self {
             Col::Str(a) => write_text(out, a.str_value(i).as_bytes(), o),
             Col::Bool(a) => out.extend_from_slice(if a.value(i) { b"true" } else { b"false" }),
@@ -271,6 +285,11 @@ impl<'a> Col<'a> {
                 };
                 write_timestamp(out, v, *unit, *offset);
             }
+            Col::Json(e) => {
+                let mut text = Vec::new();
+                e.encode(i, &mut text);
+                write_text(out, &text, o);
+            }
             Col::Other(f) => {
                 let text = f.value(i).to_string();
                 write_text(out, text.as_bytes(), o);
@@ -299,11 +318,16 @@ pub fn write_header<W: Write>(w: &mut W, names: &[String], o: &CsvWriteOptions) 
 
 fn format_rows(batch: &RecordBatch, start: usize, end: usize, o: &CsvWriteOptions) -> Result<Vec<u8>> {
     let fmt = FormatOptions::default().with_null("");
-    let cols: Vec<Col> = batch.columns().iter().map(|c| Col::new(c, &fmt)).collect::<Result<_>>()?;
+    let json = arrow::json::writer::EncoderOptions::default()
+        .with_explicit_nulls(true)
+        .with_encoder_factory(std::sync::Arc::new(crate::jsonl::FloatText));
+    let schema = batch.schema();
+    let mut cols: Vec<Col> =
+        schema.fields().iter().zip(batch.columns()).map(|(f, c)| Col::new(f, c, &fmt, &json)).collect::<Result<_>>()?;
     let arrays = batch.columns();
     let mut out = Vec::with_capacity((end - start) * 16 * cols.len().max(1));
     for row in start..end {
-        for (j, col) in cols.iter().enumerate() {
+        for (j, col) in cols.iter_mut().enumerate() {
             if j > 0 {
                 out.push(o.delimiter);
             }
