@@ -881,7 +881,13 @@ struct Out<'a> {
     pool: &'a Arc<rayon::ThreadPool>,
     single: Option<(AtomicFile, Box<dyn Sink>)>,
     rolling: Option<crate::split::RollingSink<Opener<'a>>>,
+    /// Parquet: the first batches, held back until there are enough rows to tune the
+    /// writer on (one small batch makes a column of common values look unique).
+    held: Vec<RecordBatch>,
 }
+
+/// Rows a Parquet writer is tuned on (see `effective_parquet_options`).
+const TUNING_ROWS: usize = 32 * 1024;
 
 impl<'a> Out<'a> {
     fn new(
@@ -891,7 +897,7 @@ impl<'a> Out<'a> {
         plan: &'a Plan,
         pool: &'a Arc<rayon::ThreadPool>,
     ) -> Self {
-        Out { target, schema, opts, plan, pool, single: None, rolling: None }
+        Out { target, schema, opts, plan, pool, single: None, rolling: None, held: Vec::new() }
     }
 
     fn open(&mut self, first: Option<&RecordBatch>) -> Result<()> {
@@ -945,8 +951,19 @@ impl<'a> Out<'a> {
 
     fn write(&mut self, batch: &RecordBatch) -> Result<()> {
         if self.single.is_none() && self.rolling.is_none() {
+            if self.target.format == Format::Parquet && self.target.split.is_none() {
+                self.held.push(batch.clone());
+                if self.held.iter().map(RecordBatch::num_rows).sum::<usize>() >= TUNING_ROWS {
+                    self.release()?;
+                }
+                return Ok(());
+            }
             self.open(Some(batch))?;
         }
+        self.write_open(batch)
+    }
+
+    fn write_open(&mut self, batch: &RecordBatch) -> Result<()> {
         match (&mut self.single, &mut self.rolling) {
             (Some((_, sink)), _) => sink.write(batch),
             (None, Some(r)) => r.write(batch),
@@ -954,9 +971,24 @@ impl<'a> Out<'a> {
         }
     }
 
+    /// Open the output tuned on the held batches, then write them.
+    fn release(&mut self) -> Result<()> {
+        let held = std::mem::take(&mut self.held);
+        let sample = match &held[..] {
+            [one] => one.clone(),
+            many => arrow::compute::concat_batches(&self.schema, many)?,
+        };
+        self.open(Some(&sample))?;
+        held.iter().try_for_each(|b| self.write_open(b))
+    }
+
     fn finish(mut self) -> Result<(u64, Vec<crate::split::Part>)> {
         if self.single.is_none() && self.rolling.is_none() {
-            self.open(None)?;
+            if self.held.is_empty() {
+                self.open(None)?;
+            } else {
+                self.release()?;
+            }
         }
         if let Some((file, sink)) = self.single.take() {
             sink.finish()?;
@@ -1216,7 +1248,9 @@ fn convert_csv(
         bad_lines: opts.bad_lines,
         avg_record: (dialect.max_record_len / 2).max(16),
     };
-    let sample_bytes = opts.sample_bytes.unwrap_or(16 << 20).max(64 << 10);
+    // 4 MiB from the start and as much again in windows spread through the file: a
+    // value the sample misses makes the job re-plan, so the sample need not be large
+    let sample_bytes = opts.sample_bytes.unwrap_or(4 << 20).max(64 << 10);
     let mut warnings = Vec::new();
     let mut full_done = opts.infer == InferMode::Full;
     if mode != TypesMode::String || !opts.schema.is_empty() {

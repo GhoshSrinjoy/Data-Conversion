@@ -85,9 +85,11 @@ with `python native/scripts/third_party_licenses.py`.
 | liblzma | 0.4.9 | MIT OR Apache-2.0 |
 | liblzma-sys | 0.4.9 | MIT OR Apache-2.0 |
 | libm | 0.2.16 | MIT |
+| libmimalloc-sys | 0.1.49 | MIT |
 | log | 0.4.34 | MIT OR Apache-2.0 |
 | lz4_flex | 0.14.0 | MIT |
 | memchr | 2.8.3 | Unlicense OR MIT |
+| mimalloc | 0.1.52 | MIT |
 | multiversion_no_op | 1.0.0 | Apache-2.0 OR MIT |
 | nix | 0.31.3 | MIT |
 | ntapi | 0.4.3 | Apache-2.0 OR MIT |
@@ -5585,6 +5587,38 @@ Copyright notices are retained in src/* files where relevant.
 
 ### Text 63
 
+Used by: libmimalloc-sys 0.1.49, mimalloc 0.1.52
+
+```text
+Copyright 2019 Octavian Oncescu
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+```
+
+### Text 64
+
 Used by: lz4_flex 0.14.0
 
 ```text
@@ -5610,7 +5644,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### Text 64
+### Text 65
 
 Used by: nix 0.31.3
 
@@ -5638,7 +5672,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### Text 65
+### Text 66
 
 Used by: ntapi 0.4.3
 
@@ -5662,7 +5696,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### Text 66
+### Text 67
 
 Used by: phf 0.12.1, phf_shared 0.12.1
 
@@ -5689,7 +5723,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### Text 67
+### Text 68
 
 Used by: pyo3 0.30.1, pyo3-build-config 0.30.1, pyo3-ffi 0.30.1, pyo3-macros 0.30.1, pyo3-macros-backend 0.30.1
 
@@ -5874,7 +5908,7 @@ TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
 END OF TERMS AND CONDITIONS
 ```
 
-### Text 68
+### Text 69
 
 Used by: pyo3 0.30.1, pyo3-build-config 0.30.1, pyo3-ffi 0.30.1, pyo3-macros 0.30.1, pyo3-macros-backend 0.30.1
 
@@ -5906,7 +5940,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Text 69
+### Text 70
 
 Used by: r-efi 5.3.0, r-efi 6.0.0
 
@@ -5914,7 +5948,7 @@ Used by: r-efi 5.3.0, r-efi 6.0.0
 Licensed under: MIT OR Apache-2.0 OR LGPL-2.1-or-later
 ```
 
-### Text 70
+### Text 71
 
 Used by: rayon 1.12.0, rayon-core 1.13.0
 
@@ -5946,7 +5980,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Text 71
+### Text 72
 
 Used by: rustc_version 0.4.1
 
@@ -5978,7 +6012,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Text 72
+### Text 73
 
 Used by: ryu 1.0.23
 
@@ -6008,7 +6042,7 @@ ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Text 73
+### Text 74
 
 Used by: scopeguard 1.2.0
 
@@ -6040,7 +6074,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Text 74
+### Text 75
 
 Used by: shlex 2.0.1
 
@@ -6060,7 +6094,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-### Text 75
+### Text 76
 
 Used by: shlex 2.0.1
 
@@ -6088,7 +6122,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-### Text 76
+### Text 77
 
 Used by: siphasher 1.0.4
 
@@ -6102,7 +6136,7 @@ http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
 option.
 ```
 
-### Text 77
+### Text 78
 
 Used by: slab 0.4.12
 
@@ -6134,7 +6168,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Text 78
+### Text 79
 
 Used by: snap 1.1.2
 
@@ -6168,7 +6202,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### Text 79
+### Text 80
 
 Used by: sysinfo 0.38.4
 
@@ -6196,7 +6230,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### Text 80
+### Text 81
 
 Used by: target-lexicon 0.13.5, wasi 0.11.1+wasi-snapshot-preview1, wasip2 1.0.4+wasi-0.2.12, wit-bindgen 0.57.1
 
@@ -6421,7 +6455,7 @@ the License, but only in their entirety and only with respect to the Combined
 Software.
 ```
 
-### Text 81
+### Text 82
 
 Used by: tiny-keccak 2.0.2
 
@@ -6549,7 +6583,7 @@ express Statement of Purpose.
     this CC0 or use of the Work.
 ```
 
-### Text 82
+### Text 83
 
 Used by: twox-hash 2.1.5
 
@@ -6577,7 +6611,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### Text 83
+### Text 84
 
 Used by: unicode-ident 1.0.27
 
@@ -6623,7 +6657,7 @@ dealings in these Data Files or Software without prior written
 authorization of the copyright holder.
 ```
 
-### Text 84
+### Text 85
 
 Used by: version_check 0.9.5
 
@@ -6649,7 +6683,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-### Text 85
+### Text 86
 
 Used by: winapi 0.3.9
 
@@ -6675,7 +6709,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-### Text 86
+### Text 87
 
 Used by: winapi-i686-pc-windows-gnu 0.4.0, winapi-x86_64-pc-windows-gnu 0.4.0
 
@@ -6683,7 +6717,7 @@ Used by: winapi-i686-pc-windows-gnu 0.4.0, winapi-x86_64-pc-windows-gnu 0.4.0
 Licensed under: MIT/Apache-2.0
 ```
 
-### Text 87
+### Text 88
 
 Used by: windows 0.62.2, windows-collections 0.3.2, windows-core 0.62.2, windows-future 0.3.2, windows-implement 0.60.2, windows-interface 0.59.3, windows-link 0.2.1, windows-numerics 0.3.1, windows-result 0.4.1, windows-strings 0.5.1, windows-sys 0.61.2, windows-threading 0.2.1
 
@@ -6891,7 +6925,7 @@ Apache License
    limitations under the License.
 ```
 
-### Text 88
+### Text 89
 
 Used by: windows 0.62.2, windows-collections 0.3.2, windows-core 0.62.2, windows-future 0.3.2, windows-implement 0.60.2, windows-interface 0.59.3, windows-link 0.2.1, windows-numerics 0.3.1, windows-result 0.4.1, windows-strings 0.5.1, windows-sys 0.61.2, windows-threading 0.2.1
 
@@ -6919,7 +6953,7 @@ MIT License
     SOFTWARE
 ```
 
-### Text 89
+### Text 90
 
 Used by: zerocopy 0.8.63, zerocopy-derive 0.8.63
 
@@ -7127,7 +7161,7 @@ Apache License
    limitations under the License.
 ```
 
-### Text 90
+### Text 91
 
 Used by: zerocopy 0.8.63, zerocopy-derive 0.8.63
 
@@ -7158,7 +7192,7 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### Text 91
+### Text 92
 
 Used by: zerocopy 0.8.63, zerocopy-derive 0.8.63
 
@@ -7190,7 +7224,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-### Text 92
+### Text 93
 
 Used by: zlib-rs 0.6.8
 
@@ -7216,7 +7250,7 @@ freely, subject to the following restrictions:
 3. This notice may not be removed or altered from any source distribution.
 ```
 
-### Text 93
+### Text 94
 
 Used by: zstd 0.14.3, zstd-safe 8.2.0, zstd-sys 2.1.2+zstd.1.5.7
 
@@ -7251,7 +7285,7 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### Text 94
+### Text 95
 
 Used by: zstd-sys 2.1.2+zstd.1.5.7
 
@@ -7290,7 +7324,7 @@ ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-### Text 95
+### Text 96
 
 Used by: zstd-sys 2.1.2+zstd.1.5.7
 
@@ -7636,7 +7670,7 @@ library.  If this is what you want to do, use the GNU Lesser General
 Public License instead of this License.
 ```
 
-### Text 96
+### Text 97
 
 Used by: zstd-sys 2.1.2+zstd.1.5.7
 

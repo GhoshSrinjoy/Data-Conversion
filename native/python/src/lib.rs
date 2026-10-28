@@ -18,6 +18,10 @@ use vegg_core::convert::{self as engine, ConvertOptions, Hooks};
 use vegg_core::pack::{self, Packed, Values};
 use vegg_core::{dcz, inspect, resources, Error};
 
+// mimalloc: the system allocator on Windows made conversions about a third slower
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Bumped whenever the JSON contract with the Python package changes.
 const PROTOCOL: u32 = 1;
 

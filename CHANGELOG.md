@@ -15,7 +15,9 @@ working name `dataconv`.
     Arrow IPC and DCZ;
   - Parquet writing that encodes every column while the input is still being
     read, several row groups at once (256 Ki rows each, 1 Mi with
-    `--profile max`), and tunes encodings per column;
+    `--profile max`) in pages of up to 128 Ki rows, and tunes encodings per
+    column;
+  - mimalloc as the memory allocator of the Python extension and the binary;
   - a standalone `vegg` binary that needs no Python (`cargo install vegg`).
 - **One package everywhere.** `pip install vegg` gets the native engine on
   CPython 3.9+ for Windows, macOS and Linux (x86-64 and ARM64, glibc and musl),

@@ -25,7 +25,7 @@ use crate::tokenize::Dialect;
 
 /// Free space at the front of every block for the partial record carried over.
 const ROOM: usize = 256 << 10;
-const READERS: usize = 3;
+const READERS: usize = 4;
 
 /// A plain UTF-8 file whose data records start at `start` (after a BOM and the header).
 pub struct PlainFile {
@@ -136,7 +136,7 @@ fn produce(file: &PlainFile, tx: &SyncSender<Result<Chunk>>) -> Result<()> {
     let mut tail: Vec<u8> = Vec::new();
     let (mut offset, mut index) = (0u64, 0usize);
     for k in 0.. {
-        let block = match lanes[k % READERS].recv() {
+        let block = match lanes[k % lanes.len()].recv() {
             Ok(block) => block.map_err(|e| Error::io(e, &file.path))?,
             Err(_) => return Err(Error::Data("a reader thread stopped".into())),
         };

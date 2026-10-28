@@ -240,6 +240,10 @@ impl ParquetOptions {
             .set_writer_version(version)
             .set_created_by(format!("vegg {}", crate::VERSION))
             .set_max_row_group_row_count(Some(rows_hint.max(1)))
+            // pages of up to 128 Ki rows (the 1 MiB page size limit usually ends them
+            // first): the default 20 Ki rows left zstd too little to work with, and files
+            // a third larger
+            .set_data_page_row_count_limit(128 * 1024)
             .set_statistics_enabled(if self.statistics.unwrap_or(true) {
                 EnabledStatistics::Page
             } else {

@@ -374,8 +374,11 @@ pub fn parse_float(v: &[u8], loose: bool) -> Option<FloatInfo> {
     if i != n {
         return None;
     }
-    let text = std::str::from_utf8(v).ok()?;
-    let value: f64 = text.parse().ok()?;
+    let value = match exact_float(int_part, frac_part, exp) {
+        Some(x) if v[0] == b'-' => -x,
+        Some(x) => x,
+        None => std::str::from_utf8(v).ok()?.parse().ok()?,
+    };
     // Significant digits: the digit sequence without leading and trailing zeros.
     let total = int_part.len() + frac_part.len();
     let digit_at = |k: usize| if k < int_part.len() { int_part[k] } else { frac_part[k - int_part.len()] };
@@ -408,6 +411,36 @@ pub fn parse_float(v: &[u8], loose: bool) -> Option<FloatInfo> {
         int_digits: int_part.iter().skip_while(|&&b| b == b'0').count().max(1) as u32,
         frac_digits: frac_part.len() as u32,
     })
+}
+
+/// Powers of ten a double holds exactly.
+const EXACT_POW10: [f64; 23] = [
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20,
+    1e21, 1e22,
+];
+
+/// The double nearest `int.frac` x 10^exp, without the general parser, when its digits
+/// fit 2^53 and the power of ten is exact: one multiplication or division of two exact
+/// doubles is then correctly rounded (Clinger's fast path).  Prices and measurements
+/// almost always qualify; anything else returns None.
+#[inline]
+fn exact_float(int: &[u8], frac: &[u8], exp: i64) -> Option<f64> {
+    if int.len() + frac.len() > 19 {
+        return None;
+    }
+    let mut m: u64 = 0;
+    for &b in int.iter().chain(frac) {
+        m = m * 10 + (b - b'0') as u64;
+    }
+    if m > 1 << 53 {
+        return None;
+    }
+    let e = exp - frac.len() as i64;
+    match e {
+        0..=22 => Some(m as f64 * EXACT_POW10[e as usize]),
+        -22..=-1 => Some(m as f64 / EXACT_POW10[(-e) as usize]),
+        _ => None,
+    }
 }
 
 /// Whether printing `value` with as many significant digits as `sig` reproduces the
@@ -606,16 +639,26 @@ pub fn parse_decimal(v: &[u8], scale: u8) -> Option<i128> {
     if int_part.len() > 1 && int_part[0] == b'0' {
         return None;
     }
-    let mut acc: i128 = 0;
-    for &b in int_part.iter().chain(frac_part.iter()) {
+    // 18 digits always fit a u64, so only longer numbers need checked i128 arithmetic
+    let mut digits = int_part.iter().chain(frac_part.iter());
+    let mut head: u64 = 0;
+    for &b in digits.by_ref().take(18) {
+        let d = b.wrapping_sub(b'0');
+        if d > 9 {
+            return None;
+        }
+        head = head * 10 + d as u64;
+    }
+    let mut acc = head as i128;
+    for &b in digits {
         let d = b.wrapping_sub(b'0');
         if d > 9 {
             return None;
         }
         acc = acc.checked_mul(10)?.checked_add(d as i128)?;
     }
-    for _ in frac_part.len()..scale as usize {
-        acc = acc.checked_mul(10)?;
+    if frac_part.len() < scale as usize {
+        acc = acc.checked_mul(10i128.checked_pow((scale as usize - frac_part.len()) as u32)?)?;
     }
     if neg && acc == 0 {
         return None; // `-0` / `-0.00`: the sign would be lost
@@ -969,5 +1012,58 @@ mod tests {
         let mut loose = ColumnStats::default();
         loose.observe(b"007", TypesMode::Loose, &[]);
         assert_eq!(loose.decide(), LogicalType::Int64);
+    }
+
+    /// A small xorshift generator, so the tests need no dependency.
+    fn numbers(seed: u64) -> impl FnMut() -> u64 {
+        let mut s = seed;
+        move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        }
+    }
+
+    #[test]
+    fn floats_parse_like_the_standard_parser() {
+        let mut next = numbers(0x2545_f491_4f6c_dd1d);
+        for i in 0..200_000u64 {
+            let int = next() % 10u64.pow((next() % 12) as u32);
+            let frac_len = (next() % 10) as usize;
+            let frac = format!("{:0width$}", next() % 10u64.pow(frac_len as u32), width = frac_len);
+            let mut text = format!("{}{int}", if i % 3 == 0 { "-" } else { "" });
+            if frac_len > 0 {
+                text = format!("{text}.{frac}");
+            }
+            if i % 5 == 0 {
+                text = format!("{text}e{}", (next() % 61) as i64 - 30);
+            }
+            let ours = parse_float(text.as_bytes(), false).unwrap_or_else(|| panic!("{text}")).value;
+            let std: f64 = text.parse().unwrap();
+            assert_eq!(ours.to_bits(), std.to_bits(), "{text}");
+        }
+    }
+
+    #[test]
+    fn decimals_parse_every_length() {
+        let mut next = numbers(0x9e37_79b9_7f4a_7c15);
+        for digits in 1..=38usize {
+            for _ in 0..200 {
+                let mut text: String = (0..digits).map(|_| char::from(b'0' + (next() % 10) as u8)).collect();
+                if text.len() > 1 && text.starts_with('0') {
+                    text.replace_range(0..1, "7");
+                }
+                let expected: i128 = text.parse().unwrap();
+                assert_eq!(parse_decimal(text.as_bytes(), 0), Some(expected), "{text}");
+                let negative = format!("-{text}");
+                let expected = if expected == 0 { None } else { Some(-expected) };
+                assert_eq!(parse_decimal(negative.as_bytes(), 0), expected, "{negative}");
+            }
+        }
+        // a scale pads with zeros, within the 38 digits a decimal holds
+        assert_eq!(parse_decimal(b"12345678901234567890.5", 2), Some(1_234_567_890_123_456_789_050));
+        assert_eq!(parse_decimal(b"1.5", 37), Some(15 * 10i128.pow(36)));
+        assert_eq!(parse_decimal(b"99999999999999999999999999999999999999", 1), None);
     }
 }

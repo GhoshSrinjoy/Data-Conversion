@@ -118,13 +118,14 @@ pub fn plan_with(
     // User-supplied chunk sizes are clamped: a typo must not become a 256 GB allocation.
     let mut chunk_size = chunk.map(|c| (c as u64).clamp(4 * KIB, 2 * GIB)).unwrap_or_else(|| {
         let per_thread = wave_bytes / threads as u64;
-        per_thread.clamp(MIB, 64 * MIB)
+        per_thread.clamp(MIB, 16 * MIB)
     });
     if let Some(size) = input_size {
         if chunk.is_none() && size > 0 {
-            // Small inputs: split evenly so every thread has work, but keep chunks
-            // large enough that per-chunk overhead stays negligible.
-            let even = size.div_ceil(threads as u64);
+            // Smaller inputs: about four chunks per thread, so that every thread has
+            // work and the last chunk to decode holds up the end of the job only
+            // briefly, but chunks large enough that per-chunk overhead stays small.
+            let even = size.div_ceil(threads as u64 * 4);
             chunk_size = chunk_size.min(even.max(256 * KIB));
         }
     }
@@ -182,7 +183,7 @@ mod tests {
     fn plan_scales_with_resources() {
         let big = plan_with(&fake(32, 64 * GIB), Some(100 * GIB), None, None, None);
         assert_eq!(big.threads, 32);
-        assert_eq!(big.chunk_size as u64, 64 * MIB);
+        assert_eq!(big.chunk_size as u64, 16 * MIB);
         let tiny = plan_with(&fake(1, 128 * MIB), Some(10 * GIB), None, None, None);
         assert_eq!(tiny.threads, 1);
         assert!(tiny.low_memory);

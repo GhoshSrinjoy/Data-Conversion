@@ -16,6 +16,10 @@ use vegg_core::convert::{self, BadLines, ConvertOptions, Hooks, InferMode, Repor
 use vegg_core::types::TypesMode;
 use vegg_core::{dcz, inspect, resources, Error};
 
+// mimalloc: the system allocator on Windows made conversions about a third slower
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const USAGE: &str = "vegg (native) - fast, lossless data conversion and compression
 
 usage:
