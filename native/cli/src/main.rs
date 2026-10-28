@@ -62,6 +62,46 @@ struct Args {
 const SWITCHES: &[&str] =
     &["overwrite", "f", "quiet", "q", "json", "no-header", "header", "exact", "crlf", "help", "h"];
 
+/// Every option some command reads: anything else is a typo, which must not pass
+/// silently (`--force` for `--overwrite` once looked like a successful run).
+const OPTIONS: &[&str] = &[
+    "bad-lines",
+    "columns",
+    "compression",
+    "crlf",
+    "delimiter",
+    "encoding",
+    "exact",
+    "f",
+    "from",
+    "h",
+    "header",
+    "help",
+    "infer",
+    "json",
+    "level",
+    "limit",
+    "memory",
+    "n",
+    "no-header",
+    "null-values",
+    "out-delimiter",
+    "overwrite",
+    "pattern",
+    "profile",
+    "q",
+    "quarantine",
+    "quiet",
+    "quote",
+    "rows",
+    "schema",
+    "size",
+    "skip-rows",
+    "threads",
+    "to",
+    "types",
+];
+
 fn parse_args(raw: &[String]) -> Args {
     let mut positional = Vec::new();
     let mut flags = HashMap::new();
@@ -289,6 +329,10 @@ fn need<'a>(a: &'a Args, i: usize, what: &str) -> Result<&'a str, String> {
 
 fn run(raw: Vec<String>) -> Result<(), String> {
     let a = parse_args(&raw);
+    if let Some(bad) = a.flags.keys().find(|k| !OPTIONS.contains(&k.as_str())) {
+        let dashes = if bad.chars().count() == 1 { "-" } else { "--" };
+        return Err(format!("unknown option '{dashes}{bad}' (vegg --help lists the options)"));
+    }
     let cmd = a.positional.first().map(String::as_str).unwrap_or("");
     if cmd.is_empty() || a.has("help") || a.has("h") {
         print!("{USAGE}");
@@ -434,5 +478,14 @@ mod tests {
             super::schema_entries("zip=string,amount=decimal(12,2), ts=timestamp[us,UTC]"),
             vec!["zip=string", "amount=decimal(12,2)", " ts=timestamp[us,UTC]"]
         );
+    }
+
+    #[test]
+    fn unknown_options_are_errors() {
+        let args = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        let err = super::run(args("convert in.csv out.parquet --force")).unwrap_err();
+        assert!(err.contains("unknown option '--force'"), "{err}");
+        let err = super::run(args("count in.csv -x")).unwrap_err();
+        assert!(err.contains("unknown option '-x'"), "{err}");
     }
 }
