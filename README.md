@@ -197,17 +197,17 @@ losing information. Otherwise it stays text, and the report says why.
 
 | values                                     | inferred type          | why |
 |--------------------------------------------|------------------------|-----|
-| `1`, `-2`, `30`                             | `int64`                | |
+| `1`, `-2`, `30`                             | `int64`                | plain whole numbers within the int64 range |
 | `007`, `02134`                              | `string`               | leading zeros carry meaning |
 | `+4915112345678`                            | `string`               | a `+` sign usually means a phone number |
 | `18446744073709551615`                      | `decimal(20,0)`        | beyond int64; a float would round it |
 | `0.1`, `2.50`, `1e-5`                       | `float64`              | every value round-trips |
 | `1.00000000000000000001`                    | `decimal(21,20)`       | more digits than a double holds |
-| `2024-01-02`                                | `date`                 | |
+| `2024-01-02`                                | `date`                 | a valid calendar day written `YYYY-MM-DD` |
 | `2024-01-02T03:04:05.123+05:30`             | `timestamp[ms,+05:30]` | unit from the digits, offset kept |
 | offsets `+05:30` and `Z` mixed in one column | `string`              | a single type would drop local times |
-| `true`, `False`                             | `bool`                 | |
-| `NA`, `null`, `-`, empty in a numeric column | missing value          | |
+| `true`, `False`                             | `bool`                 | `true` and `false` in lower, title or upper case |
+| `NA`, `null`, `-`, empty in a numeric column | missing value          | common placeholders (also `N/A`, `None`, `nil`, `#N/A`); `--null-values` adds more |
 | `NA` in a text column (Namibia)             | `"NA"`                 | kept as written |
 
 An unquoted empty field is missing; a quoted empty field `""` is an empty string,
