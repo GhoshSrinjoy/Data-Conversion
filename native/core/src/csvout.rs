@@ -9,7 +9,7 @@
 use std::io::Write;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Array, ArrayRef, AsArray, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array, Float64Array,
     GenericStringArray, Int16Array, Int32Array, Int64Array, Int8Array, OffsetSizeTrait, RecordBatch, StringViewArray,
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
     UInt32Array, UInt64Array, UInt8Array,
@@ -81,6 +81,16 @@ pub(crate) fn write_date(out: &mut Vec<u8>, days: i64) {
         let _ = write!(out, "{y:04}-{m:02}-{d:02}");
     } else {
         let _ = write!(out, "{y}-{m:02}-{d:02}");
+    }
+}
+
+/// A date64 (milliseconds) as a date.  A value that is not a whole day, which the
+/// format forbids but files can hold, keeps its time as a timestamp.
+pub(crate) fn write_date64(out: &mut Vec<u8>, ms: i64) {
+    if ms.rem_euclid(86_400_000) == 0 {
+        write_date(out, ms.div_euclid(86_400_000));
+    } else {
+        write_timestamp(out, ms, TimeUnit::Millisecond, None);
     }
 }
 
@@ -185,6 +195,7 @@ enum Col<'a> {
     F64(&'a Float64Array),
     Dec(&'a Decimal128Array, i8),
     Date(&'a Date32Array),
+    Date64(&'a Date64Array),
     Ts(&'a dyn Array, TimeUnit, Option<i32>),
     /// Structs, lists and maps as JSON text.
     Json(arrow::json::writer::NullableEncoder<'a>),
@@ -251,6 +262,7 @@ impl<'a> Col<'a> {
             DataType::Float64 => Col::F64(array.as_primitive()),
             DataType::Decimal128(_, s) => Col::Dec(array.as_primitive(), *s),
             DataType::Date32 => Col::Date(array.as_primitive()),
+            DataType::Date64 => Col::Date64(array.as_primitive()),
             DataType::Timestamp(unit, tz) => Col::Ts(array.as_ref(), *unit, timestamp_offset(tz.as_deref())),
             DataType::Struct(_)
             | DataType::List(_)
@@ -287,6 +299,7 @@ impl<'a> Col<'a> {
             Col::F64(a) => float_text(out, a.value(i)),
             Col::Dec(a, s) => write_decimal(out, a.value(i), *s),
             Col::Date(a) => write_date(out, a.value(i) as i64),
+            Col::Date64(a) => write_date64(out, a.value(i)),
             Col::Ts(a, unit, offset) => write_timestamp_at(out, *a, i, *unit, *offset),
             Col::Json(e) => {
                 let mut text = Vec::new();
@@ -327,14 +340,16 @@ fn format_rows(batch: &RecordBatch, start: usize, end: usize, o: &CsvWriteOption
     let schema = batch.schema();
     let mut cols: Vec<Col> =
         schema.fields().iter().zip(batch.columns()).map(|(f, c)| Col::new(f, c, &fmt, &json)).collect::<Result<_>>()?;
-    let arrays = batch.columns();
+    // logical nulls: a null-type column, or a dictionary whose values hold nulls, has
+    // no validity bits of its own
+    let nulls: Vec<_> = batch.columns().iter().map(|a| a.logical_nulls()).collect();
     let mut out = Vec::with_capacity((end - start) * 16 * cols.len().max(1));
     for row in start..end {
         for (j, col) in cols.iter_mut().enumerate() {
             if j > 0 {
                 out.push(o.delimiter);
             }
-            if !arrays[j].is_null(row) {
+            if !nulls[j].as_ref().is_some_and(|n| n.is_null(row)) {
                 col.write(&mut out, row, o);
             }
         }

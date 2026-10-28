@@ -33,7 +33,9 @@ use arrow::array::{
     ListLikeArray, RecordBatch, RecordBatchOptions, StringArrayType, StringBuilder, StructArray,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
-use arrow::datatypes::{DataType, Date32Type, Field, FieldRef, Fields, Float32Type, Float64Type, Schema, SchemaRef};
+use arrow::datatypes::{
+    DataType, Date32Type, Date64Type, Field, FieldRef, Fields, Float32Type, Float64Type, Schema, SchemaRef,
+};
 use arrow::error::ArrowError;
 use arrow::json::writer::{Encoder, EncoderFactory, EncoderOptions, NullableEncoder};
 use rayon::prelude::*;
@@ -874,6 +876,47 @@ fn marked_items<'a, L: ListLikeArray>(
     Ok(NullableEncoder::new(Box::new(MarkedItems { list, items }), list.nulls().cloned()))
 }
 
+/// Maps as JSON objects, entries in order (repeated keys included).  A key that is not
+/// text is written as the text of its JSON (`1` becomes `"1"`): arrow-json refuses such
+/// keys, and hands key and value encoders the map's own field, so it would also lose
+/// the marks of the values.
+struct MapObject<'a> {
+    offsets: &'a [i32],
+    keys: NullableEncoder<'a>,
+    values: NullableEncoder<'a>,
+    key: Vec<u8>,
+}
+
+impl Encoder for MapObject<'_> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        let (start, end) = (self.offsets[idx] as usize, self.offsets[idx + 1] as usize);
+        out.push(b'{');
+        for i in start..end {
+            if i > start {
+                out.push(b',');
+            }
+            self.key.clear();
+            if self.keys.is_null(i) {
+                self.key.extend_from_slice(b"null");
+            } else {
+                self.keys.encode(i, &mut self.key);
+            }
+            if self.key.first() == Some(&b'"') {
+                out.extend_from_slice(&self.key);
+            } else {
+                let _ = serde_json::to_writer(&mut *out, String::from_utf8_lossy(&self.key).as_ref());
+            }
+            out.push(b':');
+            if self.values.is_null(i) {
+                out.extend_from_slice(b"null");
+            } else {
+                self.values.encode(i, out);
+            }
+        }
+        out.push(b'}');
+    }
+}
+
 /// Dates and timestamps as JSON strings in the CSV output's format.
 struct TemporalEncoder<'a>(&'a dyn Array);
 
@@ -888,6 +931,7 @@ impl Encoder for TemporalEncoder<'_> {
                 *unit,
                 crate::csvout::timestamp_offset(tz.as_deref()),
             ),
+            DataType::Date64 => crate::csvout::write_date64(out, self.0.as_primitive::<Date64Type>().value(idx)),
             _ => crate::csvout::write_date(out, self.0.as_primitive::<Date32Type>().value(idx) as i64),
         }
         out.push(b'"');
@@ -947,7 +991,17 @@ impl EncoderFactory for FloatText {
             DataType::Float32 | DataType::Float64 => {
                 Some(NullableEncoder::new(Box::new(FloatEncoder(array)), array.nulls().cloned()))
             }
-            DataType::Timestamp(..) | DataType::Date32 => {
+            DataType::Map(entries, _) => match entries.data_type() {
+                DataType::Struct(kv) if kv.len() == 2 => {
+                    let map = array.as_map();
+                    let keys = arrow::json::writer::make_encoder(&kv[0], map.keys().as_ref(), options)?;
+                    let values = arrow::json::writer::make_encoder(&kv[1], map.values().as_ref(), options)?;
+                    let encoder = MapObject { offsets: map.value_offsets(), keys, values, key: Vec::new() };
+                    Some(NullableEncoder::new(Box::new(encoder), map.nulls().cloned()))
+                }
+                _ => None,
+            },
+            DataType::Timestamp(..) | DataType::Date32 | DataType::Date64 => {
                 Some(NullableEncoder::new(Box::new(TemporalEncoder(array)), array.nulls().cloned()))
             }
             _ => None,

@@ -62,7 +62,8 @@ pub fn head(path: &Path, n: usize, opts: &ConvertOptions) -> Result<Preview> {
     match fmt {
         Format::Parquet => {
             let file = File::open(path).map_err(|e| Error::io(e, path))?;
-            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?
+            let meta = crate::tables::parquet_metadata(&file)?;
+            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::new_with_metadata(file, meta)
                 .with_batch_size(n.max(1))
                 .with_limit(n)
                 .build()?;

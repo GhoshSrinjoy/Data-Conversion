@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
-use arrow::datatypes::{DataType, Date64Type, Field, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Date64Type, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder};
 use parquet::arrow::arrow_writer::{compute_leaves, ArrowColumnChunk, ArrowRowGroupWriterFactory, ArrowWriterOptions};
 use parquet::arrow::ArrowWriter;
@@ -737,6 +737,64 @@ pub trait Source: Send {
     }
 }
 
+/// Parquet metadata, with the time zones that the file's stored Arrow schema gives to
+/// timestamps of a resolution Parquet lacks.  pyarrow writes `timestamp[s, tz]` as
+/// milliseconds, and arrow-rs keeps a stored time zone only when the units match.
+pub(crate) fn parquet_metadata(file: &File) -> Result<ArrowReaderMetadata> {
+    let meta = ArrowReaderMetadata::load(file, ArrowReaderOptions::new())?;
+    let Some(stored) = stored_arrow_schema(&meta) else { return Ok(meta) };
+    let inferred = meta.schema().fields();
+    if stored.fields().len() != inferred.len() {
+        return Ok(meta);
+    }
+    let fields: Fields = inferred.iter().zip(stored.fields()).map(|(f, s)| zoned_field(f, s)).collect();
+    if &fields == inferred {
+        return Ok(meta);
+    }
+    let schema = Arc::new(Schema::new_with_metadata(fields, meta.schema().metadata().clone()));
+    // a schema the reader turns down leaves the inferred one
+    Ok(ArrowReaderMetadata::try_new(meta.metadata().clone(), ArrowReaderOptions::new().with_schema(schema))
+        .unwrap_or(meta))
+}
+
+fn stored_arrow_schema(meta: &ArrowReaderMetadata) -> Option<Schema> {
+    use base64::Engine;
+    let kv = meta.metadata().file_metadata().key_value_metadata()?;
+    let value = kv.iter().find(|kv| kv.key == parquet::arrow::ARROW_SCHEMA_META_KEY)?.value.as_ref()?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(value).ok()?;
+    // IPC framing: an optional continuation marker, then the message length
+    let message = if bytes.len() > 8 && bytes[0..4] == [255u8; 4] { &bytes[8..] } else { &bytes[..] };
+    let message = arrow::ipc::root_as_message(message).ok()?;
+    arrow::ipc::convert::try_fb_to_schema(message.header_as_schema()?).ok()
+}
+
+fn zoned_field(f: &FieldRef, stored: &FieldRef) -> FieldRef {
+    let t = zoned_type(f.data_type(), stored.data_type());
+    if &t == f.data_type() {
+        f.clone()
+    } else {
+        Arc::new(f.as_ref().clone().with_data_type(t))
+    }
+}
+
+fn zoned_type(t: &DataType, stored: &DataType) -> DataType {
+    match (t, stored) {
+        (DataType::Timestamp(unit, _), DataType::Timestamp(s, Some(tz))) if unit != s => {
+            DataType::Timestamp(*unit, Some(tz.clone()))
+        }
+        (DataType::Struct(fs), DataType::Struct(ss)) if fs.len() == ss.len() => {
+            DataType::Struct(fs.iter().zip(ss.iter()).map(|(f, s)| zoned_field(f, s)).collect())
+        }
+        (DataType::List(f), DataType::List(s) | DataType::LargeList(s)) => DataType::List(zoned_field(f, s)),
+        (DataType::LargeList(f), DataType::List(s) | DataType::LargeList(s)) => DataType::LargeList(zoned_field(f, s)),
+        (DataType::FixedSizeList(f, n), DataType::FixedSizeList(s, _)) => {
+            DataType::FixedSizeList(zoned_field(f, s), *n)
+        }
+        (DataType::Map(f, sorted), DataType::Map(s, _)) => DataType::Map(zoned_field(f, s), *sorted),
+        _ => t.clone(),
+    }
+}
+
 pub struct ParquetSource {
     path: PathBuf,
     meta: ArrowReaderMetadata,
@@ -761,7 +819,7 @@ impl ParquetSource {
     ) -> Result<Self> {
         let file = File::open(path).map_err(|e| Error::io(e, path))?;
         let total_bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
-        let meta = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new())?;
+        let meta = parquet_metadata(&file)?;
         let full = meta.schema().clone();
         let projection = match columns {
             None => None,

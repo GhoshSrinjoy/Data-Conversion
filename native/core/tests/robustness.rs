@@ -394,6 +394,123 @@ fn json_kept_as_text_round_trips_as_json() {
 }
 
 #[test]
+fn foreign_types_are_written_like_their_text() {
+    use arrow::array::{ArrayRef, Date64Array, Int64Builder, MapBuilder, NullArray, StringBuilder};
+    use arrow::datatypes::{DataType, Field};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let d = dir("foreign-types");
+    // a map with a repeated key and a null value
+    let mut m = MapBuilder::new(None, StringBuilder::new(), Int64Builder::new());
+    m.keys().append_value("a");
+    m.values().append_value(1);
+    m.keys().append_value("a");
+    m.values().append_null();
+    m.append(true).unwrap();
+    m.append(false).unwrap();
+    m.append(true).unwrap();
+    // keys that are not text
+    let mut k = MapBuilder::new(None, Int64Builder::new(), StringBuilder::new());
+    for (key, v) in [(1, "x"), (2, "y")] {
+        k.keys().append_value(key);
+        k.values().append_value(v);
+    }
+    k.append(true).unwrap();
+    k.append(false).unwrap();
+    k.append(true).unwrap();
+    // values that hold JSON
+    let marked = HashMap::from([("dataconv.json".to_string(), "value".to_string())]);
+    let mut j = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new())
+        .with_values_field(Field::new("values", DataType::Utf8, true).with_metadata(marked));
+    j.keys().append_value("v");
+    j.values().append_value("[1,2]");
+    j.append(true).unwrap();
+    j.append(false).unwrap();
+    j.append(true).unwrap();
+    let day = 19_724 * 86_400_000; // 2024-01-02
+    let cols: Vec<(&str, ArrayRef)> = vec![
+        ("n", Arc::new(NullArray::new(3))),
+        ("d", Arc::new(Date64Array::from(vec![Some(day), Some(day + 11_045_006), None]))),
+        ("m", Arc::new(m.finish())),
+        ("k", Arc::new(k.finish())),
+        ("j", Arc::new(j.finish())),
+    ];
+    let batch = RecordBatch::try_from_iter(cols).unwrap();
+    let src = d.join("foreign.arrow");
+    let mut w = arrow::ipc::writer::FileWriter::try_new(File::create(&src).unwrap(), &batch.schema()).unwrap();
+    w.write(&batch).unwrap();
+    w.finish().unwrap();
+    drop(w);
+
+    let out = d.join("foreign.jsonl");
+    convert(&src, &out, &opts(), &NoHooks).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        concat!(
+            "{\"n\":null,\"d\":\"2024-01-02\",\"m\":{\"a\":1,\"a\":null},\"k\":{\"1\":\"x\",\"2\":\"y\"},\"j\":{\"v\":[1,2]}}\n",
+            "{\"n\":null,\"d\":\"2024-01-02T03:04:05.006\",\"m\":null,\"k\":null,\"j\":null}\n",
+            "{\"n\":null,\"d\":null,\"m\":{},\"k\":{},\"j\":{}}\n",
+        )
+    );
+    // a null is an empty unquoted field, whatever the column's type
+    let out = d.join("foreign.csv");
+    convert(&src, &out, &opts(), &NoHooks).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        concat!(
+            "n,d,m,k,j\n",
+            ",2024-01-02,\"{\"\"a\"\":1,\"\"a\"\":null}\",\"{\"\"1\"\":\"\"x\"\",\"\"2\"\":\"\"y\"\"}\",\"{\"\"v\"\":[1,2]}\"\n",
+            ",2024-01-02T03:04:05.006,,,\n",
+            ",,{},{},{}\n",
+        )
+    );
+}
+
+#[test]
+fn stored_time_zones_survive_a_coarser_parquet_unit() {
+    use arrow::array::{ArrayRef, StructArray, TimestampMillisecondArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use parquet::arrow::arrow_writer::ArrowWriterOptions;
+    use parquet::arrow::{encode_arrow_schema, ArrowWriter, ARROW_SCHEMA_META_KEY};
+    use parquet::file::metadata::KeyValue;
+    use parquet::file::properties::WriterProperties;
+    use std::sync::Arc;
+
+    let d = dir("stored-tz");
+    // 2024-01-02T03:04:05+05:30
+    let t: ArrayRef = Arc::new(TimestampMillisecondArray::from(vec![1_704_144_845_000]).with_timezone("+05:30"));
+    let st: ArrayRef =
+        Arc::new(StructArray::from(vec![(Arc::new(Field::new("t", t.data_type().clone(), true)), t.clone())]));
+    let batch = RecordBatch::try_from_iter([("t", t), ("st", st)]).unwrap();
+    // what pyarrow stores for timestamp[s, tz]: seconds in the Arrow schema, milliseconds
+    // in Parquet
+    let secs = DataType::Timestamp(TimeUnit::Second, Some("+05:30".into()));
+    let stored = Schema::new(vec![
+        Field::new("t", secs.clone(), true),
+        Field::new("st", DataType::Struct(vec![Field::new("t", secs, true)].into()), true),
+    ]);
+    let props = WriterProperties::builder()
+        .set_key_value_metadata(Some(vec![KeyValue::new(
+            ARROW_SCHEMA_META_KEY.to_string(),
+            encode_arrow_schema(&stored),
+        )]))
+        .build();
+    let src = d.join("tz.parquet");
+    let options = ArrowWriterOptions::new().with_properties(props).with_skip_arrow_metadata(true);
+    let mut w = ArrowWriter::try_new_with_options(File::create(&src).unwrap(), batch.schema(), options).unwrap();
+    w.write(&batch).unwrap();
+    w.close().unwrap();
+
+    let out = d.join("tz.csv");
+    convert(&src, &out, &opts(), &NoHooks).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "t,st\n2024-01-02T03:04:05+05:30,\"{\"\"t\"\":\"\"2024-01-02T03:04:05+05:30\"\"}\"\n"
+    );
+}
+
+#[test]
 fn json_output_writes_times_like_csv() {
     let d = dir("json-times");
     let src = d.join("t.csv");

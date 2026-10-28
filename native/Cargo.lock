@@ -514,6 +514,7 @@ version = "1.0.0"
 dependencies = [
  "ahash",
  "arrow",
+ "base64",
  "brotli",
  "crc32fast",
  "encoding_rs",
