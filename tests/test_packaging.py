@@ -27,6 +27,15 @@ def test_versions_agree():
     assert cli_dependency["version"] == f"={crates['version']}"
 
 
+def test_license_copies_match():
+    # the crates ship their own copy, since a published crate holds only its folder
+    for copy in ("native/core/LICENSE", "native/cli/LICENSE"):
+        path = ROOT / copy
+        if not path.exists():
+            pytest.skip(f"{copy} is not part of this copy of the sources")
+        assert path.read_bytes() == (ROOT / "LICENSE").read_bytes(), copy
+
+
 def test_native_module_name():
     assert _toml("pyproject.toml")["tool"]["maturin"]["module-name"] == _compat.NATIVE
 
