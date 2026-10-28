@@ -17,8 +17,9 @@ The name comes from বেগ (*beg*), Bengali for speed.
   exact, `NA` is only a missing value where the column is numeric, timestamps
   keep their UTC offset, and malformed rows are set aside instead of dropped.
 - **Fast.** A native Rust engine reads, types and writes in parallel. On the
-  export [below](#why-this-exists) it is 2 to 3 times faster than DuckDB,
-  pyarrow and pandas, and writes the smallest file of the five tools tested.
+  export [below](#why-this-exists) it is 2.5 to 4 times faster than DuckDB,
+  pyarrow and pandas, close to Polars, and writes the smallest file of the five
+  tools tested.
 - **Adaptive.** Threads, memory and chunk sizes follow the machine it runs on,
   including CPU and memory limits inside containers.
 - **Strong compression.** DCZ, a byte-exact columnar format for delimited text,
@@ -54,7 +55,7 @@ codes, country codes, phone numbers and 20-digit account numbers.
 
 |                                            | **vegg**    | Polars     | DuckDB    | pyarrow   | pandas    |
 |--------------------------------------------|------------:|-----------:|----------:|----------:|----------:|
-| time                                       |      0.18 s | **0.10 s** |    0.34 s |    0.44 s |    0.53 s |
+| time                                       |      0.13 s | **0.10 s** |    0.32 s |    0.43 s |    0.53 s |
 | Parquet size                               | **12.5 MB** |    12.7 MB |   50.9 MB |   32.7 MB |   39.7 MB |
 | zip codes that lost their leading zero     |       **0** |    200,000 |     **0** |   200,000 |   200,000 |
 | `NA` (Namibia) turned into a missing value |       **0** |      **0** |     **0** |     **0** |   285,714 |
