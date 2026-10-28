@@ -3,7 +3,8 @@ from pathlib import Path
 import pytest
 
 import dataconv as dc
-from conftest import ENGINES, needs_arrow, needs_native
+from conftest import ENGINES, have_native, needs_arrow, needs_native
+from dataconv import _native
 
 
 def test_info_head_count_schema(tricky):
@@ -81,6 +82,36 @@ def test_split_byte_exact(tmp_path):
     assert [Path(p["path"]).name for p in r.parts] == [f"chunk_{i:04}.csv" for i in range(4)]
     joined = "".join(Path(p["path"]).read_bytes().decode()[len("a,b,c\r\n"):] for p in r.parts)
     assert joined == body
+
+
+def test_part_names_and_patterns():
+    from dataconv.api import check_pattern, part_name
+
+    assert part_name("part-{n:05}", 7) == "part-00007"
+    assert part_name("p-{n:05}-{n:03}", 7) == "p-00007-007"
+    assert part_name("p{n}", 12) == "p12"
+    assert part_name("p{n:5}", 12) == "p12"
+    assert part_name("p-", 3) == "p-00003"
+    # anything else in braces is text, in both engines
+    assert part_name("{n{n}}", 5) == "{n5}"
+    assert part_name("{nn}-{n:}-{n:5x}", 5) == "{nn}-{n:}-{n:5x}00005"
+    assert len(part_name("{n:0999999999999999999999}", 1)) == 255
+    check_pattern("part-{n:05}", ".csv")
+    for pattern, ext in (("sub/part-{n}", ".csv"), ("part-{n}", "/x"), ("a\x01b-{n}", ".csv"), ("p-{n:0300}", ".csv")):
+        with pytest.raises(dc.OptionsError):
+            check_pattern(pattern, ext)
+
+
+@pytest.mark.parametrize("native", [True, False] if have_native() else [False])
+def test_split_names_every_placeholder(tmp_path, monkeypatch, native):
+    if not native:
+        monkeypatch.setattr(_native, "module", lambda: None)
+    src = tmp_path / "in.csv"
+    src.write_bytes(b"a\n1\n2\n3\n")
+    r = dc.split(src, tmp_path / "parts", rows=2, pattern="p-{n:03}-{n}")
+    assert [Path(p["path"]).name for p in r.parts] == ["p-000-0.csv", "p-001-1.csv"]
+    with pytest.raises(dc.OptionsError):
+        dc.split(src, tmp_path / "other", rows=2, pattern="p\x01{n}")
 
 
 @needs_native

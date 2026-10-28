@@ -28,17 +28,63 @@ pub struct Part {
     pub bytes: u64,
 }
 
-/// `pattern` with `{n}` or `{n:0W}` replaced by the part number.
+/// The name of part `n`: every `{n}` in the pattern becomes the number, and `{n:05}` the
+/// number zero-padded to five digits (`{n:5}` pads nothing); a pattern without one gets
+/// five zero-padded digits appended.  Other text in braces is kept as it is.
 pub fn part_name(pattern: &str, n: usize) -> String {
-    if let Some(start) = pattern.find("{n") {
-        if let Some(end_rel) = pattern[start..].find('}') {
-            let spec = &pattern[start + 2..start + end_rel];
-            let width = spec.trim_start_matches(':').trim_start_matches('0').parse::<usize>().unwrap_or(0);
-            let number = if spec.starts_with(":0") { format!("{n:0width$}") } else { format!("{n:width$}") };
-            return format!("{}{}{}", &pattern[..start], number.trim(), &pattern[start + end_rel + 1..]);
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(pattern.len() + 8);
+    let mut placed = false;
+    let mut rest = pattern;
+    while let Some(i) = rest.find("{n") {
+        let tail = &rest[i + 2..];
+        // exactly `{n}` or `{n:` digits `}`
+        let width = match tail.strip_prefix(':') {
+            Some(t) => {
+                let d = t.bytes().take_while(u8::is_ascii_digit).count();
+                (d > 0 && t.as_bytes().get(d) == Some(&b'}')).then(|| &t[..d])
+            }
+            None => tail.starts_with('}').then_some(""),
+        };
+        let Some(width) = width else {
+            out.push_str(&rest[..i + 1]);
+            rest = &rest[i + 1..];
+            continue;
+        };
+        out.push_str(&rest[..i]);
+        placed = true;
+        if width.starts_with('0') {
+            // no file name is longer
+            let digits = width.parse::<usize>().unwrap_or(usize::MAX).min(255);
+            let _ = write!(out, "{n:0digits$}");
+        } else {
+            let _ = write!(out, "{n}");
         }
+        rest = &tail[width.len() + usize::from(!width.is_empty()) + 1..];
     }
-    format!("{pattern}{n:05}")
+    out.push_str(rest);
+    if !placed {
+        let _ = write!(out, "{n:05}");
+    }
+    out
+}
+
+/// Refuses a part name pattern that cannot name files here: one with folders (parts are
+/// named, not placed), or one that makes names with characters this system does not
+/// allow or longer than 255 bytes.
+pub fn check_pattern(pattern: &str, extension: &str) -> Result<()> {
+    let refuse = |why: String| Err(Error::Invalid(format!("the part name pattern '{pattern}{extension}' {why}")));
+    if pattern.contains(['/', '\\']) || extension.contains(['/', '\\']) || pattern.contains("..") {
+        return refuse("must be a file name, without folders".into());
+    }
+    let name = format!("{}{extension}", part_name(pattern, 0));
+    if let Some(c) = name.chars().find(|&c| c < ' ' || (cfg!(windows) && "<>:\"|?*".contains(c))) {
+        return refuse(format!("makes file names with {c:?}, which this system does not allow"));
+    }
+    if name.len() > 255 {
+        return refuse("makes file names longer than 255 bytes".into());
+    }
+    Ok(())
 }
 
 const STAGING_PREFIX: &str = ".dataconv-staging-";
@@ -417,5 +463,33 @@ where
         }
         self.roll(false)?;
         Ok(self.parts)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn part_names_replace_every_placeholder() {
+        assert_eq!(part_name("part-{n:05}", 7), "part-00007");
+        assert_eq!(part_name("p-{n:05}-{n:03}", 7), "p-00007-007");
+        assert_eq!(part_name("p{n}", 12), "p12");
+        assert_eq!(part_name("p{n:5}", 12), "p12");
+        assert_eq!(part_name("p-", 3), "p-00003");
+        // anything else in braces is text, as Python's `\{n(?::(\d+))?\}` sees it
+        assert_eq!(part_name("{n{n}}", 5), "{n5}");
+        assert_eq!(part_name("{nn}-{n:}-{n:5x}", 5), "{nn}-{n:}-{n:5x}00005");
+        assert_eq!(part_name("{n:0999999999999999999999}", 1).len(), 255);
+    }
+
+    #[test]
+    fn patterns_that_cannot_name_files_are_refused() {
+        assert!(check_pattern("part-{n:05}", ".csv").is_ok());
+        assert!(check_pattern("sub/part-{n}", ".csv").is_err());
+        assert!(check_pattern("part-{n}", "/x").is_err());
+        assert!(check_pattern("a\u{1}b-{n}", ".csv").is_err());
+        assert!(check_pattern("p-{n:0300}", ".csv").is_err());
+        assert_eq!(check_pattern("a:b-{n}", ".csv").is_err(), cfg!(windows));
     }
 }

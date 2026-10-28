@@ -1006,12 +1006,7 @@ fn split(
     });
     let dst_comp = Compression::from_extension(Path::new(&format!("x{extension}")));
     let pattern = opts.split_pattern.clone().unwrap_or_else(|| "part-{n:05}".to_string());
-    // parts are named, not placed: a path in the pattern would put them elsewhere
-    if pattern.contains(['/', '\\']) || extension.contains(['/', '\\']) || pattern.contains("..") {
-        return Err(Error::Invalid(format!(
-            "the part name pattern '{pattern}{extension}' must be a file name, without folders"
-        )));
-    }
+    crate::split::check_pattern(&pattern, &extension)?;
     let plan = resources::plan(Some(bytes_in), opts.threads, opts.memory, opts.chunk_size);
     let mut report = Report {
         source: src.display().to_string(),

@@ -216,9 +216,7 @@ def split(src: PathLike, out_dir: PathLike, *, rows: Optional[int] = None, size:
     fmt = formats.canonical(to) if to else src_fmt
     o = ConvertOptions.build(to=fmt, **options)
     ext = extension or formats.FORMATS[fmt].extensions[0]
-    # parts are named, not placed: a path in the pattern would put them elsewhere
-    if "/" in pattern or "\\" in pattern or ".." in pattern or "/" in ext or "\\" in ext:
-        raise OptionsError(f"the part name pattern '{pattern}{ext}' must be a file name, without folders")
+    check_pattern(pattern, ext)
     engine = engines.choose(o.engine, src_fmt, fmt, src_comp, None)
     callback, bar = _progress(progress, f"split {src.name}")
     try:
@@ -437,15 +435,34 @@ def merge(sources: Sequence[PathLike], dst: PathLike, *, progress: ProgressArg =
 
 
 def part_name(pattern: str, n: int) -> str:
-    """'part-{n:05}' -> 'part-00007' (the same rule the native engine uses)."""
+    """The name of part ``n`` (the native engine's rule): every ``{n}`` in the pattern
+    becomes the number, and ``{n:05}`` the number zero-padded to five digits (``{n:5}``
+    pads nothing); a pattern without one gets five zero-padded digits appended.  Other
+    text in braces is kept as it is."""
     import re as _re
 
-    m = _re.search(r"\{n(?::(0?)(\d+))?\}", pattern)
-    if not m:
-        return f"{pattern}{n:05d}"
-    width = int(m.group(2) or 0)
-    number = str(n).zfill(width) if m.group(1) else str(n)
-    return pattern[: m.start()] + number + pattern[m.end():]
+    def number(m: Any) -> str:
+        width = m.group(1)
+        # no file name is longer than 255
+        return str(n).zfill(min(int(width), 255)) if width and width.startswith("0") else str(n)
+
+    name, placed = _re.subn(r"\{n(?::(\d+))?\}", number, pattern)
+    return name if placed else f"{pattern}{n:05d}"
+
+
+def check_pattern(pattern: str, ext: str) -> None:
+    """Refuse a part name pattern that cannot name files here: one with folders (parts
+    are named, not placed), or one that makes names with characters this system does not
+    allow or longer than 255 bytes."""
+    where = f"the part name pattern '{pattern}{ext}'"
+    if "/" in pattern or "\\" in pattern or ".." in pattern or "/" in ext or "\\" in ext:
+        raise OptionsError(f"{where} must be a file name, without folders")
+    name = part_name(pattern, 0) + ext
+    bad = next((c for c in name if c < " " or (os.name == "nt" and c in '<>:"|?*')), None)
+    if bad is not None:
+        raise OptionsError(f"{where} makes file names with {bad!r}, which this system does not allow")
+    if len(name.encode("utf-8")) > 255:
+        raise OptionsError(f"{where} makes file names longer than 255 bytes")
 
 
 # ---------------------------------------------------------------------------------
