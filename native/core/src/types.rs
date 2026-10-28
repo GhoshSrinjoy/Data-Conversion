@@ -223,7 +223,8 @@ impl LogicalType {
                         return None;
                     }
                     LogicalType::Decimal { precision: p, scale: s }
-                } else if let Some(inner) = t.strip_prefix("timestamp[").and_then(|r| r.strip_suffix(']')) {
+                } else {
+                    let inner = t.strip_prefix("timestamp[").and_then(|r| r.strip_suffix(']'))?;
                     let mut parts = inner.splitn(2, ',');
                     let unit = match parts.next()?.trim() {
                         "s" => Unit::S,
@@ -241,8 +242,6 @@ impl LogicalType {
                         }
                     });
                     LogicalType::Timestamp { unit, tz }
-                } else {
-                    return None;
                 }
             }
         })

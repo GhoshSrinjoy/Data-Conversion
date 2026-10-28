@@ -97,8 +97,9 @@ pub fn detect_encoding(sample: &[u8], complete: bool) -> (&'static str, bool) {
     // BOM-less UTF-16: ASCII text has a NUL in every other byte.
     if sample.len() >= 64 {
         let pairs = sample.len() / 2;
-        let odd_nul = sample.chunks_exact(2).filter(|p| p[1] == 0 && p[0] != 0).count();
-        let even_nul = sample.chunks_exact(2).filter(|p| p[0] == 0 && p[1] != 0).count();
+        let (units, _) = sample.as_chunks::<2>();
+        let odd_nul = units.iter().filter(|p| p[1] == 0 && p[0] != 0).count();
+        let even_nul = units.iter().filter(|p| p[0] == 0 && p[1] != 0).count();
         if odd_nul * 10 > pairs * 7 {
             return ("utf-16le", false);
         }
@@ -377,7 +378,7 @@ pub fn sniff(raw: &[u8], complete: bool, opts: &SniffOptions) -> Result<CsvDiale
         Some(d) => (d, 1.0),
         None => {
             let mut best = (b',', 0.0f64);
-            for cand in [b',', b'\t', b';', b'|', b'^', b'~', b':'] {
+            for cand in *b",\t;|^~:" {
                 let s = sample_records(&text, Dialect { delimiter: cand, ..base }, LIMIT, complete);
                 let (mut score, _) = field_count_score(&s.rows);
                 if cand == b'\t' && tsv_hint {

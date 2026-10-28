@@ -616,7 +616,7 @@ mod tests {
             let len = (next() % 40) as usize + if round % 100 == 0 { 2000 } else { 0 };
             let buf: Vec<u8> = (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
             for d in &dialects {
-                for term in [b'\n', b'\r'] {
+                for term in *b"\n\r" {
                     assert_eq!(
                         scan_end(&buf, d, term),
                         scan_end_full(&buf, d, term),

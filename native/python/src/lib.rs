@@ -238,7 +238,7 @@ fn le_chunks<const N: usize>(data: &[u8]) -> PyResult<impl Iterator<Item = [u8; 
     if !data.len().is_multiple_of(N) {
         return Err(NativeError::new_err(("invalid".to_string(), format!("buffer length must be a multiple of {N}"))));
     }
-    Ok(data.chunks_exact(N).map(|c| c.try_into().unwrap()))
+    Ok(data.as_chunks::<N>().0.iter().copied())
 }
 
 fn bitmap_from(valid: Option<&[u8]>) -> Option<Vec<bool>> {
