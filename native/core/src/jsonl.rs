@@ -18,8 +18,10 @@
 //! [`Error::Replan`]; the caller infers again from the whole file and starts over.
 //!
 //! Writing goes through arrow-json, except that non-finite floats are written as the
-//! strings above (JSON has no NaN), so they read back as floats, and dates and
-//! timestamps are written exactly as in CSV output.
+//! strings above (JSON has no NaN), so they read back as floats, dates and timestamps
+//! are written exactly as in CSV output, and text columns marked [`JSON_TEXT`] (numbers
+//! kept as text, mixed-type fields) are written as the JSON they hold, so a round trip
+//! through Parquet or Arrow gives back the same JSON.
 
 use std::borrow::Cow;
 use std::io::Read;
@@ -323,8 +325,22 @@ impl Plan {
             Plan::Text | Plan::NumText | Plan::Json => DataType::Utf8,
             Plan::Bool => DataType::Boolean,
             Plan::Struct(l) => DataType::Struct(l.fields()),
-            Plan::List(item) => DataType::List(Arc::new(Field::new("item", item.data_type(), true))),
+            Plan::List(item) => DataType::List(Arc::new(plan_field("item", item))),
         }
+    }
+}
+
+/// Field metadata of text columns that hold JSON: "number" (numbers kept as their
+/// text) or "value" (the JSON text of any value).
+pub const JSON_TEXT: &str = "dataconv.json";
+
+fn plan_field(name: &str, p: &Plan) -> Field {
+    let field = Field::new(name, p.data_type(), true);
+    let mark = |kind: &str| std::collections::HashMap::from([(JSON_TEXT.to_string(), kind.to_string())]);
+    match p {
+        Plan::NumText => field.with_metadata(mark("number")),
+        Plan::Json => field.with_metadata(mark("value")),
+        _ => field,
     }
 }
 
@@ -338,7 +354,7 @@ pub struct Layout {
 
 impl Layout {
     fn fields(&self) -> Fields {
-        self.names.iter().zip(&self.plans).map(|(n, p)| Field::new(n, p.data_type(), true)).collect()
+        self.names.iter().zip(&self.plans).map(|(n, p)| plan_field(n, p)).collect()
     }
 
     pub fn schema(&self) -> SchemaRef {
@@ -449,7 +465,7 @@ enum Builder {
     Text(StringBuilder, TextMode),
     Bool(BooleanBuilder),
     Struct(Arc<Layout>, Vec<Builder>, Vec<bool>),
-    List(Box<Builder>, Vec<i32>, Vec<bool>, DataType),
+    List(Box<Builder>, Vec<i32>, Vec<bool>, FieldRef),
 }
 
 /// A short description of a value that does not fit its column.
@@ -477,7 +493,9 @@ impl Builder {
             Plan::Json => Builder::Text(StringBuilder::new(), TextMode::Json),
             Plan::Bool => Builder::Bool(BooleanBuilder::new()),
             Plan::Struct(l) => Builder::Struct(l.clone(), l.plans.iter().map(Builder::new).collect(), Vec::new()),
-            Plan::List(item) => Builder::List(Box::new(Builder::new(item)), vec![0], Vec::new(), item.data_type()),
+            Plan::List(item) => {
+                Builder::List(Box::new(Builder::new(item)), vec![0], Vec::new(), Arc::new(plan_field("item", item)))
+            }
         }
     }
 
@@ -581,12 +599,7 @@ impl Builder {
                 let values = child.finish()?;
                 let offsets = OffsetBuffer::new(ScalarBuffer::from(std::mem::replace(offsets, vec![0])));
                 let nulls = NullBuffer::from(std::mem::take(valid));
-                Arc::new(ListArray::try_new(
-                    Arc::new(Field::new("item", item.clone(), true)),
-                    offsets,
-                    values,
-                    Some(nulls),
-                )?)
+                Arc::new(ListArray::try_new(item.clone(), offsets, values, Some(nulls))?)
             }
         })
     }
@@ -811,6 +824,23 @@ pub fn read_text(text: &[u8]) -> Result<Option<RecordBatch>> {
 #[derive(Debug)]
 pub struct FloatText;
 
+/// Text that holds JSON, written as it is ("NaN"-like texts of a number column
+/// stay strings: JSON has no such numbers).
+struct RawJson<'a>(&'a arrow::array::StringArray, bool);
+
+impl Encoder for RawJson<'_> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        let v = self.0.value(idx);
+        if self.1 && nan_text(v).is_some() {
+            out.push(b'"');
+            out.extend_from_slice(v.as_bytes());
+            out.push(b'"');
+        } else {
+            out.extend_from_slice(v.as_bytes());
+        }
+    }
+}
+
 /// Dates and timestamps as JSON strings in the CSV output's format.
 struct TemporalEncoder<'a>(&'a dyn Array);
 
@@ -856,11 +886,18 @@ impl Encoder for FloatEncoder<'_> {
 impl EncoderFactory for FloatText {
     fn make_default_encoder<'a>(
         &self,
-        _field: &'a FieldRef,
+        field: &'a FieldRef,
         array: &'a dyn Array,
         _options: &'a EncoderOptions,
     ) -> std::result::Result<Option<NullableEncoder<'a>>, ArrowError> {
         Ok(match array.data_type() {
+            DataType::Utf8 => match field.metadata().get(JSON_TEXT).map(String::as_str) {
+                Some(kind @ ("number" | "value")) => Some(NullableEncoder::new(
+                    Box::new(RawJson(array.as_string::<i32>(), kind == "number")),
+                    array.nulls().cloned(),
+                )),
+                _ => None,
+            },
             DataType::Float32 | DataType::Float64 => {
                 Some(NullableEncoder::new(Box::new(FloatEncoder(array)), array.nulls().cloned()))
             }

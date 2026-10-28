@@ -352,6 +352,25 @@ fn jsonl_round_trips_losslessly() {
 }
 
 #[test]
+fn json_kept_as_text_round_trips_as_json() {
+    let d = dir("json-text");
+    let src = d.join("in.jsonl");
+    std::fs::write(&src, "{\"v\": 1e400, \"m\": 1, \"n\": [1, 2]}\n{\"v\": 1.5, \"m\": \"1\", \"n\": null}\n").unwrap();
+    for mid in ["mid.parquet", "mid.arrow"] {
+        let mid = d.join(mid);
+        convert(&src, &mid, &opts(), &NoHooks).unwrap();
+        let back = d.join("back.jsonl");
+        convert(&mid, &back, &opts(), &NoHooks).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&back).unwrap(),
+            "{\"v\":1e+400,\"m\":1,\"n\":[1,2]}\n{\"v\":1.5,\"m\":\"1\",\"n\":null}\n",
+            "{}",
+            mid.display()
+        );
+    }
+}
+
+#[test]
 fn json_output_writes_times_like_csv() {
     let d = dir("json-times");
     let src = d.join("t.csv");
