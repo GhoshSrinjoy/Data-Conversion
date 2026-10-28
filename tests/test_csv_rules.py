@@ -3,6 +3,7 @@ files, header names and the sniffer."""
 
 import io
 import json
+import warnings
 from pathlib import Path
 
 import pytest
@@ -76,7 +77,7 @@ def test_chunks_end_at_records_and_strays_end_at_their_line():
     assert b"".join(chunks) == data
     records = [(v, flags) for c in chunks for v, _, _, _, flags in _csvtok.tokenize(c, d)]
     # S4: the never-closed quote makes its own line a malformed record, and 3,ok survives
-    assert records[2] == ([b"2", b"open\n"], _csvtok.IRREGULAR | _csvtok.UNTERMINATED)
+    assert records[2] == ([b"2", b"open"], _csvtok.IRREGULAR | _csvtok.UNTERMINATED)
     assert records[3] == ([b"3", b"ok"], 0)
 
 
@@ -86,14 +87,24 @@ def test_stray_quotes_are_malformed_rows(tmp_path, engine):
     put(src, 'id,a,note\n1,x,ok\n10,a,"note10\n11,b,fine\n15,b,note"15\n16,d,end\n17,e,"unclosed\n18,f,last\n')
     out = tmp_path / "s.jsonl"
     r = dc.convert(src, out, engine=engine)
-    assert [x["id"] for x in rows(out)] == [1, 16, 18]
+    # S4c: a stray quote that pairs with a later quote followed by text (15) costs its
+    # own line only, like one that is never closed (17); the later quote is literal
+    assert [x["id"] for x in rows(out)] == [1, 11, 15, 16, 18]
+    assert rows(out)[2]["note"] == 'note"15'
     assert r.bad_rows == 2
-    # S4b: the pairing of a stray quote with a later one spans lines 10-15 (3 lines)
-    assert any("2 malformed rows (4 lines) moved to" in w for w in r.warnings), r.warnings
+    assert any("2 malformed rows moved to" in w for w in r.warnings), r.warnings
     rejected = Path(r.quarantine).read_text(encoding="utf-8")
-    assert rejected == 'id,a,note\n10,a,"note10\n11,b,fine\n15,b,note"15\n17,e,"unclosed\n'
-    assert dc.count(src, engine=engine) == 5  # records: rows and malformed ones
+    assert rejected == 'id,a,note\n10,a,"note10\n17,e,"unclosed\n'
+    assert dc.count(src, engine=engine) == 7  # records: rows and malformed ones
     assert r.irregular_records == 2
+    # a stray paired with a quote that ends a field is valid CSV: one record over the
+    # lines between them (here of the wrong width)
+    lines = [f"{i},name{i},{i}" for i in range(20)]
+    lines[3], lines[8] = '3,"name3,3', '8,name8,8"'
+    put(src, "id,name,v\n" + "\n".join(lines) + "\n")
+    r = dc.convert(src, out, engine=engine, overwrite=True)
+    assert (r.rows, r.bad_rows) == (14, 1)
+    assert any("1 malformed rows (6 lines)" in w for w in r.warnings), r.warnings
 
 
 @pytest.mark.parametrize("engine", ENGINES)
@@ -311,13 +322,6 @@ def _exact_scan_end(buf, d):
     return None, open_, irregular
 
 
-def _exact_count(buf, d):
-    bounds, _, _ = _csvtok._regions(buf, d)
-    nl, cr = d.nl, d.cr
-    terms = sum(buf.count(nl, s, e) + buf.count(cr, s, e) - buf.count(cr + nl, s, e) for s, e in zip(bounds[::2], bounds[1::2]))
-    return terms + (1 if buf and buf[-1:] not in (nl, cr) else 0)
-
-
 def _random_csv(rng, delim):
     fields = [
         "a",
@@ -362,7 +366,7 @@ def test_fast_scan_equals_the_exact_scan(monkeypatch):
             d = _csvtok.Dialect(delim, '"', None, True, "\n", text)
             buf = s if text else s.encode()
             assert _csvtok.scan_end(buf, d) == _exact_scan_end(buf, d), (s, text)
-            assert _csvtok.count_records(buf, d) == _exact_count(buf, d), (s, text)
+            assert _csvtok.count_records(buf, d) == len(list(_csvtok.tokenize(buf, d))), (s, text)
             end = rng.randint(0, len(buf))
             assert _csvtok.scan_end(buf, d, end) == _exact_scan_end(buf[:end], d), (s, text, end)
 
@@ -506,9 +510,165 @@ def test_a_second_pass_reuses_the_chunks_cut(monkeypatch):
     d = _csvtok.Dialect(",", '"', None, True, text=False)
     data = b"a,b\n" + b"".join(b'%d,"x\ny"\n' % i for i in range(5000)) + b'9,"never\n10,z\n'
     known = {}
-    first = [(c, ch.irregular, ch.forced, ch.stray) for ch in [_csvtok.Chunker(io.BytesIO(data), 4096, d, known=known)]
-             for c in ch]
+    first = [
+        (c, ch.irregular, ch.forced, ch.stray) for ch in [_csvtok.Chunker(io.BytesIO(data), 4096, d, known=known)] for c in ch
+    ]
     assert b"".join(c for c, _, _, _ in first) == data and len(known) == len(first) > 2
     monkeypatch.setattr(_csvtok, "scan_end", lambda *a, **k: pytest.fail("scanned again"))
     ch = _csvtok.Chunker(io.BytesIO(data), 4096, d, known=known)
     assert [(c, ch.irregular, ch.forced, ch.stray) for c in ch] == first
+
+
+def test_chunks_hold_the_records_the_whole_data_holds():
+    # stray quotes of every kind (never closed, paired across lines with text after the
+    # closing quote, paired with a quote that ends a field) and doubled or escaped
+    # quotes: whatever the chunk size, the records are those of the data read whole
+    import random
+
+    rng = random.Random(0x2545F4914F6CDD1D)
+    alphabet = b'ab,,""\n\n\r\\'
+    dialects = [_csvtok.Dialect(text=False), _csvtok.Dialect(",", '"', BS, False, text=False)]
+    for rnd in range(600):
+        n = rng.randrange(60) + (600 if rnd % 50 == 0 else 0)
+        buf = bytes(rng.choice(alphabet) for _ in range(n))
+        for d in dialects:
+            whole = [(s, e) for _, s, e, _, _ in _csvtok.tokenize(buf, d)]
+            for size in (1, 2, 3, 5, 8, 16, 64):
+                chunker = _csvtok.Chunker(io.BytesIO(buf), size, d)
+                chunked = []
+                for chunk in chunker:
+                    at = chunker.offset - len(chunk)
+                    chunked += [(at + s, at + e) for _, s, e, _, _ in _csvtok.tokenize(chunk, d)]
+                assert chunked == whole, (size, d.escape, buf)
+
+
+def test_a_stray_quote_costs_one_row():
+    d = _csvtok.Dialect()
+    records = lambda text: [(v, f) for v, _, _, _, f in _csvtok.tokenize(text, d)]  # noqa: E731
+    stray = _csvtok.IRREGULAR | _csvtok.UNTERMINATED
+    # paired across lines with a quote that has text after it: the stray's own line only
+    assert records('10,"name10,20\n11,a,b\n12,"Smith, J"x,c\n') == [
+        (["10", "name10,20"], stray),
+        (["11", "a", "b"], 0),
+        (["12", "Smith, Jx", "c"], _csvtok.IRREGULAR),
+    ]
+    # never closed: in whole records its line, in a sample the rest of the data
+    assert records('1,"open\n2,x\n') == [(["1", "open"], stray), (["2", "x"], 0)]
+    assert [v for v, *_ in _csvtok.tokenize('1,"open\n2,x\n', d, partial=True)] == [["1", "open\n2,x\n"]]
+    # paired with a quote that ends a field: one record over the lines (valid CSV)
+    assert records('3,"name3,3\n4,a\n8,x"\n9,y\n') == [(["3", "name3,3\n4,a\n8,x"], 0), (["9", "y"], 0)]
+    # the closing quote is read again: here it opens the next record's field
+    assert records('1,"a\n"b",c\n') == [(["1", "a"], stray), (["b", "c"], 0)]
+    assert _csvtok.count_records('1,"a\n"b",c\n', d) == 2
+    assert _csvtok.count_records(b'a\n"x\n', _csvtok.Dialect(text=False)) == 2
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_stray_quotes_in_a_large_file(tmp_path, engine):
+    lines = ["id,name,note"] + [f"{i},name{i},note{i}" for i in range(20_000)]
+    lines[11] = '10,name10,"note10'  # a stray quote
+    lines[16] = '15,name15,note"15'  # a later quote with text after it
+    lines[251] = '250,"Smith250, John",note250'
+    src = tmp_path / "big.csv"
+    put(src, "\n".join(lines) + "\n")
+    out = tmp_path / "big.jsonl"
+    r = dc.convert(src, out, engine=engine, types="string")
+    assert (r.rows, r.bad_rows) == (19_999, 1), r.warnings
+    assert Path(r.quarantine).read_text(encoding="utf-8") == 'id,name,note\n10,name10,"note10\n'
+    got = rows(out)
+    assert got[14]["note"] == 'note"15' and got[249]["name"] == "Smith250, John"
+    assert dc.count(src, engine=engine) == 20_000
+    # a stray quote every 1000 rows, each pairing with the next: one row each
+    lines = ["id,name,note"] + [f'{i},"name{i},note{i}' if i % 1000 == 500 else f"{i},name{i},note{i}" for i in range(20_000)]
+    put(src, "\n".join(lines) + "\n")
+    r = dc.convert(src, out, engine=engine, types="string", overwrite=True)
+    assert (r.rows, r.bad_rows) == (19_980, 20), r.warnings
+    assert dc.count(src, engine=engine) == 20_000
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_a_byte_order_mark_is_never_data(tmp_path, engine):
+    src = tmp_path / "bom.csv"
+    out = tmp_path / "bom.jsonl"
+    src.write_bytes("﻿1,2\n3,4\n".encode("utf-16-le"))
+    dc.convert(src, out, engine=engine, header=False)
+    assert rows(out) == [{"column_1": 1, "column_2": 2}, {"column_1": 3, "column_2": 4}]
+    for label in ("utf_8", "UTF-8", "utf8"):
+        src.write_bytes(b"\xef\xbb\xbfa,b\n1,2\n")
+        dc.convert(src, out, engine=engine, encoding=label, header=False, overwrite=True)
+        assert rows(out)[0] == {"column_1": "a", "column_2": "b"}, label
+    src.write_bytes("﻿a,b\n1,2\n".encode("utf-16-le"))
+    dc.convert(src, out, engine=engine, encoding="utf-16-le", header=False, overwrite=True)
+    assert rows(out)[0] == {"column_1": "a", "column_2": "b"}
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_rejected_rows_keep_their_own_line_ending(tmp_path, engine):
+    src = tmp_path / "rej.csv"
+    put(src, "a,b\r\n1,2\r\n3\n4,5\r\n")
+    r = dc.convert(src, tmp_path / "rej.jsonl", engine=engine)
+    assert Path(r.quarantine).read_bytes() == b"a,b\n3\n"
+    # the whole record, whatever columns= keeps
+    put(src, "id,name,v\n1,ann,1.5\n2,bob\n")
+    r = dc.convert(src, tmp_path / "rej2.jsonl", engine=engine, columns=["v"])
+    assert Path(r.quarantine).read_text(encoding="utf-8") == "id,name,v\n2,bob\n"
+    with pytest.raises(dc.DataError, match="record with 2 fields where 3 were expected: 2,bob"):
+        dc.convert(src, tmp_path / "rej3.jsonl", engine=engine, bad_lines="error")
+    # the lines of a malformed record, as the native engine counts them: its line feeds,
+    # or its carriage returns when it holds no line feed
+    put(src, 'a,b\r\n1,"x\ry",z\r\n2,3\r\n')
+    r = dc.convert(src, tmp_path / "rej4.jsonl", engine=engine)
+    assert r.warnings == [f"1 malformed rows moved to {r.quarantine}"]
+    assert [_csvtok.count_lines(raw) for raw in ('1,"x\ry",z\r\n', "x\ry\r", "x\ny", "x", "")] == [1, 2, 2, 1, 1]
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_line_breaks_cannot_delimit_fields(tmp_path, engine):
+    src = tmp_path / "d.csv"
+    put(src, 'id,v\n1,"a,b"\n')
+    out = tmp_path / "d.csv.out.csv"
+    for option in (
+        {"delimiter": "\n"},
+        {"delimiter": "\\n"},
+        {"delimiter": "\r"},
+        {"delimiter": "\\r"},
+        {"quote": "\n"},
+        {"escape": "\r"},
+    ):
+        with pytest.raises(dc.OptionsError, match="a line break cannot be the delimiter, quote or escape character"):
+            dc.convert(src, out, engine=engine, **option)
+    for c, shown in (('"', "'\"'"), ("\n", "'\\\\n'"), ("\\r", "'\\\\r'")):
+        with pytest.raises(dc.OptionsError, match=f"{shown} cannot be the output delimiter: the file could not be read back"):
+            dc.convert(src, out, engine=engine, out_delimiter=c)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_dcz_input_in_a_whatwg_encoding(tmp_path, engine):
+    src = tmp_path / "in.csv"
+    src.write_bytes("a,b\n1,caf\xe9\n".encode("cp1252"))
+    packed = tmp_path / "in.dcz"
+    dc.compress(src, packed, engine="pure")
+    out = tmp_path / "out.jsonl"
+    dc.convert(packed, out, engine=engine, encoding="x-cp1252")
+    assert rows(out) == [{"a": 1, "b": "caf\xe9"}]
+
+
+@needs_arrow
+def test_feather_version_1_is_read_by_the_arrow_engine(tmp_path):
+    import pyarrow as pa
+    import pyarrow.feather as feather
+
+    src = tmp_path / "old.feather"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)  # pyarrow calls version 1 deprecated
+        feather.write_feather(pa.table({"x": [1, 2, 3], "s": ["a", None, "c"]}), str(src), version=1)
+    assert src.read_bytes()[:4] == b"FEA1"
+    out = tmp_path / "old.jsonl"
+    r = dc.convert(src, out)  # auto: only the arrow engine reads it
+    assert r.engine == "arrow" and rows(out) == [{"x": 1, "s": "a"}, {"x": 2, "s": None}, {"x": 3, "s": "c"}]
+    assert dc.head(src, 2)["rows"] == [["1", "a"], ["2", None]]
+    assert dc.count(src) == 3
+    assert dc.load(src).to_pylist()[2] == {"x": 3, "s": "c"}
+    renamed = tmp_path / "old.bin"  # found by its magic bytes too
+    renamed.write_bytes(src.read_bytes())
+    assert dc.convert(renamed, tmp_path / "old2.jsonl").rows == 3

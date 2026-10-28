@@ -235,10 +235,14 @@ and `"Infinity"`, and read back as floats.
 - **Stray quotes.** A quote inside a field (`55" screen`) is a literal
   character. A quote that is never closed costs only its own line: that line is
   a malformed row and parsing resumes on the next one, instead of the rest of
-  the file becoming one value. When a stray quote pairs up with a later one, the
-  lines between them become one rejected row, and the warning says how many
-  lines it holds. A genuine quoted field may run to 1 GiB; a quote still open
-  after that is taken to be a stray, and the report warns about it.
+  the file becoming one value. The same holds when a stray quote pairs up with a
+  later quote that has text after it (`"Smith, John"` further down), as a
+  quoted field spanning lines never does. Only a later quote that ends a field
+  (`55"` at the end of a value) closes it: the lines in between are then one
+  value, which is valid CSV. They become a rejected row unless that row happens
+  to have the right number of fields, and the warning says how many lines it
+  holds. A genuine quoted field may run to 1 GiB; a quote still open after that
+  is taken to be a stray, and the report warns about it.
 - **Encodings.** UTF-8 with or without BOM, UTF-16 and Windows-1252 are detected
   from samples. Invalid bytes found later in the file trigger an automatic
   re-read as Windows-1252. `--encoding latin-1` means ISO-8859-1 itself, where
@@ -260,15 +264,17 @@ and `"Infinity"`, and read back as floats.
   place only on success. Ctrl-C or an error leaves the destination untouched.
   `split` writes its parts into a private folder and publishes them together,
   so a failed or restarted split never leaves some parts behind.
-- **Readable everywhere.** Timestamps without fractional digits are stored in
-  Parquet as milliseconds and date64 values as dates, so every reader sees the
-  right type rather than bare integers.
+- **Readable everywhere.** Timestamps and times in seconds are stored in Parquet
+  as milliseconds, and date64 values as dates, so every reader sees the right
+  type rather than bare integers.
 - **Files from other tools.** Parquet and Arrow columns of any type become the
   same CSV and JSON text with every engine. Floats are written with the shortest
   digits that read back exactly (float32 and float16 in their own precision).
   Times are written at any unit and year, and structs, lists and maps become
-  JSON. A map stays an object even with repeated or non-text keys. pyarrow's
-  `timestamp[s]` columns keep their time zone.
+  JSON. A map stays an object even with repeated or non-text keys (read back,
+  JSON objects become structs, and a repeated key keeps its last value).
+  pyarrow's `timestamp[s]` columns keep their time zone. Feather version 1 files
+  are read by the arrow engine only.
 - **Verification.** `dataconv verify a b` compares contents across formats and
   reports the first differences; DCZ checks a CRC-32 per block and for the
   whole file.

@@ -70,12 +70,25 @@ def parse_char_option(value: Optional[str]) -> Optional[str]:
     the native engine reads it: '' for none, else a single ASCII character."""
     if value is None:
         return None
-    named = {"\\t": "\t", "tab": "\t", "TAB": "\t", "\\n": "\n", "space": " ", "none": "", "": ""}
+    named = {"\\t": "\t", "tab": "\t", "TAB": "\t", "\\n": "\n", "\\r": "\r", "space": " ", "none": "", "": ""}
     if value in named:
         return named[value]
     if len(value) != 1 or not value.isascii():
         raise OptionsError(f"{value!r} is not a single ASCII character (e.g. ',', ';', '|', 'tab' or 'none')")
     return value
+
+
+def check_dialect_chars(delimiter: Optional[str], quote: Optional[str], escape: Optional[str]) -> None:
+    """Refuse a line break as the delimiter, quote or escape character (records could
+    not be told apart), as the native engine does."""
+    if any(c in ("\n", "\r") for c in (delimiter, quote, escape)):
+        raise OptionsError("a line break cannot be the delimiter, quote or escape character")
+
+
+def check_out_delimiter(delimiter: Optional[str]) -> None:
+    """Refuse an output delimiter the output could not be read back with."""
+    if delimiter in ('"', "\n", "\r"):
+        raise OptionsError(f"{delimiter!r} cannot be the output delimiter: the file could not be read back")
 
 
 def detect_encoding(sample: bytes, complete: bool = True) -> Tuple[str, bool]:
@@ -309,6 +322,7 @@ def sniff_bytes(
     q = '"' if quote is None else (parse_char_option(quote) or None)
     has_quotes = bool(q) and q in text
     esc = (parse_char_option(escape) or None) if escape is not None else _backslash_escape(text, q)
+    check_dialect_chars(parse_char_option(delimiter) if delimiter else None, q, esc)
     tsv_hint = (extension or "").lower().lstrip(".") in ("tsv", "tab")
 
     def lone() -> Optional[str]:

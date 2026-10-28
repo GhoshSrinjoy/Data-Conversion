@@ -37,8 +37,16 @@ def _progress(arg: ProgressArg, label: str) -> Tuple[Optional[Callable[[int, int
     return None, None
 
 
-def _engine_for(engine: str, src_fmt: str, dst_fmt: str, src_comp: Optional[str], dst_comp: Optional[str]) -> str:
+def _engine_for(engine: str, src_fmt: str, dst_fmt: str, src_comp: Optional[str], dst_comp: Optional[str],
+                src: Optional[Path] = None) -> str:
+    if engine == "auto" and src is not None and _feather_v1(src, src_fmt):
+        engine = "arrow"  # only pyarrow reads Feather version 1
     return engines.choose(engine, src_fmt, dst_fmt, src_comp, dst_comp)
+
+
+def _feather_v1(path: Path, fmt: str) -> bool:
+    """A Feather version 1 file (which only the arrow engine reads) when pyarrow is there."""
+    return fmt == "ipc" and "arrow" in engines.installed() and formats.is_feather_v1(path)
 
 
 def _check_input(path: Path) -> None:
@@ -89,7 +97,7 @@ def convert(src: PathLike, dst: Optional[PathLike] = None, *, progress: Progress
     dst_fmt, dst_comp = formats.target(dst_path, o.to)
     if dst_path.exists() and dst_path.resolve() == src.resolve():
         raise OptionsError("source and destination are the same file")
-    engine = _engine_for(o.engine, src_fmt, dst_fmt, src_comp, dst_comp)
+    engine = _engine_for(o.engine, src_fmt, dst_fmt, src_comp, dst_comp, src)
     callback, bar = _progress(progress, f"{src.name} -> {dst_path.name}")
     try:
         if engine == "native":
@@ -217,7 +225,7 @@ def split(src: PathLike, out_dir: PathLike, *, rows: Optional[int] = None, size:
     o = ConvertOptions.build(to=fmt, **options)
     ext = extension or formats.FORMATS[fmt].extensions[0]
     check_pattern(pattern, ext)
-    engine = engines.choose(o.engine, src_fmt, fmt, src_comp, None)
+    engine = _engine_for(o.engine, src_fmt, fmt, src_comp, None, src)
     callback, bar = _progress(progress, f"split {src.name}")
     try:
         if engine == "native":
@@ -495,6 +503,8 @@ def load(path: PathLike, **options: Any) -> Any:
 def _read_ipc(pa: Any, path: Path) -> Any:
     """An Arrow IPC file or stream, read into memory (not a memory map, so the file can
     be deleted afterwards)."""
+    if formats.is_feather_v1(path):
+        return arrow_engine.read_feather_v1(path)
     with pa.OSFile(str(path), "rb") as f:
         try:
             return pa.ipc.open_file(f).read_all()
@@ -840,6 +850,8 @@ def _inspect_engine(path: Path, o: ConvertOptions) -> Tuple[str, str]:
     _check_input(path)
     fmt, comp = formats.detect(path, o.source_format)
     installed = engines.installed()
+    if o.engine == "auto" and _feather_v1(path, fmt):
+        return "arrow", fmt
     for candidate in installed:
         if o.engine not in ("auto", candidate):
             continue
@@ -881,6 +893,8 @@ def info(path: PathLike, *, exact: bool = False, **options: Any) -> Dict[str, An
 
 def head(path: PathLike, n: int = 10, **options: Any) -> Dict[str, Any]:
     """The first ``n`` rows as text: {"columns": [...], "types": [...], "rows": [[...], ...]}."""
+    if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+        raise OptionsError(f"head needs a number of rows of 0 or more, not {n!r}")
     p = Path(path)
     o = ConvertOptions.build(**options)
     engine, fmt = _inspect_engine(p, o)

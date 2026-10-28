@@ -310,11 +310,77 @@ def open_binary(path: os.PathLike[str] | str) -> IO[bytes]:
     raise FormatError(f"unsupported compression {compression!r}")
 
 
+def is_utf8(encoding: str) -> bool:
+    """Whether an encoding label names UTF-8 (in any spelling)."""
+    try:
+        return codecs.lookup(python_codec(encoding)).name in ("utf-8", "utf-8-sig")
+    except LookupError:
+        return False
+
+
+def native_label(encoding: str) -> str:
+    """The label the native engine is given for a Python encoding name."""
+    key = encoding.lower()
+    return NATIVE_ENCODINGS.get(key, key)
+
+
+class _NoBom(io.TextIOBase):
+    """A text stream without the byte order mark it starts with (codecs such as
+    utf-16-le keep it as a character)."""
+
+    def __init__(self, inner: IO[str]) -> None:
+        super().__init__()
+        self.inner = inner
+        self.first = True
+
+    @property
+    def buffer(self) -> Any:
+        return getattr(self.inner, "buffer", None)
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size: Optional[int] = -1) -> str:
+        data = self.inner.read(size)
+        if self.first:
+            self.first = False
+            if data[:1] == "﻿":
+                data = data[1:] or self.inner.read(size)
+        return data
+
+    def readline(self, size: Optional[int] = -1) -> str:  # type: ignore[override]
+        line = self.inner.readline(size)
+        if self.first:
+            self.first = False
+            if line[:1] == "﻿":
+                line = line[1:] or self.inner.readline(size)
+        return line
+
+    def close(self) -> None:
+        if not self.closed:
+            self.inner.close()
+        super().close()
+
+
+def text_stream(binary: IO[bytes], encoding: str) -> IO[str]:
+    """A text stream of ``binary`` in an encoding label (as :func:`python_codec` reads
+    it), without a leading byte order mark in any UTF encoding."""
+    encoding = python_codec(encoding)
+    name = codecs.lookup(encoding).name
+    enc = "utf-8-sig" if name == "utf-8" else encoding
+    text = io.TextIOWrapper(binary, encoding=enc, errors=text_errors(enc), newline="")
+    if name in ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"):
+        return _NoBom(text)  # type: ignore[return-value]
+    return text
+
+
 def open_text(path: os.PathLike[str] | str, encoding: str) -> IO[str]:
     binary = open_binary(path)
-    encoding = python_codec(encoding)
-    enc = "utf-8-sig" if encoding.lower() in ("utf-8", "utf8") else encoding
-    return io.TextIOWrapper(binary, encoding=enc, errors=text_errors(enc), newline="")
+    try:
+        return text_stream(binary, encoding)
+    except BaseException:
+        binary.close()
+        raise
 
 
 def open_output(path: os.PathLike[str] | str, compression: Optional[str], level: Optional[int] = None) -> IO[bytes]:

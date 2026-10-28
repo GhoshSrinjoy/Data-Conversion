@@ -30,7 +30,6 @@ end of its record.
 
 from __future__ import annotations
 
-import io
 import re
 from typing import Any, Iterator, List, Optional, Tuple
 
@@ -49,10 +48,9 @@ MAX_FAST = 1 << 20
 # Record terminator codes (the same numbering as the native tokenizer and DCZ).
 LF, CRLF, CR, EOF = 0, 1, 2, 3
 #: Record flags
-IRREGULAR = 1  # a quoted field with text after its closing quote, or never closed
-UNTERMINATED = 2  # a quote that is never closed: the record is malformed
-SPANNING = 4  # text after the closing quote of a field that spans lines: malformed too
-MALFORMED = UNTERMINATED | SPANNING
+IRREGULAR = 1  # a quoted field with text after its closing quote, or a stray quote
+UNTERMINATED = 2  # a stray quote (never closed, or paired across lines): the record is malformed
+MALFORMED = UNTERMINATED
 
 
 class Dialect:
@@ -240,6 +238,14 @@ def _regions(
                     continue
                 if c not in starts:
                     irregular = True
+                    # text after a closing quote of a field that spans lines: the quote at
+                    # j was a stray, literal, and its line ends the record; the scan
+                    # resumes on the next line (the closing quote is scanned again)
+                    t = d.lines.search(buf, j + 1, k)
+                    if t is not None:
+                        bounds += (j, t.end())
+                        pos = search = t.end()
+                        break
             pos = search = after
             break
 
@@ -432,16 +438,27 @@ def may_hold_blank(buf: Any, d: Dialect, start: int = 0, end: Optional[int] = No
 
 
 def count_records(buf: Any, d: Dialect) -> int:
-    """Records in ``buf`` (whole records): terminators outside quotes, plus a last
-    record without one."""
+    """Records in ``buf`` (whole records), as :func:`tokenize` splits them: terminators
+    outside quotes, plus a last record without one."""
     nl, cr = d.nl, d.cr
     crlf = cr + nl
-    start, terms = regular_run(buf, d, 0, CUT_WINDOW, count=True)
-    bounds, _, _ = _regions(buf, d, start)
-    for k in range(0, len(bounds), 2):
-        s, e = bounds[k], bounds[k + 1]
-        terms += buf.count(nl, s, e) + buf.count(cr, s, e) - buf.count(crlf, s, e)
-    return terms + (1 if buf and buf[-1:] not in (nl, cr) else 0)
+    n = len(buf)
+    total = pos = 0
+    while True:
+        start, terms = regular_run(buf, d, pos, CUT_WINDOW, count=True)
+        bounds, open_, _ = _regions(buf, d, start)
+        for k in range(0, len(bounds), 2):
+            s, e = bounds[k], bounds[k + 1]
+            terms += buf.count(nl, s, e) + buf.count(cr, s, e) - buf.count(crlf, s, e)
+        total += terms
+        if open_ is None:
+            return total + (1 if n > pos and buf[-1:] not in (nl, cr) else 0)
+        # a quote never closed: a stray, whose record ends with its own line
+        t = d.lines.search(buf, open_ + 1)
+        total += 1
+        if t is None or t.end() >= n:
+            return total
+        pos = t.end()
 
 
 class Chunker:
@@ -566,13 +583,41 @@ class Chunker:
 Record = Tuple[List[Any], int, int, int, int]  # (values, start, end, terminator, flags)
 
 
-def tokenize(data: Any, d: Dialect, start: int = 0) -> Iterator[Record]:
+def _unescape(content: Any, d: Dialect) -> Any:
+    """The value of a quoted field's raw content: escape sequences and doubled quotes
+    resolved (a lone escape at the very end stays)."""
+    q, esc, dq = d.quote, d.escape, d.double_quote
+    if esc is None:
+        return content.replace(q + q, q) if dq else content
+    out = []
+    i = seg = 0
+    n = len(content)
+    while i < n:
+        c = content[i : i + 1]
+        if c == esc and i + 1 < n:
+            out.append(content[seg:i])
+            out.append(content[i + 1 : i + 2])
+            i = seg = i + 2
+        elif c == q and dq and content[i + 1 : i + 2] == q:
+            out.append(content[seg:i])
+            out.append(q)
+            i = seg = i + 2
+        else:
+            i += 1
+    out.append(content[seg:])
+    return d.empty.join(out)
+
+
+def tokenize(data: Any, d: Dialect, start: int = 0, partial: bool = False) -> Iterator[Record]:
     """Records of ``data`` (whole records, as the :class:`Chunker` cuts them).
 
     A value is the field's text with escape sequences resolved; an empty unquoted
-    field is None and a quoted empty field is ``""``.  A quoted field that is never
-    closed swallows the rest of ``data`` and marks the record UNTERMINATED; a quoted
-    field spanning lines with text after its closing quote marks it SPANNING."""
+    field is None and a quoted empty field is ``""``.  Stray quotes make a record
+    UNTERMINATED (malformed), and cost their own line only: a quoted field that is
+    never closed ends with its line, and so does one that spans lines and has text
+    after its closing quote (a stray quote paired with a later one); the next line
+    starts a record.  In a ``partial`` sample, which may end inside a record, a quote
+    left open may close beyond the data: its field takes the rest of it."""
     n = len(data)
     q, delim, esc, dq, doubled = d.quote, d.delimiter, d.escape, d.double_quote, d.doubled
     qq = q * 2 if q is not None else None
@@ -597,7 +642,7 @@ def tokenize(data: Any, d: Dialect, start: int = 0) -> Iterator[Record]:
         flags = 0
         while True:
             if data[pos : pos + 1] == q:
-                i = seg = pos + 1
+                content = i = seg = pos + 1
                 parts: List[Any] = []
                 closing = -1
                 while True:
@@ -628,24 +673,32 @@ def tokenize(data: Any, d: Dialect, start: int = 0) -> Iterator[Record]:
                         continue
                     closing = k
                     break
-                if closing < 0:
-                    # never closed: the field swallows the rest of the data
+                after = closing + 1
+                text_after = closing >= 0 and after < n and data[after : after + 1] not in starts
+                stray = None if closing >= 0 and not text_after else lines.search(data, content, closing if closing >= 0 else n)
+                if closing < 0 and partial:
+                    # never closed in a sample: the field may close beyond the data
                     parts.append(data[seg:n])
                     values.append(empty.join(parts))
                     flags |= IRREGULAR | UNTERMINATED
                     pos = n
                     break
+                if closing < 0 or stray is not None:
+                    # a stray quote, never closed or paired across lines with a quote that has
+                    # text after it: the field, and the record, end with the stray's own line
+                    end = stray.start() if stray is not None else n
+                    values.append(_unescape(data[content:end], d))
+                    flags |= IRREGULAR | UNTERMINATED
+                    pos = end
+                    break  # the record ends at that line break (or the end)
                 parts.append(data[seg:closing])
                 value = empty.join(parts)
-                after = closing + 1
-                if after < n and data[after : after + 1] not in starts:
+                if text_after:
                     # text after the closing quote stays with the field
                     mm = stop.search(data, after)
                     k = mm.start() if mm else n
                     value += data[after:k]
                     flags |= IRREGULAR
-                    if data.find(nl, pos, closing) >= 0 or data.find(d.cr, pos, closing) >= 0:
-                        flags |= SPANNING
                     pos = k
                 else:
                     pos = after
@@ -696,10 +749,11 @@ def is_blank(values: List[Any]) -> bool:
 
 
 def count_lines(raw: Any) -> int:
-    """Physical lines a record's text spans."""
+    """Physical lines a record's text spans, counted as the native engine counts them:
+    its line feeds, or its carriage returns when it holds no line feed."""
     nl, cr = ("\n", "\r") if isinstance(raw, str) else (b"\n", b"\r")
-    breaks = raw.count(nl) + raw.count(cr) - raw.count(cr + nl)
-    return breaks + (0 if raw.endswith((nl, cr)) else 1)
+    breaks = raw.count(nl) or raw.count(cr)
+    return max(1, breaks + (0 if raw.endswith((nl, cr)) else 1))
 
 
 def skip_records(data: Any, d: Dialect, count: int) -> Tuple[int, int]:
@@ -718,19 +772,17 @@ def skip_records(data: Any, d: Dialect, count: int) -> Tuple[int, int]:
 def sample_records(text: str, d: Dialect, limit: int, complete: bool) -> Tuple[List[List[str]], List[int], int]:
     """Records of a sniffing sample as lists of strings: (rows, terminator counts by
     code, longest record).  A sample that is the whole file is split exactly as a
-    conversion splits it (a never-closed quote ends its record with its line); from a
-    sample cut off by its size, the last record is dropped."""
+    conversion splits it (a stray quote costs its own line); in a sample cut off by its
+    size a quote left open may close beyond it, and the last record is dropped."""
     rows: List[List[str]] = []
     terms = [0, 0, 0, 0]
     longest = 0
-    chunks = Chunker(io.StringIO(text), len(text) + 1, d) if complete else [text]
-    for chunk in chunks:
-        for values, s, e, term, _ in tokenize(chunk, d):
-            if term == EOF and not complete:
-                break
-            terms[term] += 1
-            longest = max(longest, e - s)
-            rows.append([v if v is not None else "" for v in values])
-            if len(rows) >= limit:
-                return rows, terms, longest
+    for values, s, e, term, _ in tokenize(text, d, partial=not complete):
+        if term == EOF and not complete:
+            break
+        terms[term] += 1
+        longest = max(longest, e - s)
+        rows.append([v if v is not None else "" for v in values])
+        if len(rows) >= limit:
+            break
     return rows, terms, longest

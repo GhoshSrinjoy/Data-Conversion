@@ -93,6 +93,19 @@ def split_name(path: os.PathLike) -> Tuple[str, Optional[str], Optional[str]]:
     return stem, fmt, compression
 
 
+#: The magic bytes of a Feather version 1 file (an Arrow file before the IPC format;
+#: only pyarrow's feather module reads it)
+FEATHER_V1 = b"FEA1"
+
+
+def is_feather_v1(path: os.PathLike) -> bool:
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == FEATHER_V1
+    except OSError:
+        return False
+
+
 def _magic(path: Path) -> Tuple[Optional[str], Optional[str]]:
     try:
         with open(path, "rb") as f:
@@ -101,7 +114,7 @@ def _magic(path: Path) -> Tuple[Optional[str], Optional[str]]:
         return None, None
     if head.startswith(b"PAR1"):
         return "parquet", None
-    if head.startswith(b"ARROW1"):
+    if head.startswith(b"ARROW1") or head.startswith(FEATHER_V1):
         return "ipc", None
     if head.startswith(b"\xff\xff\xff\xff") and len(head) >= 8:
         return "ipc", None

@@ -14,10 +14,11 @@ import io
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
+from itertools import islice
 from pathlib import Path
 from typing import IO, Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
-from .. import _compat, _csvtok, _io, dcz, infer
+from .. import _compat, _csvtok, _io, dcz, formats, infer
 from .._sniff import Dialect
 from .._util import atomic_output, prefetch
 from ..errors import DataError, FormatError
@@ -183,7 +184,7 @@ class CsvReader:
         # the record policy (blank lines, malformed rows, padding) of the pure engine
         self.src = pure.CsvSource(path, fmt, dialect, o, text_output=True)
         self.names = list(self.src.names)
-        self.utf8 = dialect.encoding.lower() in ("utf-8", "utf8", "utf-8-sig")
+        self.utf8 = _io.is_utf8(dialect.encoding)
         self.forced_at: Optional[int] = None  # a quote read as a stray only by its size
         self._cuts: Dict[int, Any] = {}  # chunks already cut, reused by the next pass (see Chunker)
 
@@ -243,6 +244,28 @@ class CsvReader:
                 break
         return rows, end
 
+    def _rejected_text(self, data: bytes, a: int, b: int, texts: List[str], btok: _csvtok.Dialect) -> List[str]:
+        """The original text of the records pyarrow rejected in ``data[a:b]`` (``texts``,
+        in order, without their line endings), each with its own line ending."""
+        run = data[a:b]
+        lines = run.splitlines(keepends=True)
+        out = []
+        if len(lines) == _csvtok.count_records(run, btok):  # every line is a record
+            i = 0
+            for text in texts:
+                want = text.encode("utf-8")
+                while i < len(lines) and lines[i].rstrip(b"\r\n") != want:
+                    i += 1
+                out.append(lines[i].decode("utf-8") if i < len(lines) else text + self.dialect.terminator)
+                i += 1
+            return out
+        # line breaks inside quoted fields: the tokenizer finds the records
+        ncols, wide = len(self.dialect.columns), len(self.dialect.columns) != 1
+        for values, start, end, _, _ in _csvtok.tokenize(run, btok):
+            if len(values) != ncols and not (wide and _csvtok.is_blank(values)):
+                out.append(run[start:end].decode("utf-8"))
+        return out
+
     def _rows_table(self, rows: List[List[Optional[str]]]) -> Any:
         return self._table([list(c) for c in zip(*rows)] if rows else [[] for _ in self.names])
 
@@ -260,19 +283,17 @@ class CsvReader:
         )
         btok = _csvtok.Dialect.of(d, text=False)
         python_only = d.escape is not None  # pyarrow reads escapes outside quotes too
-        terminator = d.terminator
         single = len(d.columns) == 1
 
         def read_run(data: bytes, a: int, b: int, records: Optional[int]) -> Any:
             """pyarrow's table of the regular records ``data[a:b]`` (``records`` of them
             when known, else counted when blank lines may have to be)."""
-            rejected = [0]
+            rejected: List[str] = []
+            widths: List[int] = []
 
-            def invalid(row: Any, src: pure.CsvSource = self.src, rejected: List[int] = rejected) -> str:
-                if self.o.bad_lines == "error":
-                    return "error"
-                src.bad.append(row.text + terminator)
-                rejected[0] += 1
+            def invalid(row: Any) -> str:
+                rejected.append(row.text)
+                widths.append(row.actual_columns)
                 return "skip"
 
             parse = pacsv.ParseOptions(
@@ -299,10 +320,15 @@ class CsvReader:
                 if "UTF8" in str(exc) or "utf8" in str(exc).lower():
                     raise UnicodeDecodeError("utf-8", b"", 0, 1, str(exc)) from None
                 raise DataError(str(exc)) from None
+            if rejected:
+                raws = self._rejected_text(data, a, b, rejected, btok)
+                if self.o.bad_lines == "error":
+                    raise DataError(pure.bad_record_message(raws[0], widths[0], len(d.columns), False))
+                self.src.bad.extend(raws)
             if not single and _csvtok.may_hold_blank(data, btok, a, b):  # records pyarrow skipped as empty lines
                 if records is None:
                     records = _csvtok.count_records(data[a:b], btok)
-                self.src.blank += records - table.num_rows - rejected[0]
+                self.src.blank += records - table.num_rows - len(rejected)
             return table
 
         with self._open() as f:
@@ -385,136 +411,27 @@ def _infer(reader: CsvReader, o: ConvertOptions, mode: str, full: bool) -> Tuple
 # ---------------------------------------------------------------------------------
 
 
-def _plain_json(v: Any) -> Any:
-    """A nested JSON value with its number literals as Python numbers, for pyarrow."""
-    if isinstance(v, pure.JsonNumber):
-        return float(v)
-    if isinstance(v, dict):
-        return {k: _plain_json(x) for k, x in v.items()}
-    if isinstance(v, list):
-        return [_plain_json(x) for x in v]
-    return v
-
-
-def _has_empty_struct(pa: Any, t: Any) -> bool:
-    if pa.types.is_struct(t):
-        return t.num_fields == 0 or any(_has_empty_struct(pa, t.field(i).type) for i in range(t.num_fields))
-    if pa.types.is_list(t) or pa.types.is_large_list(t) or pa.types.is_fixed_size_list(t):
-        return _has_empty_struct(pa, t.value_type)
-    return False
-
-
-def _unify(pa: Any, a: Any, b: Any) -> Any:
-    """The type that holds both (None when there is none)."""
-    if a is None or a == b:
-        return b
-    try:
-        if _compat.pyarrow_version() >= (14, 0, 0):
-            s = pa.unify_schemas([pa.schema([pa.field("v", a)]), pa.schema([pa.field("v", b)])], promote_options="permissive")
-        else:  # pragma: no cover - old pyarrow
-            s = pa.unify_schemas([pa.schema([pa.field("v", a)]), pa.schema([pa.field("v", b)])])
-        return s.field("v").type
-    except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError):
-        return None
-
-
-class _NestedTypes:
-    """Arrow types of nested JSON fields, unified over every value seen."""
-
-    def __init__(self, pa: Any) -> None:
-        self.pa = pa
-        self.types: Dict[str, Any] = {}
-        self.failed: Set[str] = set()
-        self.buf: Dict[str, List[Any]] = {}
-
-    def observe(self, name: str, value: Any) -> None:
-        if name in self.failed:
-            return
-        buf = self.buf.setdefault(name, [])
-        buf.append(_plain_json(value))
-        if len(buf) >= 65536:
-            self._flush(name)
-
-    def _flush(self, name: str) -> None:
-        pa = self.pa
-        values = self.buf.pop(name, [])
-        if not values or name in self.failed:
-            return
-        try:
-            t = pa.array(values).type
-        except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError, OverflowError, TypeError, ValueError):
-            self.failed.add(name)
-            return
-        unified = _unify(pa, self.types.get(name), t)
-        if unified is None:
-            self.failed.add(name)
-        else:
-            self.types[name] = unified
-
-    def type_of(self, name: str) -> Any:
-        for n in list(self.buf):
-            self._flush(n)
-        t = self.types.get(name)
-        if name in self.failed or t is None or _has_empty_struct(self.pa, t):
-            return None
-        return t
-
-
 def _json_batches(path: Path, fmt: str, o: ConvertOptions, batch_rows: int, full: bool,
-                  text_columns: Set[str], notes: List[str]) -> Tuple[Any, Iterator[Any]]:
-    """JSON and JSON Lines by the lossless JSON rules of the pure engine, as Arrow."""
+                  notes: List[str], sample: Optional[int] = None) -> Tuple[Any, Iterator[Any]]:
+    """JSON and JSON Lines by the lossless JSON rules every engine shares (see
+    :mod:`dataconv._jsonplan`), as Arrow: objects as structs, arrays as lists, text
+    holding numbers or JSON marked so."""
     pa = _pa()
-    nested = _NestedTypes(pa)
-    src = pure.JsonSource(path, fmt, o, full=full, nested=nested.observe)
+    src = pure.JsonSource(path, fmt, o, full=full, sample=sample)
     notes.extend(src.warnings)
-    hows = list(src.hows)
-    fields = []
-    for j, (name, ty, how) in enumerate(zip(src.names, src.types, src.hows)):
-        if how == "json":
-            t = None if name in text_columns else nested.type_of(name)
-            if t is None:
-                hows[j] = "json_text"
-                notes.append(f"column '{name}' mixes JSON types; values are stored as JSON text")
-                t = pa.string()
-        elif how in ("string", "number_text", "json_text"):
-            t = pa.string()
-        else:
-            t = ty.arrow()
-        # text that holds JSON is marked so, and JSON output writes it as that JSON again
-        mark = {"number_text": "number", "json_text": "value"}.get(hows[j])
-        fields.append(pa.field(name, t, metadata={pure.JSON_TEXT_KEY: mark} if mark else None))
-    schema = pa.schema(fields)
-    # JSON text for a nested column pyarrow cannot type: the source converts it so
-    src.hows = hows
-
-    def column(j: int, values: List[Any]) -> Any:
-        f = schema.field(j)
-        if hows[j] != "json":
-            return pa.array(values, f.type)
-        plain = [_plain_json(v) for v in values]
-        try:
-            fits = _unify(pa, f.type, pa.array(plain).type) == f.type
-            arr = pa.array(plain, f.type) if fits else None
-        except (pa.ArrowInvalid, pa.ArrowTypeError, pa.ArrowNotImplementedError, OverflowError, TypeError, ValueError):
-            arr = None
-        if arr is None:
-            # nested values the planned type would drop or mangle: widen the plan
-            bad = next((v for v in values if v is not None), None)
-            raise _Replan(f.name, pure.json_text(bad)[:80])
-        return arr
+    schema = pa.schema([p.field(pa, name) for name, p in zip(src.names, src.plans)])
 
     def batches() -> Iterator[Any]:
         rows = src.rows()
         while True:
-            buf = []
-            for r in rows:
-                buf.append(r)
-                if len(buf) >= batch_rows:
-                    break
+            buf = list(islice(rows, batch_rows))
             if not buf:
                 return
-            cols = list(zip(*buf))
-            yield pa.RecordBatch.from_arrays([column(j, list(c)) for j, c in enumerate(cols)], schema=schema)
+            if not len(schema):  # records without any key: rows without columns
+                yield pa.RecordBatch.from_struct_array(pa.array([{}] * len(buf), pa.struct([])))
+            else:
+                cols = [pa.array(list(c), schema.field(j).type) for j, c in enumerate(zip(*buf))]
+                yield pa.RecordBatch.from_arrays(cols, schema=schema)
             if len(buf) < batch_rows:
                 return
 
@@ -585,8 +502,23 @@ def _xlsx_batches(path: Path, o: ConvertOptions, batch_rows: int, full: bool, te
     return schema, more()
 
 
+def read_feather_v1(path: Path, columns: Optional[List[str]] = None) -> Any:
+    """A Feather version 1 file (from before the Arrow IPC format), which only pyarrow's
+    feather module reads (and calls deprecated: it is still read here)."""
+    import warnings
+
+    feather = _compat.require("pyarrow.feather", "reading Feather version 1", "arrow")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        try:
+            return feather.read_table(str(path), columns=columns or None)
+        except (_pa().ArrowInvalid, _pa().ArrowNotImplementedError, OSError) as exc:
+            raise FormatError(f"{path} is a Feather version 1 file this pyarrow cannot read: {exc}") from None
+
+
 def read_batches(path: Path, fmt: str, o: ConvertOptions, batch_rows: int = 65536, full: bool = False,
-                 text_columns: Optional[Set[str]] = None, notes: Optional[List[str]] = None) -> Tuple[Any, Iterator[Any]]:
+                 text_columns: Optional[Set[str]] = None, notes: Optional[List[str]] = None,
+                 sample: Optional[int] = None) -> Tuple[Any, Iterator[Any]]:
     """(schema, iterator of RecordBatches) for typed formats."""
     pa = _pa()
     cols = o.columns
@@ -597,6 +529,9 @@ def read_batches(path: Path, fmt: str, o: ConvertOptions, batch_rows: int = 6553
         pf = pq.ParquetFile(path)
         schema = pf.schema_arrow if not cols else pa.schema([pf.schema_arrow.field(c) for c in cols])
         return schema, pf.iter_batches(batch_size=batch_rows, columns=cols, use_threads=True)
+    if fmt == "ipc" and formats.is_feather_v1(path):
+        table = read_feather_v1(path, cols)
+        return table.schema, iter(table.to_batches(max_chunksize=batch_rows))
     if fmt == "ipc":
         source = pa.memory_map(str(path), "r")
         try:
@@ -622,7 +557,7 @@ def read_batches(path: Path, fmt: str, o: ConvertOptions, batch_rows: int = 6553
 
         return schema, stripes()
     if fmt in ("json", "jsonl"):
-        return _json_batches(path, fmt, o, batch_rows, full, text_columns, notes)
+        return _json_batches(path, fmt, o, batch_rows, full, notes, sample)
     if fmt == "xlsx":
         return _xlsx_batches(path, o, batch_rows, full, text_columns)
     raise FormatError(f"the arrow engine cannot read {fmt}")
@@ -840,7 +775,8 @@ class Writer:
     def write(self, batch: Any) -> None:
         if self._text is not None:
             schema = batch.schema
-            for row in zip(*(py_values(col, schema.field(j)) for j, col in enumerate(batch.columns))):
+            cols = [py_values(col, schema.field(j)) for j, col in enumerate(batch.columns)]
+            for row in zip(*cols) if cols else [()] * batch.num_rows:
                 self._text.write(row)
         elif self.fmt == "parquet":
             self._inner.write_batch(batch, row_group_size=self.row_group)
@@ -914,6 +850,7 @@ def convert(src: Path, dst: Path, src_fmt: str, dst_fmt: str, dst_comp: Optional
     types: List[infer.LogicalType] = []
     text_columns: Set[str] = set()
     chunk = max(4 << 20, min(plan.chunk_size * 8, 128 << 20))
+    first_notes: Optional[List[str]] = None  # CSV: the notes of the first plan, as the native engine reports them
     while True:
         reader = None
         notes: List[str] = []
@@ -921,6 +858,8 @@ def convert(src: Path, dst: Path, src_fmt: str, dst_fmt: str, dst_comp: Optional
             if dialect is not None:
                 reader = CsvReader(src, src_fmt, dialect, o, chunk)
                 types, notes = _infer(reader, o, mode, full)
+                if first_notes is None:
+                    first_notes = notes
                 names = reader.names
                 schema = pa.schema([pa.field(n, t.arrow()) for n, t in zip(names, types)])
                 pool = ThreadPoolExecutor(plan.threads)
@@ -976,6 +915,12 @@ def convert(src: Path, dst: Path, src_fmt: str, dst_fmt: str, dst_comp: Optional
             restarts += 1
             if restarts > len(text_columns) + 8:
                 raise DataError("could not settle on a schema") from None
+            if isinstance(r, pure._Restart) and r.reason == "json":
+                if full:
+                    raise DataError(r.value) from None
+                warnings.append(f"{r.value}; re-planned from a full scan")
+                full = True
+                continue
             if isinstance(r, _Replan):
                 what = f"column '{r.column}': value '{r.value}'"
             elif r.reason == "columns":
@@ -992,17 +937,18 @@ def convert(src: Path, dst: Path, src_fmt: str, dst_fmt: str, dst_comp: Optional
                 raise DataError(f"{what} does not fit any type") from None
         except UnicodeDecodeError:
             restarts += 1
-            if dialect is None or dialect.encoding not in ("utf-8", "utf8") or restarts > 3:
+            if dialect is None or _io.native_label(dialect.encoding) != "utf-8" or restarts > 3:
                 raise DataError("input is not valid in any supported encoding") from None
             warnings.append("input is not valid UTF-8; re-read as windows-1252")
             dialect.encoding = "cp1252"
     bad = reader.bad if reader is not None else []
+    found: List[str] = []  # what the conversion itself found
     if reader is not None:
         forced = reader.forced_at if reader.forced_at is not None else reader.src.forced_at
         if forced is not None:
-            warnings.append(_csvtok.forced_warning(forced))
+            found.append(_csvtok.forced_warning(forced))
     if dialect is not None:
-        quarantine.finish(reader.names, dialect.delimiter, bad, report, warnings)  # type: ignore[union-attr]
+        quarantine.finish(dialect.columns, dialect.delimiter, bad, report, found)  # whole records: every column
     report.rows = rows
     report.columns = len(schema.names)
     report.schema = ([(n, t.label) for n, t in zip(schema.names, types)] if dialect is not None
@@ -1011,7 +957,9 @@ def convert(src: Path, dst: Path, src_fmt: str, dst_fmt: str, dst_comp: Optional
     report.blank_lines = reader.src.blank if reader is not None else 0
     report.irregular_records = reader.src.irregular if reader is not None else 0
     report.restarts = restarts
-    report.warnings = notes + warnings
+    # in the native engine's order: CSV, the conversion's findings, then the first plan's
+    # notes and the restarts; other input, the restarts, then the final plan's notes
+    report.warnings = found + (first_notes or []) + warnings if dialect is not None else warnings + notes
     report.dialect = dialect.to_dict() if dialect else None
     report.bytes_out = dst.stat().st_size
     report.seconds = time.perf_counter() - started
@@ -1075,10 +1023,12 @@ def info(path: Path, fmt: str, o: ConvertOptions) -> Dict[str, Any]:
 
 
 def head(path: Path, n: int, fmt: str, o: ConvertOptions) -> Dict[str, Any]:
-    schema, batches = read_batches(path, fmt, o, batch_rows=max(1, n))
+    # JSON: the types of the first n records, as the native engine's head gives them
+    schema, batches = read_batches(path, fmt, o, batch_rows=max(1, n), sample=max(0, n))
     rows: List[List[Optional[str]]] = []
-    for b in batches:
-        for r in zip(*(py_values(c) for c in b.columns)):
+    for b in batches if n > 0 else ():  # a record beyond a JSON sample of none would re-plan
+        cols = [py_values(c) for c in b.columns]
+        for r in zip(*cols) if cols else [()] * b.num_rows:
             rows.append([pure.csv_text(v) for v in r])
             if len(rows) >= n:
                 break

@@ -19,7 +19,8 @@ from itertools import islice
 from pathlib import Path
 from typing import IO, Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
-from .. import _csvtok, _io, dcz, formats, infer
+from .. import _csvtok, _io, _jsonplan, dcz, formats, infer
+from .._jsonplan import JSON_TEXT_KEY, JsonInt, JsonNumber, JsonText, number_text  # noqa: F401  (pure's names)
 from .._sniff import Dialect, sniff, sniff_bytes
 from .._util import atomic_output
 from ..errors import DataError, FormatError, OptionsError, OutputExistsError
@@ -45,46 +46,8 @@ class _Restart(Exception):
 # Value formatting (identical to the native writers)
 # ---------------------------------------------------------------------------------
 
-_SPECIAL_FLOATS = {"NaN": math.nan, "Infinity": math.inf, "-Infinity": -math.inf}
-
-
-class JsonNumber(str):
-    """A JSON number literal kept exactly as written: every non-integer and ``-0``."""
-
-    __slots__ = ()
-
-
-class JsonInt(JsonNumber):
-    """An integer literal too long for any numeric type (kept as its text)."""
-
-    __slots__ = ()
-
-
-class JsonText(str):
-    """The JSON text of a value held in a text column (a field mixing JSON types, or
-    an Arrow column marked ``dataconv.json = value``): JSON output writes it as the
-    JSON it holds, CSV output as its text."""
-
-    __slots__ = ()
-
-
-#: Arrow field metadata of text columns that hold JSON: "number" (numbers kept as
-#: their text) or "value" (the JSON text of any value), as the native engine sets it
-JSON_TEXT_KEY = "dataconv.json"
-
+_SPECIAL_FLOATS = _jsonplan.NAN_TEXT
 _encode_str = json.encoder.encode_basestring  # json.dumps(s, ensure_ascii=False) of a str, without its set-up
-
-
-def number_text(text: str) -> str:
-    """A JSON number kept as text: as written, except that an exponent becomes a
-    lower-case ``e`` with an explicit sign (``1E5`` -> ``1e+5``), like the native engine."""
-    i = text.find("e")
-    if i < 0:
-        i = text.find("E")
-        if i < 0:
-            return str(text)
-    exp = text[i + 1 :]
-    return text[:i] + "e" + (exp if exp[:1] in ("+", "-") else "+" + exp)
 
 
 def _ryu_notation(shortest: str, top: int, bottom: int) -> str:
@@ -341,11 +304,24 @@ def _chunk_records(chunk: str, d: _csvtok.Dialect, pos: int, read: Any) -> Itera
                 break
 
 
+def bad_record_message(raw: str, fields: int, ncols: int, stray: bool) -> str:
+    """The error for a malformed record under bad_lines='error' (``raw``: its text, line
+    ending included; shown up to 200 bytes), as the native engine words it."""
+    b = raw.encode("utf-8", "surrogatepass")
+    shown = b[:200].decode("utf-8", "replace") if len(b) > 200 else raw
+    if stray:
+        return f"a quote is not closed where it should be: {shown}"
+    return f"record with {fields} fields where {ncols} were expected: {shown}"
+
+
 def _open_csv_text(path: Path, fmt: str, encoding: str) -> IO[str]:
     if fmt == "dcz":
-        enc = "utf-8-sig" if encoding.lower() in ("utf-8", "utf8") else encoding
         raw = io.BufferedReader(dcz.DczReader(path), 1 << 20)
-        return io.TextIOWrapper(raw, encoding=enc, errors=_io.text_errors(enc), newline="")
+        try:
+            return _io.text_stream(raw, encoding)
+        except BaseException:
+            raw.close()
+            raise
     return _io.open_text(path, encoding)
 
 
@@ -373,6 +349,7 @@ class CsvSource(Source):
         self.irregular = 0
         self.warnings = []
         self.forced_at: Optional[int] = None  # a quote read as a stray only by its size
+        self.notes: List[str] = []  # the planning notes reported (those of the first plan)
         self._cuts: Dict[int, Any] = {}  # chunks already cut, reused by the next pass (see Chunker)
         self._file: Optional[IO[str]] = None
 
@@ -428,12 +405,7 @@ class CsvSource(Source):
             if self.o.bad_lines == "pad" and n < self.ncols and not malformed:
                 values = values + [None] * (self.ncols - n)
             elif self.o.bad_lines == "error":
-                shown = chunk[start:end][:200]
-                if flags & _csvtok.UNTERMINATED:
-                    raise DataError(f"a quote is never closed: {shown!r}")
-                if malformed:
-                    raise DataError(f"a quoted field spanning lines has text after its closing quote: {shown!r}")
-                raise DataError(f"record with {n} fields where {self.ncols} were expected: {shown!r}")
+                raise DataError(bad_record_message(chunk[start:end], n, self.ncols, bool(malformed)))
             else:
                 self.bad.append(chunk[start:end])
                 return None
@@ -524,7 +496,13 @@ def _int_literal(text: str) -> Any:
     return JsonInt(text) if len(text) > 40 else int(text)
 
 
-_DECODER = json.JSONDecoder(parse_float=JsonNumber, parse_int=_int_literal, parse_constant=_SPECIAL_FLOATS.__getitem__)
+def _no_constant(name: str) -> Any:
+    raise ValueError(f"{name} is not a JSON value")  # bare NaN or Infinity
+
+
+_DECODER = json.JSONDecoder(parse_float=JsonNumber, parse_int=_int_literal, parse_constant=_no_constant)
+_JSON_SPACE = " \t\n\r"  # the only whitespace JSON knows
+_BLANK = b" \t\n\x0c\r"  # a JSON Lines line of only these is skipped, as the native engine skips it
 
 
 def _too_deep(v: Any) -> bool:
@@ -540,238 +518,44 @@ def _too_deep(v: Any) -> bool:
     return False
 
 
-class _Misfit(Exception):
-    """A JSON value does not fit the column's planned type."""
-
-
-class _JsonStats:
-    """What a JSON field holds, deciding its column type by the lossless rules shared
-    with the native engine."""
-
-    __slots__ = ("big", "fields", "float_ok", "frac_digits", "int_digits", "kinds", "lists", "negzero", "nonint",
-                 "plain", "specials")
-
-    def __init__(self) -> None:
-        self.kinds: set = set()  # str, num, bool, nested
-        self.specials = 0  # the strings "NaN", "Infinity" and "-Infinity"
-        self.big = False  # an integer beyond int64
-        self.nonint = False  # a non-integer literal, -0, or a NaN/Infinity constant
-        self.float_ok = True  # every number survives float64
-        self.plain = True  # every number is in plain notation (decimal is possible)
-        self.negzero = False  # -0 (decimal cannot keep the sign)
-        self.int_digits = 0
-        self.frac_digits = 0
-        self.fields = False  # an object with at least one field
-        self.lists = False
-
-    def observe(self, v: Any) -> None:
-        if v is None:
-            return
-        if v is True or v is False:
-            self.kinds.add("bool")
-        elif isinstance(v, JsonInt):
-            self.kinds.add("num")
-            self.big = True
-            self.float_ok = False
-            self.int_digits = max(self.int_digits, len(v.lstrip("-")))
-        elif isinstance(v, JsonNumber):
-            self.kinds.add("num")
-            self.nonint = True
-            info = infer.parse_float(v)
-            if info is None:
-                self.float_ok = self.plain = False
-                return
-            if not info.lossless:
-                self.float_ok = False
-            if not info.plain:
-                self.plain = False
-            if v.startswith("-") and info.value == 0:
-                self.negzero = True
-            self.int_digits = max(self.int_digits, info.int_digits)
-            self.frac_digits = max(self.frac_digits, info.frac_digits)
-        elif isinstance(v, int):
-            self.kinds.add("num")
-            if not infer.INT64_MIN <= v <= infer.INT64_MAX:
-                self.big = True
-            if abs(v) > (1 << 53):
-                self.float_ok = False
-            self.int_digits = max(self.int_digits, len(str(abs(v))))
-        elif isinstance(v, float):  # a bare NaN / Infinity constant
-            self.kinds.add("num")
-            self.nonint = True
-            self.plain = False
-        elif isinstance(v, str):
-            if v in _SPECIAL_FLOATS:
-                self.specials += 1
-            else:
-                self.kinds.add("str")
-        else:
-            self.kinds.add("nested")
-            if isinstance(v, dict):
-                self.fields = self.fields or bool(v)
-            else:
-                self.lists = True
-
-    def decide(self) -> Tuple[infer.LogicalType, str]:
-        """(type, how values are produced)."""
-        kinds = set(self.kinds)
-        if self.specials:
-            if kinds == {"num"}:
-                # numbers plus NaN / Infinity strings: floats when every number survives
-                # float64, else the numbers' text with the strings as written
-                if self.float_ok:
-                    return infer.LogicalType("float64"), "float64"
-                return infer.STRING, "number_text"
-            kinds.add("str")
-        if not kinds:
-            return infer.STRING, "string"
-        if len(kinds) > 1:
-            return infer.STRING, "json_text"
-        kind = kinds.pop()
-        if kind == "str":
-            return infer.STRING, "string"
-        if kind == "bool":
-            return infer.LogicalType("bool"), "bool"
-        if kind == "nested":
-            if not self.fields and not self.lists:
-                return infer.STRING, "json_text"  # objects that never have a field
-            return infer.LogicalType("json"), "json"
-        if not self.nonint:
-            if not self.big:
-                return infer.LogicalType("int64"), "int64"
-            if self.int_digits <= 38:
-                return infer.LogicalType("decimal", max(1, self.int_digits), 0), "decimal"
-            return infer.STRING, "number_text"
-        if self.float_ok:
-            return infer.LogicalType("float64"), "float64"
-        precision = self.int_digits + self.frac_digits
-        if self.plain and not self.negzero and precision <= 38:
-            return infer.LogicalType("decimal", max(1, precision), self.frac_digits), "decimal"
-        return infer.STRING, "number_text"
-
-    def mixed(self) -> bool:
-        return self.decide()[1] == "json_text" and (len(self.kinds | ({"str"} if self.specials else set())) > 1)
-
-
-def _json_converter(how: str, ty: infer.LogicalType) -> Callable[[Any], Any]:
-    """Value of a JSON field for a column produced ``how``; raises _Misfit for a value
-    the planned type cannot hold."""
-    if how == "json_text":
-        return lambda v: None if v is None else JsonText(json_text(v))
-    if how == "string":
-        def conv(v: Any) -> Any:
-            if v is None or (isinstance(v, str) and not isinstance(v, JsonNumber)):
-                return v
-            raise _Misfit
-    elif how == "bool":
-        def conv(v: Any) -> Any:
-            if v is None or v is True or v is False:
-                return v
-            raise _Misfit
-    elif how == "int64":
-        def conv(v: Any) -> Any:
-            if v is None or (type(v) is int and infer.INT64_MIN <= v <= infer.INT64_MAX):
-                return v
-            raise _Misfit
-    elif how == "float64":
-        def conv(v: Any) -> Any:
-            if v is None or type(v) is float:
-                return v
-            if isinstance(v, JsonNumber) and not isinstance(v, JsonInt):
-                info = infer.parse_float(v)
-                if info is not None and info.lossless:
-                    return info.value
-            elif type(v) is int and abs(v) <= (1 << 53):
-                return float(v)
-            elif isinstance(v, str) and v in _SPECIAL_FLOATS:
-                return _SPECIAL_FLOATS[v]
-            raise _Misfit
-    elif how == "decimal":
-        limit = 10**ty.precision
-        quant = Decimal(1).scaleb(-ty.scale)
-
-        def conv(v: Any) -> Any:
-            if v is None:
-                return None
-            if isinstance(v, JsonInt):
-                raise _Misfit
-            if isinstance(v, JsonNumber):
-                info = infer.parse_float(v)
-                if info is None or not info.plain or info.frac_digits > ty.scale or (v.startswith("-") and info.value == 0):
-                    raise _Misfit
-            elif type(v) is not int:
-                raise _Misfit
-            d = Decimal(v).quantize(quant, context=infer.DECIMAL_CONTEXT)
-            if d.scaleb(ty.scale, context=infer.DECIMAL_CONTEXT).copy_abs() >= limit:
-                raise _Misfit
-            return d
-    elif how == "number_text":
-        # numbers as their text (JSON output writes them as numbers again); the strings
-        # NaN / Infinity / -Infinity as written (they stay strings in JSON output)
-        def conv(v: Any) -> Any:
-            if v is None:
-                return None
-            if isinstance(v, JsonNumber):
-                return JsonNumber(number_text(v))
-            if type(v) is int:
-                return JsonNumber(v)
-            if type(v) is float:
-                return json_text(v).strip('"')
-            if type(v) is str and v in _SPECIAL_FLOATS:
-                return v
-            raise _Misfit
-    else:  # nested values, written as JSON
-        def conv(v: Any) -> Any:
-            if v is None or isinstance(v, (dict, list)):
-                return v
-            raise _Misfit
-    return conv
-
-
 class JsonSource(Source):
     """JSON Lines or a JSON array of objects (streamed element by element).
 
-    Column types follow the lossless JSON rules shared with the native engine:
-    integers within int64 are int64, longer ones exact decimals (or text); other
-    numbers are float64 only when every value survives it, else exact decimals or
-    their text; a field mixing kinds (string, number, bool, nested) holds each
-    value's JSON text.  Keys or values the sample did not show restart the plan
-    from a full scan, so nothing is ever dropped."""
+    Column types follow the lossless JSON rules shared with the native engine (see
+    :mod:`dataconv._jsonplan`), inside nested objects and arrays too.  Keys or values
+    the sample did not show restart the plan from a full scan, so nothing is ever
+    dropped."""
 
-    def __init__(self, path: Path, fmt: str, o: ConvertOptions, full: bool = False,
-                 nested: Optional[Callable[[str, Any], None]] = None) -> None:
+    def __init__(self, path: Path, fmt: str, o: ConvertOptions, full: bool = False, sample: Optional[int] = None) -> None:
+        """``sample``: plan from the first so many records only (previews, as the native
+        engine's ``head``), else from SAMPLE_ROWS of them, or all when ``full``."""
         self.path, self.fmt, self.o = path, fmt, o
         self.bad = []
         self.blank = 0
         self.irregular = 0
         self.warnings = []
-        full = full or o.infer == "full"
-        stats: Dict[str, _JsonStats] = {}
+        full = (full or o.infer == "full") and sample is None
+        limit = SAMPLE_ROWS if sample is None else sample
+        keys = _jsonplan.Keys()
         self.complete = True
         for n, obj in enumerate(self._objects()):
-            if not full and n >= SAMPLE_ROWS:
+            if not full and n >= limit:
                 self.complete = False
                 break
             for k, v in obj.items():
-                s = stats.get(k)
-                if s is None:
-                    s = stats[k] = _JsonStats()
-                s.observe(v)
-                if nested is not None and isinstance(v, (dict, list)):
-                    nested(k, v)
-        self.names = list(o.columns) if o.columns else list(stats)
-        self.stats = [stats.get(k) or _JsonStats() for k in self.names]
-        self.types, self.hows = [], []
-        for name, s in zip(self.names, self.stats):
-            ty, how = s.decide()
-            if how == "json_text" and s.mixed():
-                self.warnings.append(f"column '{name}' mixes JSON types; values are stored as JSON text")
-            self.types.append(ty)
-            self.hows.append(how)
+                keys.absorb(k, v)
+        top = _jsonplan.layout(keys, "", self.warnings)
+        self.keys = set(keys.names)  # every key the sample showed
+        self.names = list(o.columns) if o.columns else top.names
+        self.plans = [top.plans[top.index[n]] if n in top.index else _jsonplan.Plan("text") for n in self.names]
+        self.types = [p.logical() for p in self.plans]
 
     def _objects(self) -> Iterator[Dict[str, Any]]:
         try:
-            for obj in self._parse():
+            if self.fmt == "jsonl":
+                yield from self._lines()
+                return
+            for obj in self._array():
                 if not isinstance(obj, dict):
                     obj = {"value": obj}
                 for v in obj.values():
@@ -783,23 +567,72 @@ class JsonSource(Source):
         except UnicodeDecodeError as exc:
             raise DataError(f"{self.path}: JSON input is not valid UTF-8 ({exc.reason} at byte {exc.start})") from None
 
-    def _parse(self) -> Iterator[Any]:
+    def _lines(self) -> Iterator[Dict[str, Any]]:
+        """The records of JSON Lines, as the native engine splits and reads them: one
+        object per line ending in a line feed (any other line break is JSON whitespace
+        inside a record), lines of only whitespace skipped."""
+        with _io.open_binary(self.path) as f:
+            data = f.read(1 << 20)
+            if data.startswith(b"\xef\xbb\xbf"):
+                data = data[3:]
+            at = 0  # offset of the line in the input, after a byte order mark
+            start: List[bytes] = []  # the start of a line that continues in the next read
+            while data:
+                lines = data.split(b"\n")
+                tail = lines.pop()
+                for line in lines:
+                    if start:
+                        start.append(line)
+                        line = b"".join(start)
+                        start = []
+                    obj = self._record(line, at)
+                    if obj is not None:
+                        yield obj
+                    at += len(line) + 1
+                if tail:
+                    start.append(tail)
+                data = f.read(1 << 20)
+            if start:
+                obj = self._record(b"".join(start), at)
+                if obj is not None:
+                    yield obj
+
+    @staticmethod
+    def _record(line: bytes, at: int) -> Optional[Dict[str, Any]]:
+        """The object on one JSON Lines line (None for a blank line)."""
+        if not line.strip(_BLANK):
+            return None
+        try:
+            text = line.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise DataError(f"invalid JSON in the line at byte {at}: invalid UTF-8 at byte {at + exc.start}") from None
+        n = len(text)
+        i = 0
+        while i < n and text[i] in _JSON_SPACE:
+            i += 1
+        if text[i : i + 1] == "[":
+            raise DataError(f"the JSON Lines record at byte {at} is not an object")
+        try:
+            obj, end = _DECODER.raw_decode(text, i)
+        except ValueError as exc:
+            msg = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
+            raise DataError(f"invalid JSON in the line at byte {at}: {msg}") from None
+        if type(obj) is not dict:
+            raise DataError(f"the JSON Lines record at byte {at} is not an object")
+        while end < n and text[end] in _JSON_SPACE:
+            end += 1
+        if end != n:
+            raise DataError(f"invalid JSON in the line at byte {at}: trailing characters after the record")
+        for v in obj.values():
+            if isinstance(v, (dict, list)) and _too_deep(v):
+                raise DataError(f"invalid JSON in the line at byte {at}: recursion limit exceeded")
+        return obj
+
+    def _array(self) -> Iterator[Any]:
+        """The elements of a JSON array, read 1 MiB at a time."""
         raw_decode = _DECODER.raw_decode
         with _io.open_text(self.path, "utf-8") as f:
-            if self.fmt == "jsonl":
-                for n, line in enumerate(f, 1):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj, end = raw_decode(line)
-                    except json.JSONDecodeError as exc:
-                        raise DataError(f"{self.path}: invalid JSON on line {n}: {exc.msg}") from None
-                    if end != len(line):
-                        raise DataError(f"{self.path}: invalid JSON on line {n}: extra data after the value")
-                    yield obj
-                return
-            buf = f.read(1 << 20).lstrip()
+            buf = f.read(1 << 20).lstrip(_JSON_SPACE)
             eof = False
             if not buf.startswith("["):
                 raise FormatError(f"{self.path}: expected a JSON array of records")
@@ -827,13 +660,14 @@ class JsonSource(Source):
                 while True:
                     try:
                         obj, end = raw_decode(buf, pos)
-                    except json.JSONDecodeError as exc:
+                    except ValueError as exc:
                         if more():
                             continue
-                        raise DataError(f"{self.path}: invalid JSON: {exc.msg}") from None
-                    # a value that runs to the end of what was read (a number cut at the
-                    # read boundary) may continue: read more before taking it
-                    if end >= len(buf) and not eof and more():
+                        msg = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
+                        raise DataError(f"{self.path}: invalid JSON: {msg}") from None
+                    # a value counts only when what follows it has been read and ends it
+                    # (a number cut by the read boundary, "0.|5", is not yet "0")
+                    if (end >= len(buf) or buf[end] not in ",] \t\r\n") and not eof and more():
                         continue
                     break
                 yield obj
@@ -842,21 +676,21 @@ class JsonSource(Source):
                     buf, pos = buf[pos:], 0
 
     def rows(self) -> Iterator[List[Any]]:
-        convs = [_json_converter(how, ty) for how, ty in zip(self.hows, self.types)]
+        convs = [p.converter() for p in self.plans]
         names = self.names
-        known = None if (self.complete or self.o.columns) else set(names)
+        known = None if self.complete else self.keys
         for obj in self._objects():
             if known is not None:
                 for k in obj:
                     if k not in known:
-                        raise _Restart("columns", None, k)
+                        raise _Restart("json", None, f"key '{k}' first appears beyond the inference sample")
             out = []
             for j, conv in enumerate(convs):
-                v = obj.get(names[j])
                 try:
-                    out.append(conv(v))
-                except _Misfit:
-                    raise _Restart("violation", j, json_text(v)[:80]) from None
+                    out.append(conv(obj.get(names[j])))
+                except _jsonplan.Misfit as m:
+                    why = f"column '{names[j]}': value {m.shown} does not fit {self.plans[j].rust}"
+                    raise _Restart("json", j, why) from None
             yield out
 
 
@@ -987,20 +821,24 @@ def _dialect(path: Path, fmt: str, o: ConvertOptions) -> Dialect:
 
 
 def plan(src: Path, src_fmt: str, o: ConvertOptions, dialect: Optional[Dialect], text_out: bool,
-         consume: Callable[[Source], Any], warnings: List[str]) -> Tuple[Source, Any, int]:
+         consume: Callable[[Source], Any], warnings: List[str], sample: Optional[int] = None) -> Tuple[Source, Any, int]:
     """Run ``consume`` on a source, re-planning until the types hold every value:
     (source, result, restarts).  Nothing internal escapes: a value that fits no
     plan ends as a DataError."""
     restarts = 0
     full = o.infer == "full"
+    notes: Optional[List[str]] = None  # CSV: the notes of the first plan, as the native engine reports them
     while True:
         source: Optional[Source] = None
         try:
             if dialect is not None:
                 source = CsvSource(src, src_fmt, dialect, o, text_out)
                 source.infer(full)
+                if notes is None:
+                    notes = list(source.warnings)
+                source.notes = notes
             else:
-                source = JsonSource(src, src_fmt, o, full)
+                source = JsonSource(src, src_fmt, o, full, sample)
             return source, consume(source), restarts
         except _Restart as r:
             restarts += 1
@@ -1008,14 +846,15 @@ def plan(src: Path, src_fmt: str, o: ConvertOptions, dialect: Optional[Dialect],
             if restarts > len(names) + 8:
                 raise DataError("could not settle on a schema") from None
             if r.reason == "encoding":
-                if dialect is None or dialect.encoding not in ("utf-8", "utf8") or source is None:
+                if dialect is None or _io.native_label(dialect.encoding) != "utf-8" or source is None:
                     raise DataError("input is not valid in any supported encoding") from None
                 warnings.append("input is not valid UTF-8; re-read as windows-1252")
                 dialect.encoding = "cp1252"
-            elif r.reason == "columns":
+            elif r.reason == "json":
+                # a JSON key or value beyond the sample: plan again from the whole file
                 if full:
-                    raise DataError(f"field {r.value!r} appeared after the full scan") from None
-                warnings.append(f"field '{r.value}' first appears beyond the sample; re-planned from a full scan")
+                    raise DataError(r.value) from None
+                warnings.append(f"{r.value}; re-planned from a full scan")
                 full = True
             elif not full:
                 name = names[r.column or 0]
@@ -1070,9 +909,11 @@ def convert(src: Path, dst: Path, src_fmt: str, dst_fmt: str, dst_comp: Optional
 
     source, rows, restarts = plan(src, src_fmt, o, dialect, text_out, write, warnings)
     bad = source.bad
+    found: List[str] = []  # what the conversion itself found
     if isinstance(source, CsvSource) and source.forced_at is not None:
-        warnings.append(_csvtok.forced_warning(source.forced_at))
-    quarantine.finish(source.names, dialect.delimiter if dialect else ",", bad, report, warnings)
+        found.append(_csvtok.forced_warning(source.forced_at))
+    # whole records are rejected: the file's header names every column, whatever columns= selects
+    quarantine.finish(dialect.columns if dialect else source.names, dialect.delimiter if dialect else ",", bad, report, found)
     report.rows = rows
     report.columns = len(source.names)
     report.schema = [(n, t.label) for n, t in zip(source.names, source.types)]
@@ -1080,7 +921,9 @@ def convert(src: Path, dst: Path, src_fmt: str, dst_fmt: str, dst_comp: Optional
     report.blank_lines = source.blank
     report.irregular_records = source.irregular
     report.restarts = restarts
-    report.warnings = source.warnings + warnings
+    # in the native engine's order: CSV, the conversion's findings, then the first plan's
+    # notes and the restarts; JSON, the restarts, then the final plan's notes
+    report.warnings = (found + source.notes + warnings) if isinstance(source, CsvSource) else (warnings + source.warnings + found)
     report.dialect = dialect.to_dict() if dialect else None
     report.bytes_out = dst.stat().st_size
     report.seconds = time.perf_counter() - started
@@ -1138,7 +981,9 @@ def head(path: Path, n: int, fmt: str, o: ConvertOptions) -> Dict[str, Any]:
     if fmt not in DELIMITED and fmt not in ("jsonl", "json"):
         raise FormatError(f"the pure engine cannot read {fmt}")
     dialect = _dialect(path, fmt, o) if fmt in DELIMITED else None
-    source, rows, _ = plan(path, fmt, o, dialect, False, lambda s: list(islice(s.rows(), max(0, n))), [])
+    # JSON: the types of the first n records, as the native engine's head gives them
+    sample = None if dialect is not None else max(0, n)
+    source, rows, _ = plan(path, fmt, o, dialect, False, lambda s: list(islice(s.rows(), max(0, n))), [], sample)
     return {"columns": source.names, "types": [t.label for t in source.types], "rows": [[csv_text(v) for v in r] for r in rows]}
 
 
@@ -1148,7 +993,7 @@ def count(path: Path, fmt: str, o: ConvertOptions) -> int:
         try:
             return CsvSource(path, fmt, dialect, o, text_output=True).count()
         except _Restart:
-            if dialect.encoding not in ("utf-8", "utf8"):
+            if _io.native_label(dialect.encoding) != "utf-8":
                 raise DataError("input is not valid in any supported encoding") from None
             dialect.encoding = "cp1252"
             return CsvSource(path, fmt, dialect, o, text_output=True).count()

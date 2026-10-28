@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Dict, List, Optional, Union
 
-from ._io import NATIVE_ENCODINGS as _NATIVE_ENCODINGS
-from ._sniff import parse_char_option
+from ._io import native_label
+from ._sniff import check_dialect_chars, check_out_delimiter, parse_char_option
 from ._util import parse_size
 from .errors import OptionsError
 from .infer import parse_type
@@ -115,6 +115,8 @@ class ConvertOptions:
                 if char == "" and name in ("delimiter", "out_delimiter"):
                     raise OptionsError(f"{name} cannot be empty")
                 setattr(self, name, char)
+        check_dialect_chars(self.delimiter, self.quote, self.escape)
+        check_out_delimiter(self.out_delimiter)
         if isinstance(self.null_values, str):
             self.null_values = [v.strip() for v in self.null_values.split(",")]
         if isinstance(self.columns, str):
@@ -136,8 +138,7 @@ class ConvertOptions:
     def native_encoding(self) -> Optional[str]:
         if self.encoding is None:
             return None
-        key = self.encoding.lower()
-        return _NATIVE_ENCODINGS.get(key, key)
+        return native_label(self.encoding)
 
     def to_native(self, dst_fmt: str, out_delimiter: Optional[str]) -> Dict[str, Any]:
         sniff = {

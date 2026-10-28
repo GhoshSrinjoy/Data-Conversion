@@ -18,6 +18,8 @@ def test_info_head_count_schema(tricky):
     assert dict(dc.schema(tricky))["zip"] == "string"
     sniffed = dc.sniff(tricky)
     assert sniffed["delimiter"] == "," and sniffed["header"]
+    with pytest.raises(dc.OptionsError):
+        dc.head(tricky, -1)
 
 
 @pytest.mark.parametrize("engine", ENGINES)

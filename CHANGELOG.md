@@ -23,8 +23,9 @@ A rewrite of the three original scripts into one package, `dataconv`.
   - Windows-1252 fallback for invalid UTF-8;
   - quarantine of malformed rows (`--bad-lines`), which never replaces the input
     or an existing file without `--force`;
-  - a quote that is never closed costs only its own line, and quotes inside
-    fields are literal characters;
+  - a stray quote costs only its own line, whether it is never closed or pairs
+    up with a later quote across lines, and quotes inside fields are literal
+    characters;
   - atomic outputs, including splits (parts are published together) and Ctrl-C
     in the standalone binary.
 - **Exact chunking.** Chunk boundaries follow the tokenizer's quote rules,

@@ -329,3 +329,104 @@ def test_json_marks_on_nested_fields(tmp_path, engine):
         '"{""x"":1e+400,""y"":""7""}","[1,""a"",{}]",-0',
         '"{""x"":""NaN"",""y"":null}",,Infinity',
     ]
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_nested_values_follow_the_lossless_rules(tmp_path, engine):
+    # objects are structs (a missing key is null), arrays lists, and every leaf follows
+    # the rules of a column: no number turns into a float that loses it
+    src = tmp_path / "n.jsonl"
+    put(
+        src,
+        '{"l":[1e400],"o":{"x":0.1234567890123456789},"f":[1,2.5],"s":{"x":1},"m":{"k":1}}\n'
+        '{"l":[2],"o":{"x":1.5},"f":[3],"s":{"x":2,"y":"z"},"m":{"k":"1"}}\n',
+    )
+    out = tmp_path / "n.out.jsonl"
+    r = dc.convert(src, out, engine=engine)
+    assert out.read_text().splitlines() == [
+        '{"l":[1e+400],"o":{"x":0.1234567890123456789},"f":[1.0,2.5],"s":{"x":1,"y":null},"m":{"k":1}}',
+        '{"l":[2],"o":{"x":1.5000000000000000000},"f":[3.0],"s":{"x":2,"y":"z"},"m":{"k":"1"}}',
+    ]
+    assert r.schema == [
+        ("l", "list<string>"),
+        ("o", "struct<x: decimal(20,19)>"),  # 1 integer digit (1.5) and 19 fraction digits
+        ("f", "list<float64>"),
+        ("s", "struct<x: int64, y: string>"),
+        ("m", "struct<k: string>"),
+    ]
+    assert r.warnings == ["column 'm.k' mixes JSON types; values are stored as JSON text"]
+    h = dc.head(src, 2, engine=engine)
+    assert h["types"] == [t for _, t in r.schema] and h["rows"][0][2] == "[1.0,2.5]"
+    # head plans from the records it shows, as the native engine's does
+    assert dc.head(src, 1, engine=engine)["types"][1:5:3] == ["struct<x: decimal(19,19)>", "struct<k: int64>"]
+    assert dc.head(src, 0, engine=engine) == {"columns": [], "types": [], "rows": []}
+
+
+@pytest.mark.parametrize("engine", [e for e in ENGINES if e != "pure"])
+def test_nested_json_parquet_schema(tmp_path, engine):
+    pa = pytest.importorskip("pyarrow")
+    import pyarrow.parquet as pq
+
+    src = tmp_path / "n.jsonl"
+    put(src, '{"o":{"x":1e400,"y":[1,"a"],"z":{}},"l":[[1.5]]}\n{"o":null,"l":[]}\n')
+    out = tmp_path / "n.parquet"
+    dc.convert(src, out, engine=engine)
+    schema = pq.read_schema(out)
+    o = schema.field("o").type
+    assert pa.types.is_struct(o) and [o.field(i).name for i in range(o.num_fields)] == ["x", "y", "z"]
+    assert o.field("x").metadata == {b"dataconv.json": b"number"}
+    assert o.field("y").type.value_field.metadata == {b"dataconv.json": b"value"}
+    assert o.field("z").metadata == {b"dataconv.json": b"value"}  # an object that never has a field
+    assert pq.read_table(out).to_pylist()[0]["o"] == {"x": "1e+400", "y": ["1", '"a"'], "z": "{}"}
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_json_lines_are_read_as_the_native_engine_reads_them(tmp_path, engine):
+    src = tmp_path / "w.jsonl"
+    out = tmp_path / "w.out.jsonl"
+    # a lone CR is JSON whitespace inside a record: only a line feed ends one
+    put(src, '{"a":1,\r"b":2}\n\n \x0c\n{"a":3,"b":4}\n')
+    dc.convert(src, out, engine=engine)
+    assert rows(out) == [{"a": 1, "b": 2}, {"a": 3, "b": 4}]
+    for text, what in [
+        ('{"a":1}\r{"a":2}\n', "invalid JSON in the line at byte 0"),
+        ('\xa0{"a":1}\n', "invalid JSON in the line at byte 0"),
+        ('\x0c{"a":1}\n', "invalid JSON in the line at byte 0"),
+        ('\x1e{"a":1}\n', "invalid JSON in the line at byte 0"),
+        ('{"a":1}\n[1,2,3]\n', "the JSON Lines record at byte 8 is not an object"),
+        ('{"a":1}\n"x"\n', "the JSON Lines record at byte 8 is not an object"),
+        ('{"a":NaN}\n{"a":1.5}\n', "invalid JSON in the line at byte 0"),
+        ('{"a":-Infinity}\n', "invalid JSON in the line at byte 0"),
+    ]:
+        put(src, text)
+        with pytest.raises(dc.DataError, match=what.replace("[", r"\[")):
+            dc.convert(src, out, engine=engine, overwrite=True)
+    # a lone surrogate cannot be text: a clean error, and no output
+    put(src, '{"a":"\\ud83d"}\n')
+    out.unlink()
+    with pytest.raises(dc.DataError, match="does not fit Utf8"):
+        dc.convert(src, out, engine=engine)
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("engine", PY_ENGINES)
+def test_a_number_cut_by_the_read_boundary_of_an_array(tmp_path, engine):
+    body = "[ " + "0.5," * 300000 + "0.5]"
+    assert body[(1 << 20) - 1] == "."  # the first read ends right after a '.'
+    src = tmp_path / "nums.json"
+    put(src, body)
+    out = tmp_path / "nums.jsonl"
+    r = dc.convert(src, out, engine=engine)
+    assert r.rows == 300001 and set(out.read_text().splitlines()) == {'{"value":0.5}'}
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_late_json_values_replan_as_the_native_engine_says(tmp_path, engine):
+    src = tmp_path / "late.jsonl"
+    put(src, "".join(f'{{"a":{i},"o":{{"x":1}}}}\n' for i in range(100_001)) + '{"a":1.5,"o":{"x":2,"y":"z"}}\n')
+    out = tmp_path / "late.out.jsonl"
+    r = dc.convert(src, out, engine=engine, sample_bytes="64KB")
+    assert kinds(r) == {"a": "float64", "o": "struct<x: int64, y: string>"}
+    assert r.restarts == 1
+    assert r.warnings == ["column 'a': value 1.5 does not fit Int64; re-planned from a full scan"]
+    assert rows(out)[-1] == {"a": 1.5, "o": {"x": 2, "y": "z"}} and rows(out)[0] == {"a": 0.0, "o": {"x": 1, "y": None}}
