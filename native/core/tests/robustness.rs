@@ -560,21 +560,38 @@ fn damaged_arrow_files_are_errors() {
     let names: Vec<String> = (0..50).map(|i| format!("name-{i}")).collect();
     let col: ArrayRef = Arc::new(StringArray::from(names));
     let batch = RecordBatch::try_from_iter([("s", col)]).unwrap();
-    let src = d.join("f.arrow");
-    let mut w = arrow::ipc::writer::FileWriter::try_new(File::create(&src).unwrap(), &batch.schema()).unwrap();
+    let file_format = d.join("f.arrow");
+    let mut w = arrow::ipc::writer::FileWriter::try_new(File::create(&file_format).unwrap(), &batch.schema()).unwrap();
     w.write(&batch).unwrap();
     w.finish().unwrap();
     drop(w);
-    let good = std::fs::read(&src).unwrap();
+    let stream_format = d.join("s.arrows");
+    let mut w =
+        arrow::ipc::writer::StreamWriter::try_new(File::create(&stream_format).unwrap(), &batch.schema()).unwrap();
+    w.write(&batch).unwrap();
+    w.finish().unwrap();
+    drop(w);
     let flip = d.join("flip.arrow");
     let out = d.join("flip.csv");
-    for i in 0..good.len() {
-        let mut bad = good.clone();
-        bad[i] ^= 0x80;
-        std::fs::write(&flip, &bad).unwrap();
-        // an error or a result, never a panic
-        let _ = convert(&flip, &out, &ConvertOptions { overwrite: true, ..opts() }, &NoHooks);
-        let _ = dataconv_core::inspect::count(&flip, &opts());
+    for src in [file_format, stream_format] {
+        let good = std::fs::read(&src).unwrap();
+        for i in 0..good.len() {
+            let mut bad = good.clone();
+            bad[i] ^= 0x80;
+            std::fs::write(&flip, &bad).unwrap();
+            // an error or a result, never a panic; and a length past the end of the file
+            // is found before anything is allocated for it (a flip of a high bit can turn
+            // a length into gigabytes)
+            if let Err(e) = convert(&flip, &out, &ConvertOptions { overwrite: true, ..opts() }, &NoHooks) {
+                let e = e.to_string();
+                assert!(
+                    !e.contains("allocate") && !e.contains("fill whole buffer"),
+                    "byte {i} of {}: {e}",
+                    src.display()
+                );
+            }
+            let _ = dataconv_core::inspect::count(&flip, &opts());
+        }
     }
 }
 

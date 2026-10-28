@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -946,6 +946,62 @@ thread_local! {
     static DAMAGE_EXPECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Checks the lengths an Arrow IPC file gives its blocks (file format) or its messages
+/// (stream format) against the size of the file.  arrow-rs allocates such a length before
+/// reading what it covers, so a single damaged length would ask for gigabytes.
+fn check_ipc_lengths(path: &Path, file: &mut File, footer: bool) -> Result<()> {
+    let damaged = || Error::Format(format!("{} is damaged: it is not a valid Arrow file", path.display()));
+    let len = file.metadata().map_err(|e| Error::io(e, path))?.len();
+    let mut read_at = |pos: u64, buf: &mut [u8]| -> Result<()> {
+        file.seek(SeekFrom::Start(pos)).and_then(|_| file.read_exact(buf)).map_err(|_| damaged())
+    };
+    let length = |word: [u8; 4]| u64::try_from(i32::from_le_bytes(word)).map_err(|_| damaged());
+    let mut word = [0u8; 4];
+    if footer {
+        // the file ends with the footer, the footer's length (i32) and "ARROW1"
+        let trailer = len.checked_sub(10).ok_or_else(damaged)?;
+        read_at(trailer, &mut word)?;
+        let start = trailer.checked_sub(length(word)?).ok_or_else(damaged)?;
+        let mut bytes = vec![0; usize::try_from(trailer - start).map_err(|_| damaged())?];
+        read_at(start, &mut bytes)?;
+        let footer = arrow::ipc::root_as_footer(&bytes).map_err(|_| damaged())?;
+        let blocks = footer.dictionaries().into_iter().flatten().chain(footer.recordBatches().into_iter().flatten());
+        for b in blocks {
+            let end = [b.offset(), i64::from(b.metaDataLength()), b.bodyLength()]
+                .into_iter()
+                .try_fold(0u64, |end, n| end.checked_add(u64::try_from(n).ok()?));
+            if end.is_none_or(|end| end > start) {
+                return Err(damaged());
+            }
+        }
+    } else {
+        // messages: a continuation marker (from format version 0.15), the length of the
+        // metadata (i32), the metadata and the body, up to a length of 0 or the end of the file
+        let mut pos = 0;
+        while pos < len {
+            read_at(pos, &mut word)?;
+            pos += 4;
+            if word == [0xff; 4] {
+                read_at(pos, &mut word)?;
+                pos += 4;
+            }
+            let size = length(word)?;
+            if size == 0 {
+                break;
+            }
+            if size > len - pos {
+                return Err(damaged());
+            }
+            let mut bytes = vec![0; usize::try_from(size).map_err(|_| damaged())?];
+            read_at(pos, &mut bytes)?;
+            let message = arrow::ipc::root_as_message(&bytes).map_err(|_| damaged())?;
+            let body = u64::try_from(message.bodyLength()).map_err(|_| damaged())?;
+            pos = (pos + size).checked_add(body).filter(|&end| end <= len).ok_or_else(damaged)?;
+        }
+    }
+    Ok(())
+}
+
 /// Runs `f` on Arrow IPC data that may be damaged.  arrow-rs can panic on such data (a
 /// buffer sliced past its end) instead of returning an error: the panic becomes an
 /// error naming the file.
@@ -975,7 +1031,10 @@ impl IpcBatches {
                 path.display()
             )));
         }
-        let file = BufReader::new(File::open(path).map_err(|e| Error::io(e, path))?);
+        let mut file = File::open(path).map_err(|e| Error::io(e, path))?;
+        check_ipc_lengths(path, &mut file, head == b"ARROW1")?;
+        file.rewind().map_err(|e| Error::io(e, path))?;
+        let file = BufReader::new(file);
         let (layout, batches) = decoding(path, || {
             Ok(if head == b"ARROW1" {
                 let r = arrow::ipc::reader::FileReader::try_new(file, None)?;
