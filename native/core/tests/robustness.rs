@@ -208,7 +208,7 @@ fn dcz_blocks_stay_bounded_without_line_feeds() {
         assert!(footer.blocks.len() > 3, "{}: {} blocks", path.display(), footer.blocks.len());
         assert!(footer.blocks.iter().all(|b| b.raw_len as usize <= 2 * block), "{}", path.display());
         let back = path.with_extension("back");
-        dcz::decompress_file(&packed, &back, true, 2, &NoHooks).unwrap();
+        dcz::decompress_file(&packed, &back, true, 2, None, &NoHooks).unwrap();
         assert_eq!(std::fs::read(&back).unwrap(), text.as_bytes());
     }
 }
@@ -438,10 +438,10 @@ fn compress_keeps_compressed_files_byte_for_byte() {
     let bytes = enc.finish().unwrap();
     std::fs::write(&gz, &bytes).unwrap();
     let packed = d.join("data.csv.gz.dcz");
-    let eo = dcz::EncodeOptions { profile: Profile::Balanced, threads: 2, block_size: None };
+    let eo = dcz::EncodeOptions { profile: Profile::Balanced, threads: 2, block_size: None, memory: None };
     dcz::compress_file(&gz, &packed, &eo, true, &NoHooks).unwrap();
     let back = d.join("restored.csv.gz");
-    dcz::decompress_file(&packed, &back, true, 2, &NoHooks).unwrap();
+    dcz::decompress_file(&packed, &back, true, 2, None, &NoHooks).unwrap();
     assert_eq!(std::fs::read(&back).unwrap(), bytes);
     // converting the same file to DCZ stores the CSV itself
     let conv = d.join("conv.dcz");

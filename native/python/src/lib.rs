@@ -153,7 +153,7 @@ fn convert(py: Python<'_>, src: &str, dst: &str, options: &str, progress: Option
 }
 
 #[pyfunction]
-#[pyo3(signature = (src, dst, profile="balanced", threads=0, block_size=None, overwrite=false, progress=None))]
+#[pyo3(signature = (src, dst, profile="balanced", threads=0, block_size=None, overwrite=false, progress=None, memory=None))]
 #[allow(clippy::too_many_arguments)]
 fn compress(
     py: Python<'_>,
@@ -164,16 +164,17 @@ fn compress(
     block_size: Option<usize>,
     overwrite: bool,
     progress: Option<Py<PyAny>>,
+    memory: Option<u64>,
 ) -> PyResult<String> {
     let profile = Profile::parse(profile).map_err(to_py)?;
-    let opts = dcz::EncodeOptions { profile, threads, block_size };
+    let opts = dcz::EncodeOptions { profile, threads, block_size, memory };
     let hooks = PyHooks::new(progress);
     let result = py.detach(|| dcz::compress_file(Path::new(src), Path::new(dst), &opts, overwrite, &hooks));
     json(&hooks.finish(result)?)
 }
 
 #[pyfunction]
-#[pyo3(signature = (src, dst, threads=0, overwrite=false, progress=None))]
+#[pyo3(signature = (src, dst, threads=0, overwrite=false, progress=None, memory=None))]
 fn decompress(
     py: Python<'_>,
     src: &str,
@@ -181,9 +182,10 @@ fn decompress(
     threads: usize,
     overwrite: bool,
     progress: Option<Py<PyAny>>,
+    memory: Option<u64>,
 ) -> PyResult<String> {
     let hooks = PyHooks::new(progress);
-    let result = py.detach(|| dcz::decompress_file(Path::new(src), Path::new(dst), overwrite, threads, &hooks));
+    let result = py.detach(|| dcz::decompress_file(Path::new(src), Path::new(dst), overwrite, threads, memory, &hooks));
     json(&hooks.finish(result)?)
 }
 

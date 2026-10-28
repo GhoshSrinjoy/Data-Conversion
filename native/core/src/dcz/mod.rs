@@ -54,6 +54,8 @@ pub struct EncodeOptions {
     /// 0 = all usable CPUs.
     pub threads: usize,
     pub block_size: Option<usize>,
+    /// Memory budget in bytes (None: from the machine).
+    pub memory: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -206,7 +208,7 @@ pub struct DczWriter {
 impl DczWriter {
     pub fn new(mut out: BufWriter<File>, opts: EncodeOptions) -> Result<Self> {
         out.write_all(&file_header())?;
-        let plan = resources::plan(None, (opts.threads > 0).then_some(opts.threads), None, None);
+        let plan = resources::plan(None, (opts.threads > 0).then_some(opts.threads), opts.memory, None);
         let block_size = opts.block_size.unwrap_or(match opts.profile {
             Profile::Fast => 8 << 20,
             Profile::Balanced => 8 << 20,
@@ -654,10 +656,17 @@ fn compress_input(
 }
 
 /// Decompress a DCZ file, decoding blocks in parallel and verifying every checksum.
-pub fn decompress_file(src: &Path, dst: &Path, overwrite: bool, threads: usize, hooks: &dyn Hooks) -> Result<Report> {
+pub fn decompress_file(
+    src: &Path,
+    dst: &Path,
+    overwrite: bool,
+    threads: usize,
+    memory: Option<u64>,
+    hooks: &dyn Hooks,
+) -> Result<Report> {
     let started = Instant::now();
     let footer = read_footer(src)?;
-    let plan = resources::plan(Some(footer.original_size), (threads > 0).then_some(threads), None, None);
+    let plan = resources::plan(Some(footer.original_size), (threads > 0).then_some(threads), memory, None);
     let pool = resources::thread_pool(plan.threads);
     let mut out = AtomicFile::create(dst, overwrite)?;
     let mut f = File::open(src).map_err(|e| Error::io(e, src))?;
@@ -882,10 +891,10 @@ mod tests {
         for profile in [Profile::Fast, Profile::Balanced, Profile::Max] {
             let dst = tmp(&format!("out-{profile:?}.dcz"));
             let back = tmp(&format!("back-{profile:?}.csv"));
-            let opts = EncodeOptions { profile, threads: 4, block_size: Some(256 << 10) };
+            let opts = EncodeOptions { profile, threads: 4, block_size: Some(256 << 10), memory: None };
             let r = compress_file(&src, &dst, &opts, true, &NoHooks).unwrap();
             assert!(r.bytes_out < r.bytes_in / 4, "{profile:?}: {} -> {}", r.bytes_in, r.bytes_out);
-            decompress_file(&dst, &back, true, 4, &NoHooks).unwrap();
+            decompress_file(&dst, &back, true, 4, None, &NoHooks).unwrap();
             assert_eq!(std::fs::read(&back).unwrap(), csv.as_bytes());
             let mut streamed = Vec::new();
             DczReader::open(&dst).unwrap().read_to_end(&mut streamed).unwrap();
@@ -918,12 +927,12 @@ mod tests {
         compress_file(
             &src,
             &dst,
-            &EncodeOptions { profile: Profile::Balanced, threads: 2, block_size: Some(100_000) },
+            &EncodeOptions { profile: Profile::Balanced, threads: 2, block_size: Some(100_000), memory: None },
             true,
             &NoHooks,
         )
         .unwrap();
-        decompress_file(&dst, &back, true, 2, &NoHooks).unwrap();
+        decompress_file(&dst, &back, true, 2, None, &NoHooks).unwrap();
         assert_eq!(std::fs::read(&back).unwrap(), data);
         assert_eq!(read_footer(&dst).unwrap().kind, "raw");
     }

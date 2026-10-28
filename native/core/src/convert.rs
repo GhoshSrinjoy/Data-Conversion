@@ -709,7 +709,7 @@ fn build_sink(
             let o = csv_write_options(opts)?;
             let mut enc = crate::dcz::DczWriter::new(
                 file,
-                crate::dcz::EncodeOptions { profile, threads: plan.threads, block_size: None },
+                crate::dcz::EncodeOptions { profile, threads: plan.threads, block_size: None, memory: opts.memory },
             )?
             .with_dialect(Dialect { delimiter: o.delimiter, ..Dialect::default() });
             if o.header {
@@ -921,7 +921,12 @@ pub fn convert(src: &Path, dst: &Path, opts: &ConvertOptions, hooks: &dyn Hooks)
         return crate::dcz::compress_content(
             src,
             dst,
-            &crate::dcz::EncodeOptions { profile, threads: opts.threads.unwrap_or(0), block_size: opts.chunk_size },
+            &crate::dcz::EncodeOptions {
+                profile,
+                threads: opts.threads.unwrap_or(0),
+                block_size: opts.chunk_size,
+                memory: opts.memory,
+            },
             opts.overwrite,
             hooks,
         );
@@ -935,7 +940,7 @@ pub fn convert(src: &Path, dst: &Path, opts: &ConvertOptions, hooks: &dyn Hooks)
         && !opts.out_crlf
         && opts.out_header != Some(false)
     {
-        return crate::dcz::decompress_file(src, dst, opts.overwrite, opts.threads.unwrap_or(0), hooks);
+        return crate::dcz::decompress_file(src, dst, opts.overwrite, opts.threads.unwrap_or(0), opts.memory, hooks);
     }
 
     let plan = resources::plan(Some(bytes_in), opts.threads, opts.memory, opts.chunk_size);

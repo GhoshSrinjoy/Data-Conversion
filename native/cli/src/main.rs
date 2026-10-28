@@ -309,7 +309,9 @@ fn run(raw: Vec<String>) -> Result<(), String> {
                 PathBuf::from(s)
             });
             let profile = Profile::parse(a.get("profile").unwrap_or("balanced")).map_err(err)?;
-            let opts = dcz::EncodeOptions { profile, threads: a.num("threads")?.unwrap_or(0), block_size: None };
+            let memory = a.get("memory").map(|m| parse_size(m, 1 << 20)).transpose()?;
+            let opts =
+                dcz::EncodeOptions { profile, threads: a.num("threads")?.unwrap_or(0), block_size: None, memory };
             let r = dcz::compress_file(&src, &dst, &opts, a.has("overwrite") || a.has("f"), &bar).map_err(err)?;
             bar.clear();
             print_report(&r, &a);
@@ -328,6 +330,7 @@ fn run(raw: Vec<String>) -> Result<(), String> {
                 &dst,
                 a.has("overwrite") || a.has("f"),
                 a.num("threads")?.unwrap_or(0),
+                a.get("memory").map(|m| parse_size(m, 1 << 20)).transpose()?,
                 &bar,
             )
             .map_err(err)?;
