@@ -483,6 +483,45 @@ fn foreign_types_are_written_like_their_text() {
 }
 
 #[test]
+fn nulls_among_dictionary_values_stay_null() {
+    use arrow::array::{ArrayRef, DictionaryArray, Int32Array, ListArray, StringArray};
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::{Field, Int32Type};
+    use std::sync::Arc;
+
+    let d = dir("dictionary-nulls");
+    // pyarrow's dictionary_encode(null_encoding="encode") stores the null as a value
+    let values = Arc::new(StringArray::from(vec![Some("a"), Some(""), None]));
+    let dict = DictionaryArray::<Int32Type>::try_new(Int32Array::from(vec![0, 1, 2, 2]), values).unwrap();
+    let item = Arc::new(Field::new("item", dict.data_type().clone(), true));
+    let list = ListArray::new(item, OffsetBuffer::new(vec![0, 3, 3, 4, 4].into()), Arc::new(dict.clone()), None);
+    let cols: Vec<(&str, ArrayRef)> = vec![("d", Arc::new(dict)), ("l", Arc::new(list))];
+    let batch = RecordBatch::try_from_iter(cols).unwrap();
+    let src = d.join("dict.arrow");
+    let mut w = arrow::ipc::writer::FileWriter::try_new(File::create(&src).unwrap(), &batch.schema()).unwrap();
+    w.write(&batch).unwrap();
+    w.finish().unwrap();
+    drop(w);
+    let out = d.join("dict.jsonl");
+    convert(&src, &out, &opts(), &NoHooks).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        concat!(
+            "{\"d\":\"a\",\"l\":[\"a\",\"\",null]}\n",
+            "{\"d\":\"\",\"l\":[]}\n",
+            "{\"d\":null,\"l\":[null]}\n",
+            "{\"d\":null,\"l\":[]}\n",
+        )
+    );
+    let out = d.join("dict.csv");
+    convert(&src, &out, &opts(), &NoHooks).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "d,l\na,\"[\"\"a\"\",\"\"\"\",null]\"\n\"\",[]\n,[null]\n,[]\n"
+    );
+}
+
+#[test]
 fn half_floats_read_back_exactly() {
     use arrow::array::Float32Array;
     use arrow::datatypes::DataType;

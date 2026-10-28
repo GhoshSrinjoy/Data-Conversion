@@ -917,6 +917,24 @@ impl Encoder for MapObject<'_> {
     }
 }
 
+/// A dictionary whose values hold nulls.  arrow-json checks only the keys for nulls, and
+/// would write a null value's slot as `0` or `""`.
+struct DictionaryValues<'a> {
+    keys: Vec<usize>,
+    values: NullableEncoder<'a>,
+}
+
+impl Encoder for DictionaryValues<'_> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        let k = self.keys[idx];
+        if self.values.is_null(k) {
+            out.extend_from_slice(b"null");
+        } else {
+            self.values.encode(k, out);
+        }
+    }
+}
+
 /// Dates and timestamps as JSON strings in the CSV output's format.
 struct TemporalEncoder<'a>(&'a dyn Array);
 
@@ -992,6 +1010,17 @@ impl EncoderFactory for FloatText {
             }
             DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                 Some(NullableEncoder::new(Box::new(FloatEncoder(array)), array.nulls().cloned()))
+            }
+            DataType::Dictionary(..) => {
+                let dict = array.as_any_dictionary();
+                if dict.values().logical_null_count() == 0 {
+                    None
+                } else {
+                    let values = arrow::json::writer::make_encoder(field, dict.values().as_ref(), options)?;
+                    let encoder = DictionaryValues { keys: dict.normalized_keys(), values };
+                    // the logical nulls: those of the keys and of the values they point at
+                    Some(NullableEncoder::new(Box::new(encoder), array.logical_nulls()))
+                }
             }
             DataType::Map(entries, _) => match entries.data_type() {
                 DataType::Struct(kv) if kv.len() == 2 => {
