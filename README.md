@@ -17,13 +17,13 @@ The name comes from বেগ (*beg*), Bengali for speed.
   exact, `NA` is only a missing value where the column is numeric, timestamps
   keep their UTC offset, and malformed rows are set aside instead of dropped.
 - **Fast.** A native Rust engine reads, types and writes in parallel. On the
-  export [below](#why-this-exists) it is 2.5 to 4 times faster than DuckDB,
-  pyarrow and pandas, close to Polars, and writes the smallest file of the five
-  tools tested.
+  export [below](#why-this-exists) it was the fastest of the five tools tested,
+  4 to 6 times faster than DuckDB, pyarrow and pandas, and wrote the smallest
+  file.
 - **Adaptive.** Threads, memory and chunk sizes follow the machine it runs on,
   including CPU and memory limits inside containers.
 - **Strong compression.** DCZ, a byte-exact columnar format for delimited text,
-  produced a file about 1.5x smaller than Parquet and 1.6x smaller than xz on a
+  produced a file about 1.7x smaller than Parquet and 1.6x smaller than xz on a
   typical export, and still decompresses at about 1 GB/s.
 - **Runs anywhere.** One Python package with no required dependencies. On
   Windows, macOS and Linux (x86-64 and ARM) it comes with the native engine built
@@ -55,8 +55,8 @@ codes, country codes, phone numbers and 20-digit account numbers.
 
 |                                            | **vegg**    | Polars     | DuckDB    | pyarrow   | pandas    |
 |--------------------------------------------|------------:|-----------:|----------:|----------:|----------:|
-| time                                       |      0.13 s | **0.10 s** |    0.32 s |    0.43 s |    0.53 s |
-| Parquet size                               | **12.5 MB** |    12.7 MB |   50.9 MB |   32.7 MB |   39.7 MB |
+| time                                       |  **0.09 s** |     0.10 s |    0.40 s |    0.47 s |    0.54 s |
+| Parquet size                               |  **9.2 MB** |    12.7 MB |   50.9 MB |   32.7 MB |   39.7 MB |
 | zip codes that lost their leading zero     |       **0** |    200,000 |     **0** |   200,000 |   200,000 |
 | `NA` (Namibia) turned into a missing value |       **0** |      **0** |     **0** |     **0** |   285,714 |
 | phone numbers that lost their `+`          |       **0** |      **0** |     **0** | 2,000,000 | 2,000,000 |
@@ -71,7 +71,7 @@ that is never closed:
 |                         | result                                                                  |
 |-------------------------|-------------------------------------------------------------------------|
 | **vegg**                | 999,998 rows written; the 2 malformed rows go to a `.rejected.csv` file |
-| Polars                  | an error, after leaving a partial file of 434,985 rows behind           |
+| Polars                  | an error, after leaving a partial or broken output file behind          |
 | DuckDB, pyarrow, pandas | an error                                                                |
 
 Measured on a 24-thread Windows machine with Polars 2.1, DuckDB 2.0, pyarrow 26
@@ -147,18 +147,20 @@ vegg.write(table, "out.parquet", profile="max")
 ## What is the best compression for my data?
 
 It depends on what you will do with the file. `vegg bench yourfile.csv`
-measures every option on your own data. For the 135.5 MB export above:
+measures every option on your own data. For a 135.5 MB export of 2 million
+orders (ids, Unix timestamps, user names, amounts, quantities, scores, country
+codes, flags, zip codes and notes):
 
 | format            | size    | ratio | write   | read   | use it for |
 |-------------------|--------:|------:|--------:|-------:|------------|
-| **DCZ max**       | 21.1 MB | 6.4x  | 16 s    | 0.3 s  | archival, smallest |
-| **DCZ balanced**  | 21.9 MB | 6.2x  | 0.3 s   | 0.1 s  | lossless storage and transfer |
-| Parquet max       | 29.3 MB | 4.6x  | 3.8 s   | 0.13 s | analytics, smallest Parquet |
-| Parquet zstd-3    | 33.5 MB | 4.0x  | 0.2 s   | 0.15 s | analytics (default) |
-| csv.xz            | 35.6 MB | 3.8x  | 7.6 s   | 1.8 s  | compatibility with xz tools |
-| csv.zst           | 44.0 MB | 3.1x  | 0.9 s   | 0.3 s  | fast generic compression |
-| Parquet snappy    | 49.6 MB | 2.7x  | 0.4 s   | 0.11 s | old readers |
-| csv.gz            | 49.6 MB | 2.7x  | 2.4 s   | 0.4 s  | maximum compatibility |
+| **DCZ max**       | 21.1 MB | 6.4x  | 17 s    | 0.2 s  | archival, smallest |
+| **DCZ balanced**  | 21.9 MB | 6.2x  | 0.27 s  | 0.12 s | lossless storage and transfer |
+| Parquet max       | 26.3 MB | 5.1x  | 3.8 s   | 0.13 s | analytics, smallest Parquet |
+| csv.xz            | 35.6 MB | 3.8x  | 7.5 s   | 1.7 s  | compatibility with xz tools |
+| Parquet zstd-3    | 37.6 MB | 3.6x  | 0.10 s  | 0.07 s | analytics (default) |
+| csv.zst           | 44.0 MB | 3.1x  | 1.0 s   | 0.2 s  | fast generic compression |
+| csv.gz            | 49.6 MB | 2.7x  | 2.7 s   | 0.3 s  | maximum compatibility |
+| Parquet snappy    | 56.5 MB | 2.4x  | 0.09 s  | 0.07 s | old readers |
 
 Rules of thumb:
 
