@@ -74,5 +74,4 @@ A rewrite of the three original scripts into one package, `dataconv`.
   their jobs, without the pandas-based code's losses: leading zeros, `NA`
   strings and large integers are kept, split parts hit the requested size
   (measured on the output), and malformed rows go to a `.rejected.csv` file
-  instead of being dropped silently. The README shows the new form of each old
-  command.
+  instead of being dropped silently.
