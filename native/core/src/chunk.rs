@@ -37,6 +37,19 @@ fn at_field_start(buf: &[u8], j: usize, d: &Dialect) -> bool {
     }
 }
 
+/// A quoted field opened at `open` and closed at `close` that spans lines and has text
+/// after its closing quote was opened by a stray quote paired with a later one: the
+/// offset of the line break that ends the stray quote's own record, as the tokenizer
+/// reads it.
+#[inline]
+fn stray_line(buf: &[u8], d: &Dialect, open: usize, close: usize) -> Option<usize> {
+    let after = *buf.get(close + 1)?;
+    if after == d.delimiter || after == b'\n' || after == b'\r' {
+        return None;
+    }
+    memchr::memchr2(b'\n', b'\r', &buf[open + 1..close]).map(|k| open + 1 + k)
+}
+
 /// Visit the stretches of `buf` that lie outside quoted fields, in order, scanning
 /// from a record boundary.  Returns the offset of the opening quote when `buf` ends
 /// inside a quoted field.
@@ -75,6 +88,12 @@ fn outside<F: FnMut(usize, usize)>(buf: &[u8], d: &Dialect, mut visit: F) -> Opt
             // an escaped character, or a doubled quote, is part of the field
             if Some(buf[p]) == esc || (d.double_quote && p + 1 < n && buf[p + 1] == q) {
                 i = p + 2;
+            } else if let Some(nl) = stray_line(buf, d, j, p) {
+                // the quote at `j` was a stray: literal, and its line ends the record
+                visit(j, nl + 1);
+                pos = nl + 1;
+                search = nl + 1;
+                break;
             } else {
                 pos = p + 1;
                 search = p + 1;
@@ -278,6 +297,9 @@ fn scan_quotes(
             // an escaped character, or a doubled quote, is part of the field
             if Some(b) == esc || (d.double_quote && j + 1 < n && buf[j + 1] == q) {
                 skip_to = j + 2;
+            } else if stray_line(buf, d, open, j).is_some() {
+                // the quotes after the stray's line need scanning again
+                return None;
             } else {
                 inside = false;
                 region = j + 1;
@@ -601,6 +623,46 @@ mod tests {
                         "{:?} {d:?}",
                         String::from_utf8_lossy(&buf)
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chunks_hold_the_records_the_whole_data_holds() {
+        // stray quotes of every kind (never closed, paired across lines with text after
+        // the closing quote, paired with a quote that ends a field) and doubled quotes:
+        // whatever the chunk size, the records are those of the data read whole
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let dialects = [csv(), Dialect { escape: Some(b'\\'), double_quote: false, ..csv() }];
+        let alphabet = b"ab,,\"\"\n\n\r\\";
+        for round in 0..3_000 {
+            let len = (next() % 60) as usize + if round % 50 == 0 { 600 } else { 0 };
+            let buf: Vec<u8> = (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
+            for d in dialects {
+                let mut whole = Vec::new();
+                Tokenizer::new(d).for_each(&buf, |r| {
+                    whole.push((r.start, r.end));
+                    true
+                });
+                for size in [1, 2, 3, 5, 8, 16, 64] {
+                    let mut chunker =
+                        Chunker::new(std::io::Cursor::new(buf.clone()), size, d.quote, b'\n').with_dialect(d);
+                    let mut chunked = Vec::new();
+                    while let Some(c) = chunker.next_chunk().unwrap() {
+                        let at = c.offset as usize;
+                        Tokenizer::new(d).for_each(&c.data, |r| {
+                            chunked.push((at + r.start, at + r.end));
+                            true
+                        });
+                    }
+                    assert_eq!(chunked, whole, "size {size} {d:?} {:?}", String::from_utf8_lossy(&buf));
                 }
             }
         }

@@ -126,11 +126,21 @@ impl<'a> Record<'a> {
 pub struct Tokenizer {
     pub dialect: Dialect,
     fields: Vec<Field>,
+    partial: bool,
 }
 
 impl Tokenizer {
+    /// A tokenizer for whole records, as the chunker cuts them.  A quote the chunker
+    /// took for a stray (never closed, or paired with a quote beyond the chunk) is the
+    /// only kind left open in them: its field ends with its own line.
     pub fn new(dialect: Dialect) -> Self {
-        Tokenizer { dialect, fields: Vec::with_capacity(64) }
+        Tokenizer { dialect, fields: Vec::with_capacity(64), partial: false }
+    }
+
+    /// A tokenizer for data that may end inside a record (a sample): a quote left
+    /// open may close beyond it, so its field runs to the end of the data.
+    pub fn partial(dialect: Dialect) -> Self {
+        Tokenizer { partial: true, ..Tokenizer::new(dialect) }
     }
 
     /// Visit every record in `data`.  The visitor returns false to stop early.
@@ -180,24 +190,54 @@ impl Tokenizer {
                     };
                     match closing {
                         None => {
-                            // Unterminated quote: the field swallows the rest of the data.
+                            // Unterminated quote: a stray (its field ends with its line),
+                            // or in a sample one that may close beyond it.
+                            let start = content_start.min(n);
+                            let end = if self.partial {
+                                n
+                            } else {
+                                memchr2(b'\n', b'\r', &data[start..]).map_or(n, |k| start + k)
+                            };
                             self.fields.push(Field {
-                                start: content_start.min(n),
-                                end: n,
-                                raw_end: n,
+                                start,
+                                end,
+                                raw_end: end,
                                 quoted: true,
                                 escaped,
                                 malformed: true,
                             });
                             regular = false;
                             unterminated = true;
-                            pos = n;
-                            term = Term::Eof;
-                            break;
+                            pos = end;
+                            if pos >= n {
+                                term = Term::Eof;
+                                break;
+                            }
                         }
                         Some(j) => {
                             let after = j + 1;
-                            if after < n && data[after] != d.delimiter && data[after] != b'\n' && data[after] != b'\r' {
+                            let text_after =
+                                after < n && data[after] != d.delimiter && data[after] != b'\n' && data[after] != b'\r';
+                            let line_break = memchr2(b'\n', b'\r', &data[content_start..j]);
+                            if let (true, Some(k)) = (text_after, line_break) {
+                                // A quoted field that spans lines and has text after its
+                                // closing quote was opened by a stray quote (paired with a
+                                // later one): the record ends with the stray quote's own line,
+                                // a malformed row, and the next line starts a record (the
+                                // chunker cuts there as well).
+                                let nl = content_start + k;
+                                self.fields.push(Field {
+                                    start: content_start,
+                                    end: nl,
+                                    raw_end: nl,
+                                    quoted: true,
+                                    escaped,
+                                    malformed: true,
+                                });
+                                regular = false;
+                                unterminated = true;
+                                pos = nl;
+                            } else if text_after {
                                 // Text after the closing quote: keep it with the field.
                                 let k = memchr3(d.delimiter, b'\n', b'\r', &data[after..]).map_or(n, |k| after + k);
                                 self.fields.push(Field {
@@ -365,9 +405,17 @@ mod tests {
         let r = records(b"\"abc\"def,x\n\"open,y\n", Dialect::default());
         assert_eq!(r[0].0, s(&["abcdef", "x"]));
         assert!(!r[0].2);
-        assert_eq!(r[1].0, s(&["open,y\n"]));
-        assert_eq!(r[1].1, Term::Eof);
+        // a quote left open in whole records is a stray: its field ends with its line
+        assert_eq!(r[1].0, s(&["open,y"]));
+        assert_eq!(r[1].1, Term::Lf);
         assert!(!r[1].2);
+        // in a partial sample it may close beyond the data
+        let mut fields = Vec::new();
+        Tokenizer::partial(Dialect::default()).for_each(b"\"open,y\nz", |r| {
+            fields.push((r.content(0).to_vec(), r.term));
+            true
+        });
+        assert_eq!(fields, [(b"open,y\nz".to_vec(), Term::Eof)]);
     }
 
     #[test]

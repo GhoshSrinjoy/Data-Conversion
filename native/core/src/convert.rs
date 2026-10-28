@@ -434,8 +434,10 @@ fn decode_chunk(plan: &CsvPlan, schema: &SchemaRef, chunk: &Chunk) -> Result<Dec
 }
 
 /// Statistics of every column over a sample (or the whole stream).
-fn observe_chunk(plan: &CsvPlan, data: &[u8], stats: &mut [ColumnStats]) -> (u64, u64) {
-    let mut tok = Tokenizer::new(plan.dialect);
+/// Observe the records of `data` (whole records, or a window of the file that may start
+/// and end inside one).  Returns the (good, bad) record counts.
+fn observe_chunk(plan: &CsvPlan, data: &[u8], whole: bool, stats: &mut [ColumnStats]) -> (u64, u64) {
+    let mut tok = if whole { Tokenizer::new(plan.dialect) } else { Tokenizer::partial(plan.dialect) };
     let mut scratch = Vec::new();
     let (mut good, mut bad) = (0u64, 0u64);
     let d = plan.dialect;
@@ -497,7 +499,7 @@ fn sample_stats(
             .par_iter()
             .map(|r| {
                 let mut local = vec![ColumnStats::default(); ncols];
-                observe_chunk(plan, &head.data[r.clone()], &mut local);
+                observe_chunk(plan, &head.data[r.clone()], true, &mut local);
                 local
             })
             .collect();
@@ -535,7 +537,7 @@ fn sample_stats(
                     return None;
                 }
                 let mut local = vec![ColumnStats::default(); ncols];
-                let (good, bad) = observe_chunk(plan, slice, &mut local);
+                let (good, bad) = observe_chunk(plan, slice, false, &mut local);
                 // A window that started inside a quoted field parses as garbage: drop it.
                 (good > 0 && bad * 10 <= good).then_some(local)
             })
@@ -570,7 +572,7 @@ fn full_stats(
             wave.par_iter()
                 .map(|c| {
                     let mut local = vec![ColumnStats::default(); ncols];
-                    observe_chunk(plan, &c.data, &mut local);
+                    observe_chunk(plan, &c.data, true, &mut local);
                     local
                 })
                 .collect()

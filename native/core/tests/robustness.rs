@@ -323,12 +323,45 @@ fn a_stray_quote_costs_one_row() {
     assert_eq!(b.column(0).as_primitive::<Int64Type>().value(10), 11);
     assert_eq!(count(&src, &o), 200_000);
 
-    // a second quote later closes the first one: the record between them is one
-    // malformed row, and the warning says how many lines it holds
+    // a later quote with text after it would close the first one across lines: that
+    // marks the first as a stray, which still costs its own line only
     s = s.replace("15,name15,note15\n", "15,name15,note\"15\n");
+    s = s.replace("250,name250,note250\n", "250,\"Smith250, John\",note250\n");
     std::fs::write(&src, &s).unwrap();
     let r = convert(&src, &dst, &o, &NoHooks).unwrap();
-    assert_eq!((r.rows, r.bad_rows), (199_994, 1));
+    assert_eq!((r.rows, r.bad_rows), (199_999, 1), "{:?}", r.warnings);
+    let rejected = std::fs::read_to_string(r.quarantine.unwrap()).unwrap();
+    assert_eq!(rejected, "id,name,note\n10,name10,\"note10\n");
+    let b = read_parquet(&dst);
+    assert_eq!(b.column(2).as_string::<i32>().value(14), "note\"15");
+    assert_eq!(count(&src, &o), 200_000);
+    // so does a stray quote every 1000 rows, each pairing with the next
+    let mut s = String::from("id,name,note\n");
+    for i in 0..100_000 {
+        if i % 1000 == 500 {
+            s.push_str(&format!("{i},\"name{i},note{i}\n"));
+        } else {
+            s.push_str(&format!("{i},name{i},note{i}\n"));
+        }
+    }
+    std::fs::write(&src, &s).unwrap();
+    let r = convert(&src, &dst, &o, &NoHooks).unwrap();
+    assert_eq!((r.rows, r.bad_rows), (99_900, 100), "{:?}", r.warnings);
+    assert_eq!(count(&src, &o), 100_000);
+    // a later quote followed by a delimiter or line break closes the first one: then
+    // the record between them is one malformed row, and the warning says how many
+    // lines it holds
+    let mut s = String::from("id,name,v\n");
+    for i in 0..20 {
+        match i {
+            3 => s.push_str("3,\"name3,3\n"),
+            8 => s.push_str("8,name8,8\"\n"),
+            _ => s.push_str(&format!("{i},name{i},{i}\n")),
+        }
+    }
+    std::fs::write(&src, &s).unwrap();
+    let r = convert(&src, &dst, &o, &NoHooks).unwrap();
+    assert_eq!((r.rows, r.bad_rows), (14, 1), "{:?}", r.warnings);
     assert!(r.warnings.iter().any(|w| w.contains("1 malformed rows (6 lines)")), "{:?}", r.warnings);
 }
 

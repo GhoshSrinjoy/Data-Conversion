@@ -210,42 +210,23 @@ fn value(data: &[u8], f: &crate::tokenize::Field, d: &Dialect, scratch: &mut Vec
 }
 
 fn sample_records(text: &[u8], d: Dialect, limit: usize, complete: bool) -> Sampled {
-    let mut t = Tokenizer::new(d);
+    // In a whole file, a quote that is never closed ends with its line, as when
+    // converting; in a sample it may still close beyond the sample.
+    let mut t = if complete { Tokenizer::new(d) } else { Tokenizer::partial(d) };
     let mut rows = Vec::new();
     let mut terms = [0usize; 4];
     let mut max_len = 0;
     let mut scratch = Vec::new();
-    let mut pos = 0;
-    while pos < text.len() && rows.len() < limit {
-        // In a whole file, a quote that is never closed ends with its line, as when
-        // converting (in a sample it may still close beyond the sample).
-        let mut stray = None;
-        t.for_each(&text[pos..], |r| {
-            if r.unterminated && complete {
-                let open = r.fields.last().map_or(r.start, |f| f.start.saturating_sub(1));
-                let end = memchr::memchr(b'\n', &r.data[open..]).map_or(r.data.len(), |k| open + k + 1);
-                stray = Some((r.start, end));
-                return false;
-            }
-            if r.term == Term::Eof && !complete {
-                // The last record was cut off by the sample boundary.
-                return false;
-            }
-            terms[r.term.code() as usize] += 1;
-            max_len = max_len.max(r.end - r.start);
-            rows.push(r.fields.iter().map(|f| value(r.data, f, &d, &mut scratch)).collect());
-            rows.len() < limit
-        });
-        let Some((start, end)) = stray else { break };
-        // the stray line on its own is one (malformed) record
-        Tokenizer::new(d).for_each(&text[pos + start..pos + end], |r| {
-            terms[r.term.code() as usize] += 1;
-            max_len = max_len.max(r.end - r.start);
-            rows.push(r.fields.iter().map(|f| value(r.data, f, &d, &mut scratch)).collect());
-            false
-        });
-        pos += end;
-    }
+    t.for_each(text, |r| {
+        if r.term == Term::Eof && !complete {
+            // The last record was cut off by the sample boundary.
+            return false;
+        }
+        terms[r.term.code() as usize] += 1;
+        max_len = max_len.max(r.end - r.start);
+        rows.push(r.fields.iter().map(|f| value(r.data, f, &d, &mut scratch)).collect());
+        rows.len() < limit
+    });
     Sampled { rows, terms, max_len }
 }
 
