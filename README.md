@@ -335,10 +335,17 @@ Frequently used options:
 | `--threads`, `--memory`, `--engine` | resources and engine choice |
 | `-f, --overwrite`, `--json`, `-q`, `-v` | output control |
 
-The original scripts still work unchanged: `python csv_to_parquet.py`,
-`python parquet_viewer.py` and `python csv_splitter_converter.py`. They call
-the new engine and keep their arguments and output names, for example
-`chunk_0000.parquet`.
+### Coming from the original scripts
+
+The three scripts this project started with are retired. Each job is one
+command now:
+
+| before | now |
+|--------|-----|
+| `python csv_to_parquet.py data.csv` | `dataconv convert data.csv --to parquet` |
+| `python csv_to_parquet.py folder --output out` | `dataconv convert folder --to parquet -o out --include "*.csv"` |
+| `python parquet_viewer.py data.parquet --rows 5` | `dataconv info data.parquet`, then `dataconv head data.parquet -n 5` |
+| `python csv_splitter_converter.py big.csv parts --chunk-size 250` | `dataconv split big.csv parts --size 250MB --to parquet --pattern "chunk_{n:04}"` |
 
 ## Python API
 

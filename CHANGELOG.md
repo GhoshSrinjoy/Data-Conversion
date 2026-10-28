@@ -62,12 +62,15 @@ A rewrite of the three original scripts into one package, `dataconv`.
 
 ### Changed
 
-- `csv_to_parquet.py`, `parquet_viewer.py` and `csv_splitter_converter.py` now
-  call the new engine. Their arguments and output names are unchanged, but
-  conversions keep leading zeros, `NA` strings and large integers that the old
-  pandas-based code altered.
-- `csv_splitter_converter.py` now hits the requested chunk size (measured on the
-  output, not estimated from memory usage) and moves malformed rows to a
-  `.rejected.csv` file instead of dropping them silently.
 - The license is now the PolyForm Noncommercial License 1.0.0. Earlier releases
   remain under Apache-2.0.
+
+### Removed
+
+- The original scripts `csv_to_parquet.py`, `parquet_viewer.py` and
+  `csv_splitter_converter.py`. `dataconv convert`, `info`, `head` and `split` do
+  their jobs, without the pandas-based code's losses: leading zeros, `NA`
+  strings and large integers are kept, split parts hit the requested size
+  (measured on the output), and malformed rows go to a `.rejected.csv` file
+  instead of being dropped silently. The README shows the new form of each old
+  command.
