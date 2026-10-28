@@ -468,6 +468,32 @@ fn foreign_types_are_written_like_their_text() {
 }
 
 #[test]
+fn half_floats_read_back_exactly() {
+    use arrow::array::Float32Array;
+    use arrow::datatypes::DataType;
+
+    let d = dir("float16");
+    let singles = Float32Array::from(vec![Some(1.0), Some(6e-8), Some(f32::NAN), None]);
+    let h = arrow::compute::cast(&singles, &DataType::Float16).unwrap();
+    let batch = RecordBatch::try_from_iter([("h", h)]).unwrap();
+    let src = d.join("half.arrow");
+    let mut w = arrow::ipc::writer::FileWriter::try_new(File::create(&src).unwrap(), &batch.schema()).unwrap();
+    w.write(&batch).unwrap();
+    w.finish().unwrap();
+    drop(w);
+    // written as the float32 each widens to, alike in CSV and JSON
+    let out = d.join("half.csv");
+    convert(&src, &out, &opts(), &NoHooks).unwrap();
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "h\n1.0\n5.9604645e-8\nNaN\n\n");
+    let out = d.join("half.jsonl");
+    convert(&src, &out, &opts(), &NoHooks).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "{\"h\":1.0}\n{\"h\":5.9604645e-8}\n{\"h\":\"NaN\"}\n{\"h\":null}\n"
+    );
+}
+
+#[test]
 fn stored_time_zones_survive_a_coarser_parquet_unit() {
     use arrow::array::{ArrayRef, StructArray, TimestampMillisecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};

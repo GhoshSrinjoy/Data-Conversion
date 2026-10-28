@@ -34,7 +34,7 @@ use arrow::array::{
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{
-    DataType, Date32Type, Date64Type, Field, FieldRef, Fields, Float32Type, Float64Type, Schema, SchemaRef,
+    DataType, Date32Type, Date64Type, Field, FieldRef, Fields, Float16Type, Float32Type, Float64Type, Schema, SchemaRef,
 };
 use arrow::error::ArrowError;
 use arrow::json::writer::{Encoder, EncoderFactory, EncoderOptions, NullableEncoder};
@@ -942,17 +942,19 @@ struct FloatEncoder<'a>(&'a dyn Array);
 
 impl Encoder for FloatEncoder<'_> {
     fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
-        let v = match self.0.data_type() {
-            DataType::Float32 => self.0.as_primitive::<Float32Type>().value(idx) as f64,
-            _ => self.0.as_primitive::<Float64Type>().value(idx),
+        // float16 is written as the float32 it widens to
+        let (v, single) = match self.0.data_type() {
+            DataType::Float16 => (self.0.as_primitive::<Float16Type>().value(idx).to_f32() as f64, true),
+            DataType::Float32 => (self.0.as_primitive::<Float32Type>().value(idx) as f64, true),
+            _ => (self.0.as_primitive::<Float64Type>().value(idx), false),
         };
         if v.is_nan() {
             out.extend_from_slice(b"\"NaN\"");
         } else if v.is_infinite() {
             out.extend_from_slice(if v > 0.0 { b"\"Infinity\"" } else { b"\"-Infinity\"" });
-        } else if self.0.data_type() == &DataType::Float32 {
+        } else if single {
             let mut buf = ryu::Buffer::new();
-            out.extend_from_slice(buf.format_finite(self.0.as_primitive::<Float32Type>().value(idx)).as_bytes());
+            out.extend_from_slice(buf.format_finite(v as f32).as_bytes());
         } else {
             let mut buf = ryu::Buffer::new();
             out.extend_from_slice(buf.format_finite(v).as_bytes());
@@ -988,7 +990,7 @@ impl EncoderFactory for FloatText {
             DataType::FixedSizeList(item, _) if marked(item) => {
                 Some(marked_items(item, array.as_fixed_size_list(), options)?)
             }
-            DataType::Float32 | DataType::Float64 => {
+            DataType::Float16 | DataType::Float32 | DataType::Float64 => {
                 Some(NullableEncoder::new(Box::new(FloatEncoder(array)), array.nulls().cloned()))
             }
             DataType::Map(entries, _) => match entries.data_type() {

@@ -9,10 +9,10 @@
 use std::io::Write;
 
 use arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float32Array, Float64Array,
-    GenericStringArray, Int16Array, Int32Array, Int64Array, Int8Array, OffsetSizeTrait, RecordBatch, StringViewArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
-    UInt32Array, UInt64Array, UInt8Array,
+    Array, ArrayRef, AsArray, BooleanArray, Date32Array, Date64Array, Decimal128Array, Float16Array, Float32Array,
+    Float64Array, GenericStringArray, Int16Array, Int32Array, Int64Array, Int8Array, OffsetSizeTrait, RecordBatch,
+    StringViewArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow::datatypes::{DataType, FieldRef, TimeUnit};
 use arrow::util::display::{ArrayFormatter, FormatOptions};
@@ -191,6 +191,8 @@ enum Col<'a> {
     U16(&'a UInt16Array),
     U32(&'a UInt32Array),
     U64(&'a UInt64Array),
+    /// float16 is written as the float32 it widens to.
+    F16(&'a Float16Array),
     F32(&'a Float32Array),
     F64(&'a Float64Array),
     Dec(&'a Decimal128Array, i8),
@@ -238,6 +240,15 @@ fn float_text(out: &mut Vec<u8>, v: f64) {
     }
 }
 
+fn single_text(out: &mut Vec<u8>, v: f32) {
+    if v.is_finite() {
+        let mut buf = ryu::Buffer::new();
+        out.extend_from_slice(buf.format_finite(v).as_bytes());
+    } else {
+        float_text(out, v as f64);
+    }
+}
+
 impl<'a> Col<'a> {
     fn new(
         field: &'a FieldRef,
@@ -258,6 +269,7 @@ impl<'a> Col<'a> {
             DataType::UInt16 => Col::U16(array.as_primitive()),
             DataType::UInt32 => Col::U32(array.as_primitive()),
             DataType::UInt64 => Col::U64(array.as_primitive()),
+            DataType::Float16 => Col::F16(array.as_primitive()),
             DataType::Float32 => Col::F32(array.as_primitive()),
             DataType::Float64 => Col::F64(array.as_primitive()),
             DataType::Decimal128(_, s) => Col::Dec(array.as_primitive(), *s),
@@ -287,15 +299,8 @@ impl<'a> Col<'a> {
             Col::U16(a) => int!(out, a, i),
             Col::U32(a) => int!(out, a, i),
             Col::U64(a) => int!(out, a, i),
-            Col::F32(a) => {
-                let v = a.value(i);
-                if v.is_finite() {
-                    let mut buf = ryu::Buffer::new();
-                    out.extend_from_slice(buf.format_finite(v).as_bytes());
-                } else {
-                    float_text(out, v as f64);
-                }
-            }
+            Col::F16(a) => single_text(out, a.value(i).to_f32()),
+            Col::F32(a) => single_text(out, a.value(i)),
             Col::F64(a) => float_text(out, a.value(i)),
             Col::Dec(a, s) => write_decimal(out, a.value(i), *s),
             Col::Date(a) => write_date(out, a.value(i) as i64),
