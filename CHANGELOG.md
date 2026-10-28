@@ -9,7 +9,8 @@ working name `dataconv`.
 ### Added
 
 - **Native engine** (Rust), compiled into vegg's platform wheels as `vegg._rust`:
-  - a quote-aware chunker and zero-copy tokenizer;
+  - a quote-aware chunker and zero-copy tokenizer, and plain UTF-8 files read
+    straight into the chunk buffers by several threads;
   - parallel, memory-bounded conversion between CSV/TSV, JSON Lines, Parquet,
     Arrow IPC and DCZ;
   - Parquet writing that encodes every column while the input is still being

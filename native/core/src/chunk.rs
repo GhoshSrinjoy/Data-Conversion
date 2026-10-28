@@ -370,13 +370,21 @@ pub fn split_records(buf: &[u8], d: &Dialect, term: u8, n: usize) -> Vec<Range<u
 }
 
 pub struct Chunk {
+    /// The chunk's bytes are `data[start..]` (see [`Chunk::bytes`]).
     pub data: Vec<u8>,
-    /// Offset of `data[0]` within the (decoded) stream.
+    pub start: usize,
+    /// Offset of the chunk's first byte within the (decoded) stream.
     pub offset: u64,
     pub index: usize,
     /// The chunk ends at a quote taken to be a stray only because its field was still
     /// open [`MAX_QUOTED`] bytes later (a genuine field that large would be split).
     pub forced: bool,
+}
+
+impl Chunk {
+    pub fn bytes(&self) -> &[u8] {
+        &self.data[self.start..]
+    }
 }
 
 /// Splits a byte stream into record-aligned chunks of roughly `chunk_size` bytes.
@@ -434,6 +442,14 @@ impl<R: Read> Chunker<R> {
     pub fn cut_at(mut self, n: usize) -> Self {
         self.max_record = n.max(self.chunk_size);
         self.cut_anywhere = true;
+        self
+    }
+
+    /// Continue the numbering of chunks taken before this chunker started: `offset` is
+    /// where its stream starts within the whole input, `index` the next chunk's number.
+    pub fn with_position(mut self, offset: u64, index: usize) -> Self {
+        self.offset = offset;
+        self.index = index;
         self
     }
 
@@ -534,7 +550,7 @@ impl<R: Read> Chunker<R> {
                 rest.extend_from_slice(&self.carry[cut..]);
                 self.carry.truncate(cut);
                 let data = std::mem::replace(&mut self.carry, rest);
-                let chunk = Chunk { data, offset: self.offset, index: self.index, forced };
+                let chunk = Chunk { data, start: 0, offset: self.offset, index: self.index, forced };
                 self.offset += cut as u64;
                 self.index += 1;
                 return Ok(Some(chunk));

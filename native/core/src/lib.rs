@@ -7,6 +7,7 @@
 //!   and JSON Lines.
 //! * [`dcz`]: the DCZ container, a byte-exact columnar compressor for delimited text.
 
+pub mod blocks;
 pub mod chunk;
 pub mod codec;
 pub mod convert;

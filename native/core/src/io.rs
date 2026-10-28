@@ -95,6 +95,12 @@ pub struct CountingReader<R> {
     count: Arc<AtomicU64>,
 }
 
+impl<R> CountingReader<R> {
+    pub fn new(inner: R, count: Arc<AtomicU64>) -> Self {
+        CountingReader { inner, count }
+    }
+}
+
 impl<R: Read> Read for CountingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;

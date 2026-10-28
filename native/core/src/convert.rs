@@ -12,9 +12,9 @@ use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, TryRecvError};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{Field, Schema, SchemaRef};
@@ -250,7 +250,7 @@ fn open_csv_stream(path: &Path, encoding: &str) -> Result<Counted<Box<dyn Read +
 /// stream and the bytes already read beyond them, so that chunking starts at the
 /// first data record however long the header is.  Records are split by the same
 /// chunker as the data, so a stray quote in a header ends with its line.
-fn skip_leading(
+pub(crate) fn skip_leading(
     reader: Box<dyn Read + Send>,
     d: Dialect,
     term: u8,
@@ -289,6 +289,17 @@ pub(crate) fn data_stream(path: &Path, dialect: &CsvDialect) -> Result<Counted<B
     let reader: Box<dyn Read + Send> =
         if prefix.is_empty() { reader } else { Box::new(std::io::Cursor::new(prefix).chain(reader)) };
     Ok((reader, consumed, total))
+}
+
+/// Whether `src` can be chunked straight from the file by [`crate::blocks`]: a plain
+/// UTF-8 file (no compression, no transcoding) whose records end at line feeds.
+fn plain_input(src: &Path, encoding: &str, plan: &CsvPlan) -> Result<bool> {
+    Ok(plan.split == b'\n'
+        && !io::is_latin1(encoding)
+        && io::encoding_for(encoding).is_none_or(|e| e == encoding_rs::UTF_8)
+        && std::fs::metadata(src).is_ok_and(|m| m.is_file())
+        && detect_format(src, None)?.0 != Format::Dcz
+        && io::detect_compression(src, &io::read_head(src, 16)?) == Compression::None)
 }
 
 /// A chunker over the data records of a CSV stream (leading records skipped).
@@ -361,16 +372,17 @@ struct Decoded {
 }
 
 fn decode_chunk(plan: &CsvPlan, schema: &SchemaRef, chunk: &Chunk) -> Result<Decoded> {
-    if simdutf8::basic::from_utf8(&chunk.data).is_err() {
+    let data = chunk.bytes();
+    if simdutf8::basic::from_utf8(data).is_err() {
         return Err(Error::Data("input is not valid UTF-8".into()));
     }
-    let est = chunk.data.len() / plan.avg_record.max(8) + 16;
+    let est = data.len() / plan.avg_record.max(8) + 16;
     let mut builders: Vec<ColumnBuilder> = plan.types.iter().map(|t| ColumnBuilder::new(t, est, plan.mode)).collect();
     let mut out = Decoded::default();
     let mut tok = Tokenizer::new(plan.dialect);
     let mut scratch = Vec::new();
     let d = plan.dialect;
-    tok.for_each(&chunk.data, |rec| {
+    tok.for_each(data, |rec| {
         // In a single-column file a blank line is a row with a missing value.
         if rec.is_blank() && plan.ncols != 1 {
             out.blank += 1;
@@ -585,6 +597,67 @@ fn full_stats(
         }
     }
     Ok(stats)
+}
+
+/// What the decoding stage hands the writer, in input order.
+enum Item {
+    /// A decoded chunk, and where it ends when a stray quote was taken by size alone.
+    Decoded(Result<Decoded>, Option<u64>),
+    /// The input could not be read.
+    Failed(Error),
+    End,
+}
+
+/// Decode chunks on the pool as soon as they are read.  A thread of its own takes the
+/// chunks, so the writer never waits for input to be read while a decoded chunk is
+/// ready, nor the other way round.  At most `depth` chunks are between reading and
+/// writing: the writer hands back a permit for every item it takes.
+fn spawn_decoders(
+    chunks: Receiver<Result<Chunk>>,
+    pool: Arc<rayon::ThreadPool>,
+    plan: Arc<CsvPlan>,
+    schema: SchemaRef,
+    depth: usize,
+    spares: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+) -> (Receiver<(usize, Item)>, SyncSender<()>) {
+    let (item_tx, items) = std::sync::mpsc::channel();
+    let (permits, permit_rx) = sync_channel::<()>(depth);
+    for _ in 0..depth {
+        let _ = permits.send(());
+    }
+    std::thread::Builder::new()
+        .name("vegg-decode".into())
+        .spawn(move || {
+            for idx in 0usize.. {
+                if permit_rx.recv().is_err() {
+                    return; // the writer stopped
+                }
+                let chunk = match chunks.recv() {
+                    Ok(Ok(chunk)) => chunk,
+                    Ok(Err(e)) => {
+                        let _ = item_tx.send((idx, Item::Failed(e)));
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = item_tx.send((idx, Item::End));
+                        return;
+                    }
+                };
+                let forced = chunk.forced.then(|| chunk.offset + chunk.bytes().len() as u64);
+                let (tx, plan, schema, spares) = (item_tx.clone(), plan.clone(), schema.clone(), spares.clone());
+                pool.spawn(move || {
+                    let decoded =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_chunk(&plan, &schema, &chunk)))
+                            .unwrap_or_else(|_| Err(Error::Data("internal error while decoding a chunk".into())));
+                    let _ = tx.send((idx, Item::Decoded(decoded, forced)));
+                    if let Some(spares) = spares {
+                        let _ = spares.send(chunk.data);
+                    }
+                });
+            }
+        })
+        .expect("failed to start a worker thread");
+    (items, permits)
 }
 
 fn spawn_chunker<R: Read + Send + 'static>(mut chunker: Chunker<R>, depth: usize) -> Receiver<Result<Chunk>> {
@@ -1252,10 +1325,24 @@ fn csv_attempt(
         // a restarted split writes every part again, into an empty staging directory
         crate::split::reset_staging(&target.dst)?;
     }
-    let (chunker, consumed, total) = open_records(src, encoding, cplan, plan.chunk_size)?;
-    // decoded chunks hand their buffers back to the reader
-    let (spare_tx, spare_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    let rx = spawn_chunker(chunker.with_spares(spare_rx), plan.wave_chunks);
+    let (rx, consumed, total, spare_tx) = if plain_input(src, encoding, cplan)? {
+        let start = crate::blocks::data_start(src, cplan.dialect, cplan.leading)?;
+        let consumed = Arc::new(AtomicU64::new(start));
+        let total = std::fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+        let file = crate::blocks::PlainFile {
+            path: src.to_path_buf(),
+            start,
+            block: plan.chunk_size,
+            dialect: cplan.dialect,
+            count: consumed.clone(),
+        };
+        (crate::blocks::spawn(file, plan.wave_chunks), consumed, total, None)
+    } else {
+        let (chunker, consumed, total) = open_records(src, encoding, cplan, plan.chunk_size)?;
+        // decoded chunks hand their buffers back to the reader
+        let (spare_tx, spare_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        (spawn_chunker(chunker.with_spares(spare_rx), plan.wave_chunks), consumed, total, Some(spare_tx))
+    };
     let schema = cplan.schema();
     let dst = target.final_dst.as_path();
     let mut out = Out::new(target, schema.clone(), opts, plan, pool);
@@ -1267,60 +1354,24 @@ fn csv_attempt(
     let limit = opts.limit.unwrap_or(u64::MAX);
     // Ordered streaming pipeline: chunks are decoded on worker threads as soon as
     // they are read, and written in file order as they complete, so reading,
-    // decoding and encoding overlap.  At most `depth` chunks are in flight.  The loop
-    // never waits for input while a decoded chunk could be written: writing starts
-    // with the first chunk, not after the last one has been read.
-    let shared = Arc::new(cplan.clone());
-    let (res_tx, res_rx) = std::sync::mpsc::channel::<(usize, Result<Decoded>)>();
+    // decoding and encoding overlap.  At most `depth` chunks are in flight.
     let depth = plan.wave_chunks.max(2);
-    let mut pending: std::collections::BTreeMap<usize, Result<Decoded>> = std::collections::BTreeMap::new();
-    let (mut spawned, mut emitted, mut in_flight) = (0usize, 0usize, 0usize);
-    let mut input_done = false;
+    let (items, permits) = spawn_decoders(rx, pool.clone(), Arc::new(cplan.clone()), schema.clone(), depth, spare_tx);
+    let mut pending: BTreeMap<usize, Item> = BTreeMap::new();
+    let mut emitted = 0usize;
     'stream: loop {
-        while !input_done && in_flight < depth {
-            let next = if in_flight == 0 { rx.recv().map_err(|_| TryRecvError::Disconnected) } else { rx.try_recv() };
-            match next {
-                Ok(Ok(chunk)) => {
-                    if chunk.forced && forced_at.is_none() {
-                        forced_at = Some(chunk.offset + chunk.data.len() as u64);
-                    }
-                    let (tx, p, s, idx, spare) =
-                        (res_tx.clone(), shared.clone(), schema.clone(), spawned, spare_tx.clone());
-                    pool.spawn(move || {
-                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_chunk(&p, &s, &chunk)))
-                            .unwrap_or_else(|_| Err(Error::Data("internal error while decoding a chunk".into())));
-                        let _ = tx.send((idx, r));
-                        let _ = spare.send(chunk.data);
-                    });
-                    spawned += 1;
-                    in_flight += 1;
-                }
-                Ok(Err(Error::Data(m))) if m.contains("decoding failed") => return Err(Retry::Encoding),
-                Ok(Err(e)) => return Err(Retry::Fatal(e)),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => input_done = true,
-            }
-        }
-        if in_flight == 0 {
-            break;
-        }
-        // while more input can be taken, look for it again within a millisecond
-        let received = if input_done || in_flight >= depth {
-            res_rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
-        } else {
-            res_rx.recv_timeout(Duration::from_millis(1))
-        };
-        let (idx, result) = match received {
-            Ok(r) => r,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(Retry::Fatal(Error::Data("a worker thread stopped".into())))
-            }
-        };
-        in_flight -= 1;
-        pending.insert(idx, result);
-        while let Some(d) = pending.remove(&emitted) {
+        let (idx, item) = items.recv().map_err(|_| Retry::Fatal(Error::Data("a worker thread stopped".into())))?;
+        pending.insert(idx, item);
+        while let Some(item) = pending.remove(&emitted) {
             emitted += 1;
+            let _ = permits.send(());
+            let (d, forced) = match item {
+                Item::End => break 'stream,
+                Item::Failed(Error::Data(m)) if m.contains("decoding failed") => return Err(Retry::Encoding),
+                Item::Failed(e) => return Err(Retry::Fatal(e)),
+                Item::Decoded(d, forced) => (d, forced),
+            };
+            forced_at = forced_at.or(forced);
             let d = match d {
                 Ok(d) => d,
                 Err(Error::Data(m)) if m.contains("UTF-8") => return Err(Retry::Encoding),
@@ -1373,7 +1424,9 @@ fn csv_attempt(
             return Err(Retry::Fatal(Error::Cancelled));
         }
     }
-    drop(rx);
+    // stop reading and decoding (after a row limit)
+    drop(items);
+    drop(permits);
     trace("  decode + write", started_attempt);
     let t = Instant::now();
     let (bytes_out, parts) = out.finish()?;
