@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import os
-import queue
 import re
-import secrets
 import shutil
 import threading
 import time
@@ -107,7 +105,7 @@ def _remove(path: Path) -> None:
 def _replace(tmp: Path, final: Path) -> None:
     if tmp.is_dir() and final.exists():
         # Directories cannot be atomically replaced on every OS: swap via a backup name.
-        backup = final.with_name(f".{final.name}.{secrets.token_hex(4)}.old")
+        backup = final.with_name(f".{final.name}.{os.urandom(4).hex()}.old")
         os.replace(final, backup)
         try:
             os.replace(tmp, final)
@@ -134,7 +132,7 @@ def atomic_output(path: PathLike, overwrite: bool = False, directory: bool = Fal
     """
     final = check_overwrite(path, overwrite)
     final.parent.mkdir(parents=True, exist_ok=True)
-    tmp = final.with_name(f".{final.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    tmp = final.with_name(f".{final.name}.{os.getpid()}.{os.urandom(4).hex()}.tmp")
     if directory:
         tmp.mkdir()
     try:
@@ -174,6 +172,8 @@ def prefetch(items: Iterable[T], depth: int = 1) -> Iterator[T]:
     one.  Exceptions are re-raised in the consumer; abandoning the iterator stops
     the producer.
     """
+    import queue  # only here: importing it costs every command a few milliseconds
+
     buffer: queue.Queue[object] = queue.Queue(maxsize=max(1, depth))
     stop = threading.Event()
 

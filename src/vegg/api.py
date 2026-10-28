@@ -6,7 +6,6 @@ import array
 import fnmatch
 import json
 import os
-import secrets
 import shutil
 import struct
 import tempfile
@@ -319,7 +318,7 @@ def _split_python(src: Path, out_dir: Path, src_fmt: str, src_comp: Optional[str
                     bytes_in=src.stat().st_size)
     created = not out_dir.exists()
     out_dir.mkdir(parents=True, exist_ok=True)
-    staging = out_dir / f".vegg-staging-{os.getpid()}-{secrets.token_hex(4)}"
+    staging = out_dir / f".vegg-staging-{os.getpid()}-{os.urandom(4).hex()}"
     staging.mkdir()
     published = False
     try:
