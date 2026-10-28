@@ -862,7 +862,7 @@ fn options_that_cannot_work_are_refused() {
         .contains("unknown encoding"));
     assert!(err(&sniff(SniffOptions { delimiter: Some("\"".into()), ..Default::default() })).contains("must differ"));
     // a line break cannot separate fields or quote them
-    for (delimiter, quote) in [(Some("\\n"), None), (Some("\r"), None), (None, Some("\n"))] {
+    for (delimiter, quote) in [(Some("\\n"), None), (Some("\\r"), None), (Some("\r"), None), (None, Some("\n"))] {
         let o = sniff(SniffOptions {
             delimiter: delimiter.map(Into::into),
             quote: quote.map(Into::into),

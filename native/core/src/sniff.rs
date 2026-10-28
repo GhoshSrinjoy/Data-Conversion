@@ -69,6 +69,7 @@ pub fn parse_char_option(text: &str) -> Result<Option<u8>> {
     Ok(match text {
         "\\t" | "tab" | "TAB" => Some(b'\t'),
         "\\n" => Some(b'\n'),
+        "\\r" => Some(b'\r'),
         "space" => Some(b' '),
         "none" | "" => None,
         other => match other.as_bytes() {
