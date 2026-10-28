@@ -1,6 +1,8 @@
 [build-system]
-requires = ["setuptools>=77", "wheel"]
-build-backend = "setuptools.build_meta"
+# hatchling 1.27 is the last release for Python 3.8 and 3.9, and it already writes
+# license expressions (PEP 639); setuptools only does from version 77, which needs 3.9
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
 
 [project]
 name = "dataconv"
@@ -42,11 +44,11 @@ dev = ["pytest>=7", "ruff>=0.5"]
 [project.scripts]
 dataconv = "dataconv.cli:main"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.hatch.build.targets.wheel]
+packages = ["src/dataconv"]
 
-[tool.setuptools.package-data]
-dataconv = ["py.typed"]
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "docs", "README.md", "CHANGELOG.md", "LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
