@@ -515,10 +515,7 @@ fn nulls_among_dictionary_values_stay_null() {
     );
     let out = d.join("dict.csv");
     convert(&src, &out, &opts(), &NoHooks).unwrap();
-    assert_eq!(
-        std::fs::read_to_string(&out).unwrap(),
-        "d,l\na,\"[\"\"a\"\",\"\"\"\",null]\"\n\"\",[]\n,[null]\n,[]\n"
-    );
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "d,l\na,\"[\"\"a\"\",\"\"\"\",null]\"\n\"\",[]\n,[null]\n,[]\n");
 }
 
 #[test]
