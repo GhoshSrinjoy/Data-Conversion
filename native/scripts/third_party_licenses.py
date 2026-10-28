@@ -41,7 +41,7 @@ def main() -> int:
                 stack.append(dep["pkg"])
     bundled = sorted((packages[p] for p in seen - members), key=lambda p: (p["name"], p["version"]))
 
-    texts: "OrderedDict[str, list]" = OrderedDict()
+    texts: OrderedDict[str, list] = OrderedDict()
     for p in bundled:
         label = f"{p['name']} {p['version']}"
         found = False

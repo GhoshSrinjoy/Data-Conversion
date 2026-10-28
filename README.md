@@ -2,6 +2,13 @@
 
 # dataconv: fast, lossless data conversion and compression
 
+[![CI](https://github.com/GhoshSrinjoy/Data-Conversion/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/GhoshSrinjoy/Data-Conversion/actions/workflows/ci.yml)
+[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue)](LICENSE)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-3776AB?logo=python&logoColor=white)](#install)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-B7410E?logo=rust&logoColor=white)](#engines-and-portability)
+[![Platforms: Windows, macOS, Linux](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-informational)](#engines-and-portability)
+[![No required dependencies](https://img.shields.io/badge/dependencies-none%20required-brightgreen)](#engines-and-portability)
+
 Convert, compress, split, inspect and verify CSV, TSV, JSON Lines, JSON, Parquet,
 Arrow IPC/Feather, ORC, Excel and DCZ files, from the command line or Python.
 
@@ -380,7 +387,7 @@ Errors derive from `dataconv.DataconvError`.
 
 `--engine auto` (the default) picks the first engine that handles both formats.
 All engines apply the same type rules and read and write the same DCZ files,
-which the test suite cross-checks. The suite runs on Python 3.8 to 3.13, with and
+which the test suite cross-checks. The suite runs on Python 3.8 to 3.14, with and
 without each optional package; set `DATACONV_DISABLE=all` (or a list such as
 `dataconv_native,pyarrow`) to try the fallbacks yourself.
 
