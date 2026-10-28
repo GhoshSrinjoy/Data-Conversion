@@ -1,0 +1,4 @@
+[build]
+# dep-info (.d) files list sources relative to this workspace, not by their absolute
+# paths on the build machine
+dep-info-basedir = "."

@@ -24,3 +24,7 @@ classifiers = [
 module-name = "dataconv_native"
 features = ["pyo3/extension-module"]
 strip = true
+
+[tool.maturin.sbom]
+# no SBOM generated from cargo metadata: it names local crates by their path on disk
+rust = false

@@ -413,6 +413,14 @@ Changes to the type rules, the CSV and JSON rules or DCZ must be made in both
 implementations; `tests/test_infer.py`, `tests/test_csv_rules.py`,
 `tests/test_json_rules.py` and `tests/test_dcz.py` check that they agree.
 
+Release artifacts come from the release workflow. To build them on your own
+machine, run `python native/build_release.py`. Rust embeds the source path of
+every crate in panic messages, so a plain build names your home directory. The
+script remaps the paths of the build machine (home directory, cargo home,
+checkout), builds the binary and the wheel into `dist/`, and fails if either
+still contains such a path. `python native/build_release.py --check FILE...`
+checks existing artifacts.
+
 ## License
 
 PolyForm Noncommercial License 1.0.0. See [LICENSE](LICENSE).
