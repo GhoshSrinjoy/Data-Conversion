@@ -8,6 +8,7 @@ import re
 import secrets
 import shutil
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable, Iterator, Optional, TypeVar, Union
@@ -86,13 +87,21 @@ def clamp(value: int, low: int, high: int) -> int:
 
 
 def _remove(path: Path) -> None:
-    try:
-        if path.is_dir() and not path.is_symlink():
-            shutil.rmtree(path, ignore_errors=True)
-        elif path.exists() or path.is_symlink():
-            path.unlink()
-    except OSError:
-        pass
+    # On Windows a file can stay locked for a moment after its last handle is closed
+    # (a virus scanner reading it): try again briefly before leaving it.
+    for attempt in range(10):
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            elif path.exists() or path.is_symlink():
+                path.unlink()
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if os.name != "nt" or attempt == 9:
+                return
+            time.sleep(0.05 * (attempt + 1))
 
 
 def _replace(tmp: Path, final: Path) -> None:

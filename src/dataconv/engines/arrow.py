@@ -21,7 +21,7 @@ from typing import IO, Any, Callable, Dict, Iterator, List, Optional, Sequence, 
 from .. import _compat, _csvtok, _io, dcz, formats, infer
 from .._sniff import Dialect
 from .._util import atomic_output, prefetch
-from ..errors import DataError, FormatError
+from ..errors import DataError, FormatError, SchemaError
 from ..options import ConvertOptions
 from ..report import Report
 from ..resources import make_plan
@@ -516,6 +516,24 @@ def read_feather_v1(path: Path, columns: Optional[List[str]] = None) -> Any:
             raise FormatError(f"{path} is a Feather version 1 file this pyarrow cannot read: {exc}") from None
 
 
+def _valid_batches(path: Path, batches: Iterator[Any]) -> Iterator[Any]:
+    """Arrow file batches, each checked in full before use: offsets or text that a
+    corrupt file gets wrong would otherwise crash the process when read."""
+    pa = _pa()
+    while True:
+        try:
+            batch = next(batches)
+            for col in batch.columns:
+                # a date64 may hold any milliseconds, which a full check refuses; its
+                # fixed-width values cannot misdirect a read anyway
+                col.validate(full=not pa.types.is_date64(col.type))
+        except StopIteration:
+            return
+        except (pa.ArrowException, OSError) as exc:
+            raise DataError(f"{path.name} is corrupt: {exc}") from None
+        yield batch
+
+
 def read_batches(path: Path, fmt: str, o: ConvertOptions, batch_rows: int = 65536, full: bool = False,
                  text_columns: Optional[Set[str]] = None, notes: Optional[List[str]] = None,
                  sample: Optional[int] = None) -> Tuple[Any, Iterator[Any]]:
@@ -535,12 +553,16 @@ def read_batches(path: Path, fmt: str, o: ConvertOptions, batch_rows: int = 6553
     if fmt == "ipc":
         source = pa.memory_map(str(path), "r")
         try:
-            reader = pa.ipc.open_file(source)
-            batches: Iterator[Any] = (reader.get_batch(i) for i in range(reader.num_record_batches))
-        except pa.ArrowInvalid:
-            reader = pa.ipc.open_stream(source)
-            batches = iter(reader)
+            try:
+                reader = pa.ipc.open_file(source)
+                raw: Iterator[Any] = (reader.get_batch(i) for i in range(reader.num_record_batches))
+            except pa.ArrowInvalid:
+                reader = pa.ipc.open_stream(source)
+                raw = iter(reader)
+        except (pa.ArrowException, OSError) as exc:  # pyarrow reports a damaged stream as OSError
+            raise DataError(f"{path.name} is not a readable Arrow file: {exc}") from None
         schema = reader.schema
+        batches = _valid_batches(path, raw)
         if cols:
             idx = [schema.get_field_index(c) for c in cols]
             return pa.schema([schema.field(i) for i in idx]), (b.select(idx) for b in batches)
@@ -681,6 +703,19 @@ def type_name(t: Any) -> str:
     return str(t)  # integers, binary, times, durations, intervals and null: pyarrow's names
 
 
+def _list_view_texts(arr: Any, t: Any) -> List[Any]:
+    """List views as JSON text: list ``r`` is ``sizes[r]`` values from ``offsets[r]``
+    (pyarrow's cast to a list drops null items)."""
+    if len(arr) == 0:
+        return []
+    items = py_values(arr.values, t.value_field)
+    of = pure.json_text
+    return [
+        pure.JsonText("[" + ",".join(of(x) for x in items[o : o + s]) + "]") if ok else None
+        for o, s, ok in zip(arr.offsets.to_pylist(), arr.sizes.to_pylist(), _rows(arr))
+    ]
+
+
 _SINGLE_SPECIAL = {"nan": float("nan"), "inf": float("inf"), "-inf": float("-inf")}
 
 
@@ -703,12 +738,11 @@ def py_values(arr: Any, field: Any = None) -> List[Any]:
         if kind == b"value":
             return [v if v is None else pure.JsonText(v) for v in values]
         return values  # type: ignore[no-any-return]
-    if pa.types.is_fixed_size_list(t) or _is(pa, "is_list_view", t):
+    if pa.types.is_fixed_size_list(t):
         arr = arr.cast(pa.list_(t.value_field))
         t = arr.type
-    elif _is(pa, "is_large_list_view", t):
-        arr = arr.cast(pa.large_list(t.value_field))
-        t = arr.type
+    elif _is(pa, "is_list_view", t) or _is(pa, "is_large_list_view", t):
+        return _list_view_texts(arr, t)
     if pa.types.is_struct(t) or pa.types.is_map(t) or pa.types.is_list(t) or pa.types.is_large_list(t):
         return _nested_texts(pa, arr, t)
     if pa.types.is_timestamp(t):
@@ -744,6 +778,62 @@ def py_values(arr: Any, field: Any = None) -> List[Any]:
         raise DataError(f"cannot write a {t} column as text: {exc}") from None
 
 
+def _write_error(fmt: str, exc: Exception) -> Exception:
+    """A pyarrow error while writing, as one of ours: a type the format cannot hold is a
+    schema error, anything else a data error."""
+    what = {"parquet": "Parquet", "ipc": "Arrow", "orc": "ORC"}.get(fmt, fmt)
+    kind = SchemaError if isinstance(exc, _pa().ArrowNotImplementedError) else DataError
+    return kind(f"cannot write {what}: {exc}")
+
+
+def _holds(pa: Any, t: Any, check: Callable[[Any], bool]) -> bool:
+    """Whether type ``t`` is, or nests, a type that ``check`` accepts."""
+    if check(t):
+        return True
+    if pa.types.is_struct(t):
+        return any(_holds(pa, t.field(i).type, check) for i in range(t.num_fields))
+    if pa.types.is_map(t):
+        return _holds(pa, t.key_type, check) or _holds(pa, t.item_type, check)
+    if pa.types.is_dictionary(t):
+        return _holds(pa, t.value_type, check)
+    value_type = getattr(t, "value_type", None)
+    return value_type is not None and _holds(pa, value_type, check)
+
+
+def _check_date64(pa: Any, name: str, arr: Any) -> None:
+    """A Parquet date cannot keep a time of day: refuse a date64 value that has one, as
+    the native engine does (pyarrow would drop it)."""
+    t = arr.type
+    if pa.types.is_date64(t):
+        ticks = arr.cast(pa.int64())
+        days = pa.compute.multiply(pa.compute.divide(ticks, 86_400_000), 86_400_000)
+        timed = pa.compute.filter(ticks, pa.compute.not_equal(ticks, days))
+        if len(timed):
+            raise SchemaError(f"column '{name}': date64 value {timed[0].as_py()} has a time of day, which a "
+                              "Parquet date cannot keep; cast the column to a timestamp first")
+    elif pa.types.is_struct(t):
+        for i in range(t.num_fields):
+            _check_date64(pa, name, arr.field(i))
+    elif pa.types.is_list(t) or pa.types.is_large_list(t) or pa.types.is_fixed_size_list(t):
+        _check_date64(pa, name, arr.flatten())
+    elif pa.types.is_map(t):
+        _check_date64(pa, name, arr.keys)
+        _check_date64(pa, name, arr.items)
+
+
+def _without_dictionary_nulls(pa: Any, batch: Any) -> Any:
+    """A dictionary holding a null among its values, with that null moved to the
+    indices: pyarrow cannot write the former to Parquet."""
+    cols = list(batch.columns)
+    moved = False
+    for i, col in enumerate(cols):
+        t = col.type
+        if pa.types.is_dictionary(t) and col.dictionary.null_count:
+            cols[i] = col.cast(t.value_type).dictionary_encode().cast(t)
+            moved = True
+    return pa.RecordBatch.from_arrays(cols, schema=batch.schema) if moved else batch
+
+
 class Writer:
     def __init__(self, path: Path, fmt: str, compression: Optional[str], schema: Any, o: ConvertOptions, sample: Any = None) -> None:
         pa = _pa()
@@ -755,8 +845,17 @@ class Writer:
             pq = _compat.require("pyarrow.parquet", "writing Parquet", "arrow")
             from ..tune import parquet_writer_options
 
-            self._inner = pq.ParquetWriter(str(path), schema, **parquet_writer_options(o, schema, sample))
+            options = parquet_writer_options(o, schema, sample)
+            # an explicit sink, closed when the writer cannot be made, so the temporary
+            # file can be removed (Windows)
+            self._stream = pa.OSFile(str(path), "wb")
+            try:
+                self._inner = pq.ParquetWriter(self._stream, schema, **options)
+            except pa.ArrowException as exc:
+                self._stream.close()
+                raise _write_error("Parquet", exc) from None
             self.row_group = o.row_group_rows or 1 << 20
+            self._date64 = any(_holds(pa, f.type, pa.types.is_date64) for f in schema)
         elif fmt == "ipc":
             comp = {"none": None, "uncompressed": None}.get((o.compression or "zstd").lower(), (o.compression or "zstd").lower())
             options = pa.ipc.IpcWriteOptions(compression=comp)
@@ -778,12 +877,20 @@ class Writer:
             cols = [py_values(col, schema.field(j)) for j, col in enumerate(batch.columns)]
             for row in zip(*cols) if cols else [()] * batch.num_rows:
                 self._text.write(row)
-        elif self.fmt == "parquet":
-            self._inner.write_batch(batch, row_group_size=self.row_group)
-        elif self.fmt == "orc":
-            self._inner.write(_pa().Table.from_batches([batch]))
         else:
-            self._inner.write_batch(batch)
+            pa = _pa()
+            try:
+                if self.fmt == "parquet":
+                    if self._date64:
+                        for f, col in zip(batch.schema, batch.columns):
+                            _check_date64(pa, f.name, col)
+                    self._inner.write_batch(_without_dictionary_nulls(pa, batch), row_group_size=self.row_group)
+                elif self.fmt == "orc":
+                    self._inner.write(pa.Table.from_batches([batch]))
+                else:
+                    self._inner.write_batch(batch)
+            except pa.ArrowException as exc:
+                raise _write_error(self.fmt, exc) from None
 
     def abort(self) -> None:
         """Close everything after a failure, ignoring errors."""
@@ -1026,14 +1133,18 @@ def head(path: Path, n: int, fmt: str, o: ConvertOptions) -> Dict[str, Any]:
     # JSON: the types of the first n records, as the native engine's head gives them
     schema, batches = read_batches(path, fmt, o, batch_rows=max(1, n), sample=max(0, n))
     rows: List[List[Optional[str]]] = []
-    for b in batches if n > 0 else ():  # a record beyond a JSON sample of none would re-plan
-        cols = [py_values(c) for c in b.columns]
-        for r in zip(*cols) if cols else [()] * b.num_rows:
-            rows.append([pure.csv_text(v) for v in r])
+    try:
+        for b in batches if n > 0 else ():  # a record beyond a JSON sample of none would re-plan
+            cols = [py_values(c) for c in b.columns]
+            for r in zip(*cols) if cols else [()] * b.num_rows:
+                rows.append([pure.csv_text(v) for v in r])
+                if len(rows) >= n:
+                    break
             if len(rows) >= n:
                 break
-        if len(rows) >= n:
-            break
+    except pure._Restart as r:
+        # planned from these very records: a value that does not fit has no type at all
+        raise DataError(r.value or "a value fits no type") from None
     return {"columns": list(schema.names), "types": [type_name(f.type) for f in schema], "rows": rows}
 
 

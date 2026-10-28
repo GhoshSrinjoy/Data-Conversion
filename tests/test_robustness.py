@@ -280,3 +280,86 @@ def test_internal_restarts_never_escape(tmp_path, engine):
     dates = tmp_path / "d.csv"
     dates.write_bytes(b"d\n2024-01-01\n0000-01-01\n")
     assert dc.head(dates, 5, engine=engine)["rows"] == [["2024-01-01"], ["0000-01-01"]]
+
+
+TYPED_ENGINES = [e for e in ("native", "arrow") if e in ENGINES]
+needs_arrow = pytest.mark.skipif("arrow" not in ENGINES, reason="pyarrow not installed")
+
+
+def _ipc(path, table):
+    pa = pytest.importorskip("pyarrow")
+    with pa.ipc.new_file(pa.OSFile(str(path), "wb"), table.schema) as w:
+        w.write_table(table)
+    return path
+
+
+@needs_arrow
+@pytest.mark.parametrize("engine", TYPED_ENGINES)
+def test_list_views_keep_null_items(tmp_path, engine):
+    import pyarrow as pa
+
+    if not hasattr(pa, "list_view"):
+        pytest.skip("pyarrow without list views")
+    src = _ipc(tmp_path / "lv.arrow", pa.table({"lv": pa.array([[1, 2], [], None, [None]], pa.list_view(pa.int64()))}))
+    out = tmp_path / "lv.jsonl"
+    dc.convert(src, out, engine=engine)
+    assert out.read_text().splitlines() == ['{"lv":[1,2]}', '{"lv":[]}', '{"lv":null}', '{"lv":[null]}']
+
+
+@needs_arrow
+@pytest.mark.parametrize("engine", TYPED_ENGINES)
+def test_parquet_dates_keep_what_they_hold(tmp_path, engine):
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    # a date64 with a time of day cannot become a Parquet date: refused, not cut
+    src = _ipc(tmp_path / "d.arrow", pa.table({"d": pa.array([86_400_000 + 1234, None], pa.int64()).cast(pa.date64())}))
+    with pytest.raises(dc.SchemaError, match="time of day"):
+        dc.convert(src, tmp_path / "d.parquet", engine=engine)
+    assert not list(tmp_path.glob(".*"))
+    # it still converts to text, keeping the time
+    dc.convert(src, tmp_path / "d.csv", engine=engine)
+    assert (tmp_path / "d.csv").read_text().splitlines()[1] == "1970-01-02T00:00:01.234"
+    # a null stored among a dictionary's values stays a null
+    d = pc.dictionary_encode(pa.array(["a", None, "a", "b"]), null_encoding="encode")
+    src = _ipc(tmp_path / "dn.arrow", pa.table({"d": d}))
+    dc.convert(src, tmp_path / "dn.parquet", engine=engine)
+    assert pq.read_table(tmp_path / "dn.parquet").column(0).to_pylist() == ["a", None, "a", "b"]
+
+
+@needs_arrow
+@pytest.mark.parametrize("engine", TYPED_ENGINES)
+def test_a_type_parquet_cannot_hold_leaves_nothing_behind(tmp_path, engine):
+    import pyarrow as pa
+
+    src = _ipc(tmp_path / "se.arrow", pa.table({"se": pa.array([{}, None], pa.struct([]))}))
+    with pytest.raises(dc.DataconvError):
+        dc.convert(src, tmp_path / "se.parquet", engine=engine)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["se.arrow"]
+
+
+@needs_arrow
+@pytest.mark.parametrize("engine", TYPED_ENGINES)
+def test_corrupt_arrow_files_fail_cleanly(tmp_path, engine):
+    import pyarrow as pa
+
+    good = _ipc(tmp_path / "f.arrow", pa.table({"s": [f"name-{i}" for i in range(50)]})).read_bytes()
+    for i in range(0, len(good), 3):
+        bad = bytearray(good)
+        bad[i] ^= 0x80
+        src = tmp_path / "flip.arrow"
+        src.write_bytes(bytes(bad))
+        try:
+            dc.convert(src, tmp_path / "flip.csv", engine=engine, overwrite=True)
+        except dc.DataconvError:
+            pass
+    assert not list(tmp_path.glob(".*"))
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_head_of_a_value_no_type_holds(tmp_path, engine):
+    src = tmp_path / "s.jsonl"
+    src.write_bytes(b'{"s": "\\ud83d\\ude00"}\n{"s": "\\ud800"}\n')  # the second is a lone surrogate
+    with pytest.raises(dc.DataError, match="does not fit"):
+        dc.head(src, 5, engine=engine)

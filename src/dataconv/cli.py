@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import sys
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -473,6 +474,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.progress = sys.stderr.isatty() or None
     if getattr(args, "quiet", False) or getattr(args, "json", False):
         args.progress = None
+    if hasattr(signal, "SIGBREAK"):
+        # Ctrl-Break (Windows) stops a command like Ctrl-C, removing partial output
+        signal.signal(signal.SIGBREAK, signal.default_int_handler)
     try:
         return int(args.func(args) or 0)
     except KeyboardInterrupt:
