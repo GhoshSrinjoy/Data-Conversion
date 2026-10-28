@@ -42,7 +42,9 @@ A rewrite of the three original scripts into one package, `dataconv`.
   (`string`, `float64`, `timestamp[ms,+05:30]`, `list<int64>`).
 - **Hardened decoders.** Corrupt DCZ and packed data fail with an integrity
   error: every length is checked against the block index and the file size,
-  and decompressed sizes and allocations are bounded.
+  and decompressed sizes and allocations are bounded. A damaged Arrow file is
+  reported as damaged, never a crash, and its block lengths are checked against
+  the file size before anything is read.
 - **DCZ**, a byte-exact, block-parallel columnar compressor for delimited text,
   with a pure-Python reader and writer
   ([format specification](docs/FORMAT.md)), and `pack`/`unpack` for lists and
