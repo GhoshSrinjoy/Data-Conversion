@@ -1,23 +1,17 @@
+mod common;
+
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::{DataType, Float64Type, Int64Type, TimeUnit};
+use common::TestDir;
 use dataconv_core::convert::{convert, BadLines, ConvertOptions, NoHooks};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-/// A directory of this test run (process ids are reused, so a run never sees the
-/// files of an earlier one).
-fn dir() -> PathBuf {
-    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    DIR.get_or_init(|| {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let d = std::env::temp_dir().join(format!("dcv-it-{}-{nanos}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
-    })
-    .clone()
+fn dir(name: &str) -> TestDir {
+    TestDir::new(name)
 }
 
 fn read_parquet(path: &PathBuf) -> RecordBatch {
@@ -53,7 +47,7 @@ fn tricky_csv() -> String {
 
 #[test]
 fn csv_to_parquet_is_lossless() {
-    let d = dir();
+    let d = dir("csv-to-parquet-is-lossless");
     let src = d.join("tricky.csv");
     std::fs::write(&src, tricky_csv()).unwrap();
     let dst = d.join("tricky.parquet");
@@ -100,7 +94,7 @@ fn csv_to_parquet_is_lossless() {
 
 #[test]
 fn every_format_roundtrips_through_csv() {
-    let d = dir();
+    let d = dir("every-format-roundtrips-through-csv");
     let src = d.join("fmt.csv");
     let csv = tricky_csv().replace("this,row,is,broken\n\n", "");
     std::fs::write(&src, &csv).unwrap();
@@ -128,7 +122,7 @@ fn every_format_roundtrips_through_csv() {
 
 #[test]
 fn recovers_from_type_drift_beyond_the_sample() {
-    let d = dir();
+    let d = dir("recovers-from-type-drift-beyond-the-sample");
     let src = d.join("drift.csv");
     let mut s = String::from("a,b\n");
     for i in 0..200_000 {
@@ -152,7 +146,7 @@ fn recovers_from_type_drift_beyond_the_sample() {
 
 #[test]
 fn falls_back_to_windows_1252_late_in_the_file() {
-    let d = dir();
+    let d = dir("falls-back-to-windows-1252-late-in-the-file");
     let src = d.join("latin.csv");
     let mut bytes = b"city,n\n".to_vec();
     for i in 0..300_000 {
@@ -170,7 +164,7 @@ fn falls_back_to_windows_1252_late_in_the_file() {
 
 #[test]
 fn bad_line_policies_and_options() {
-    let d = dir();
+    let d = dir("bad-line-policies-and-options");
     let src = d.join("bad.csv");
     std::fs::write(&src, "a,b,c\n1,2,3\n4,5\n6,7,8,9\n").unwrap();
     let dst = d.join("bad.parquet");
@@ -214,7 +208,7 @@ fn bad_line_policies_and_options() {
 
 #[test]
 fn max_profile_tunes_parquet() {
-    let d = dir();
+    let d = dir("max-profile-tunes-parquet");
     let src = d.join("tune.csv");
     let mut s = String::from("ts,v,cat\n");
     for i in 0..100_000 {
@@ -243,9 +237,7 @@ fn max_profile_tunes_parquet() {
 
 #[test]
 fn split_csv_is_byte_exact() {
-    let d = dir().join("split-exact");
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
+    let d = dir("split-exact");
     let src = d.join("in.csv");
     let mut body = String::new();
     for i in 0..10_000 {
@@ -271,9 +263,7 @@ fn split_csv_is_byte_exact() {
 
 #[test]
 fn split_by_size_lands_near_target() {
-    let d = dir().join("split-size");
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
+    let d = dir("split-size");
     let src = d.join("in.csv");
     let mut s = String::from("id,v,name\n");
     for i in 0..400_000 {

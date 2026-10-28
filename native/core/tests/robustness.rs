@@ -2,11 +2,14 @@
 //! than a chunk, single-column nulls, split atomicity, dialect options, and corrupt
 //! DCZ input.
 
+mod common;
+
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use arrow::array::{Array, AsArray, RecordBatch};
 use arrow::datatypes::Int64Type;
+use common::TestDir;
 use dataconv_core::codec::Profile;
 use dataconv_core::convert::{convert, ConvertOptions, NoHooks};
 use dataconv_core::dcz;
@@ -14,11 +17,8 @@ use dataconv_core::sniff::SniffOptions;
 use dataconv_core::tokenize::Dialect;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-fn dir(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("dcv-rb-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+fn dir(name: &str) -> TestDir {
+    TestDir::new(name)
 }
 
 fn read_parquet(path: &Path) -> RecordBatch {

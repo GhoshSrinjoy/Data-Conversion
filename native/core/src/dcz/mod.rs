@@ -867,10 +867,28 @@ mod tests {
     use super::*;
     use crate::convert::NoHooks;
 
-    fn tmp(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("dcv-dcz-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join(name)
+    /// A directory for one test, removed when the test passes.
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new(name: &str) -> TestDir {
+            let dir = std::env::temp_dir().join(format!("dcv-dcz-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            TestDir(dir)
+        }
+
+        fn tmp(&self, name: &str) -> std::path::PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
     }
 
     #[test]
@@ -887,11 +905,12 @@ mod tests {
                 i % 60
             ));
         }
-        let src = tmp("in.csv");
+        let dir = TestDir::new("roundtrip");
+        let src = dir.tmp("in.csv");
         std::fs::write(&src, &csv).unwrap();
         for profile in [Profile::Fast, Profile::Balanced, Profile::Max] {
-            let dst = tmp(&format!("out-{profile:?}.dcz"));
-            let back = tmp(&format!("back-{profile:?}.csv"));
+            let dst = dir.tmp(&format!("out-{profile:?}.dcz"));
+            let back = dir.tmp(&format!("back-{profile:?}.csv"));
             let opts = EncodeOptions { profile, threads: 4, block_size: Some(256 << 10), memory: None };
             let r = compress_file(&src, &dst, &opts, true, &NoHooks).unwrap();
             assert!(r.bytes_out < r.bytes_in / 4, "{profile:?}: {} -> {}", r.bytes_in, r.bytes_out);
@@ -921,10 +940,11 @@ mod tests {
     #[test]
     fn raw_binary_files() {
         let data: Vec<u8> = (0..300_000u32).flat_map(|i| (i.wrapping_mul(2654435761) >> 7).to_le_bytes()).collect();
-        let src = tmp("blob.bin");
+        let dir = TestDir::new("raw");
+        let src = dir.tmp("blob.bin");
         std::fs::write(&src, &data).unwrap();
-        let dst = tmp("blob.dcz");
-        let back = tmp("blob.back");
+        let dst = dir.tmp("blob.dcz");
+        let back = dir.tmp("blob.back");
         compress_file(
             &src,
             &dst,
