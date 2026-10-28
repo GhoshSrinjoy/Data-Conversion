@@ -940,6 +940,12 @@ pub struct IpcBatches {
 impl IpcBatches {
     pub fn open(path: &Path) -> Result<Self> {
         let head = crate::io::read_head(path, 6)?;
+        if head.starts_with(b"FEA1") {
+            return Err(Error::Format(format!(
+                "{} is a Feather version 1 file, which only the arrow engine reads (--engine arrow)",
+                path.display()
+            )));
+        }
         let file = BufReader::new(File::open(path).map_err(|e| Error::io(e, path))?);
         if head == b"ARROW1" {
             let r = arrow::ipc::reader::FileReader::try_new(file, None)?;
