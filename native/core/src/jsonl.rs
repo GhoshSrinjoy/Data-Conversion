@@ -30,7 +30,7 @@ use std::sync::Arc;
 use ahash::AHashMap;
 use arrow::array::{
     Array, ArrayBuilder, ArrayRef, AsArray, BooleanBuilder, Decimal128Builder, Float64Builder, Int64Builder, ListArray,
-    RecordBatch, RecordBatchOptions, StringBuilder, StructArray,
+    ListLikeArray, RecordBatch, RecordBatchOptions, StringArrayType, StringBuilder, StructArray,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Date32Type, Field, FieldRef, Fields, Float32Type, Float64Type, Schema, SchemaRef};
@@ -826,9 +826,9 @@ pub struct FloatText;
 
 /// Text that holds JSON, written as it is ("NaN"-like texts of a number column
 /// stay strings: JSON has no such numbers).
-struct RawJson<'a>(&'a arrow::array::StringArray, bool);
+struct RawJson<T>(T, bool);
 
-impl Encoder for RawJson<'_> {
+impl<'a, T: StringArrayType<'a>> Encoder for RawJson<T> {
     fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
         let v = self.0.value(idx);
         if self.1 && nan_text(v).is_some() {
@@ -839,6 +839,39 @@ impl Encoder for RawJson<'_> {
             out.extend_from_slice(v.as_bytes());
         }
     }
+}
+
+/// A list whose items are marked [`JSON_TEXT`].  arrow-json hands an item encoder the
+/// list's own field, whose metadata says nothing about the items.
+struct MarkedItems<'a, L> {
+    list: &'a L,
+    items: NullableEncoder<'a>,
+}
+
+impl<L: ListLikeArray> Encoder for MarkedItems<'_, L> {
+    fn encode(&mut self, idx: usize, out: &mut Vec<u8>) {
+        out.push(b'[');
+        for (n, i) in self.list.element_range(idx).enumerate() {
+            if n > 0 {
+                out.push(b',');
+            }
+            if self.items.is_null(i) {
+                out.extend_from_slice(b"null");
+            } else {
+                self.items.encode(i, out);
+            }
+        }
+        out.push(b']');
+    }
+}
+
+fn marked_items<'a, L: ListLikeArray>(
+    item: &'a FieldRef,
+    list: &'a L,
+    options: &'a EncoderOptions,
+) -> std::result::Result<NullableEncoder<'a>, ArrowError> {
+    let items = arrow::json::writer::make_encoder(item, list.values().as_ref(), options)?;
+    Ok(NullableEncoder::new(Box::new(MarkedItems { list, items }), list.nulls().cloned()))
 }
 
 /// Dates and timestamps as JSON strings in the CSV output's format.
@@ -888,16 +921,29 @@ impl EncoderFactory for FloatText {
         &self,
         field: &'a FieldRef,
         array: &'a dyn Array,
-        _options: &'a EncoderOptions,
+        options: &'a EncoderOptions,
     ) -> std::result::Result<Option<NullableEncoder<'a>>, ArrowError> {
+        let marked = |f: &FieldRef| f.metadata().contains_key(JSON_TEXT);
         Ok(match array.data_type() {
-            DataType::Utf8 => match field.metadata().get(JSON_TEXT).map(String::as_str) {
-                Some(kind @ ("number" | "value")) => Some(NullableEncoder::new(
-                    Box::new(RawJson(array.as_string::<i32>(), kind == "number")),
-                    array.nulls().cloned(),
-                )),
-                _ => None,
-            },
+            t @ (DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View) => {
+                match field.metadata().get(JSON_TEXT).map(String::as_str) {
+                    Some(kind @ ("number" | "value")) => {
+                        let number = kind == "number";
+                        let encoder: Box<dyn Encoder + 'a> = match t {
+                            DataType::Utf8 => Box::new(RawJson(array.as_string::<i32>(), number)),
+                            DataType::LargeUtf8 => Box::new(RawJson(array.as_string::<i64>(), number)),
+                            _ => Box::new(RawJson(array.as_string_view(), number)),
+                        };
+                        Some(NullableEncoder::new(encoder, array.nulls().cloned()))
+                    }
+                    _ => None,
+                }
+            }
+            DataType::List(item) if marked(item) => Some(marked_items(item, array.as_list::<i32>(), options)?),
+            DataType::LargeList(item) if marked(item) => Some(marked_items(item, array.as_list::<i64>(), options)?),
+            DataType::FixedSizeList(item, _) if marked(item) => {
+                Some(marked_items(item, array.as_fixed_size_list(), options)?)
+            }
             DataType::Float32 | DataType::Float64 => {
                 Some(NullableEncoder::new(Box::new(FloatEncoder(array)), array.nulls().cloned()))
             }

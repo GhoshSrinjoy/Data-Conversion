@@ -355,7 +355,14 @@ fn jsonl_round_trips_losslessly() {
 fn json_kept_as_text_round_trips_as_json() {
     let d = dir("json-text");
     let src = d.join("in.jsonl");
-    std::fs::write(&src, "{\"v\": 1e400, \"m\": 1, \"n\": [1, 2]}\n{\"v\": 1.5, \"m\": \"1\", \"n\": null}\n").unwrap();
+    std::fs::write(
+        &src,
+        concat!(
+            "{\"v\": 1e400, \"m\": 1, \"n\": [1, 2], \"l\": [1, \"a\", {}], \"s\": {\"x\": 1}, \"p\": [1e400, 2]}\n",
+            "{\"v\": 1.5, \"m\": \"1\", \"n\": null, \"l\": [null, true], \"s\": {\"x\": \"1\"}, \"p\": null}\n",
+        ),
+    )
+    .unwrap();
     for mid in ["mid.parquet", "mid.arrow"] {
         let mid = d.join(mid);
         convert(&src, &mid, &opts(), &NoHooks).unwrap();
@@ -363,7 +370,23 @@ fn json_kept_as_text_round_trips_as_json() {
         convert(&mid, &back, &opts(), &NoHooks).unwrap();
         assert_eq!(
             std::fs::read_to_string(&back).unwrap(),
-            "{\"v\":1e+400,\"m\":1,\"n\":[1,2]}\n{\"v\":1.5,\"m\":\"1\",\"n\":null}\n",
+            concat!(
+                "{\"v\":1e+400,\"m\":1,\"n\":[1,2],\"l\":[1,\"a\",{}],\"s\":{\"x\":1},\"p\":[1e+400,2]}\n",
+                "{\"v\":1.5,\"m\":\"1\",\"n\":null,\"l\":[null,true],\"s\":{\"x\":\"1\"},\"p\":null}\n",
+            ),
+            "{}",
+            mid.display()
+        );
+        // a CSV cell holding a list or struct is its JSON, marked items included
+        let csv = d.join("back.csv");
+        convert(&mid, &csv, &opts(), &NoHooks).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&csv).unwrap(),
+            concat!(
+                "v,m,n,l,s,p\n",
+                "1e+400,1,\"[1,2]\",\"[1,\"\"a\"\",{}]\",\"{\"\"x\"\":1}\",\"[1e+400,2]\"\n",
+                "1.5,\"\"\"1\"\"\",,\"[null,true]\",\"{\"\"x\"\":\"\"1\"\"}\",\n",
+            ),
             "{}",
             mid.display()
         );
